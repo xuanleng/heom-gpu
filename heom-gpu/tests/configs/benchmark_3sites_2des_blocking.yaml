@@ -1,0 +1,69 @@
+# 3-site 2DES, shaped for the manifold-blocking A/B gate.
+#
+# benchmark_3sites_2des.yaml cannot serve that gate: filtering is on (it zeroes
+# ADOs, so it can HIDE out-of-block residue and never create it), tw is a single
+# point (tw_gap_steps is all zero, so the T segment never propagates and its
+# block is never exercised), and it sets no batch key (only the flat walk runs).
+# This file differs from it in exactly those three respects plus a grid small
+# enough that somebody will run it twice.
+#
+# System / bath are copied verbatim so a difference between the two files can
+# only come from the four keys below.
+
+system:
+  n_states: 3                  # DOUBLE_EXCITED N=7: g=[0,1) e=[1,4) f=[4,7)
+                               # ⇒ ESA's t-segment block (f,e) is 3×3, a shape
+                               # distinct from (e,e) — n_states=2 would make |f|=1
+                               # and collapse that distinction.
+  temperature: 77.0
+  hamiltonian:
+    - [12400.0,  -106.0,    8.0]
+    - [ -106.0, 12540.0,   28.0]
+    - [    8.0,   28.0, 12120.0]
+  w0: 12300.0
+  dipoles:
+    - [-0.7410, -0.5606, -0.3696]
+    - [-0.8571,  0.5038, -0.1073]
+    - [-0.1971,  0.9574, -0.2110]
+  strengths: [1.0, 1.0, 1.0]
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 70.0
+  gamma_inverse: 100.0
+  expansion_method: pade
+  n_extra_poles: 1
+  L_cutoff: 3
+
+filter:
+  enabled: false               # (1) filtering can only MASK out-of-block residue
+  tolerance: 1.0e-6
+  start_step: 8
+  warmup_factor: 1.0e-1
+  ulist: 0.9
+
+2des:
+  integrator: rk4
+  dt: 8.0
+  print_interval: 0
+  # tau_max / t_max / tw are all integer multiples of dt. That is a hard
+  # constraint, not tidiness: resolve_2des_config rejects a tw that is not an
+  # integer multiple of dt, and nsamp() rounds tau_max/dtau to a grid size you
+  # did not ask for.
+  tau_max: 64.0                # 64/8 = 8 ⇒ n_tau = 9
+  dtau: 8.0
+  tw: ["0:16:16"]              # (2) "start:step:stop" ⇒ {0, 16}: n_tw = 2 and the
+                               # second point carries a 2-step gap, so the T
+                               # segment actually propagates.
+  t_max: 64.0                  # ⇒ n_t = 9
+  dt_detect: 8.0
+  pathways: ["SE", "GSB", "ESA"]
+  signals: ["rephasing", "nonrephasing"]
+  orientation: "isotropic"
+  batch: true                  # (3) the batched walk — the only one the MP build
+                               # gets any direct evidence for (test_2des_reuse is
+                               # FP64-only).
+  output:
+    save_path: "tests/benchmark_data"
+    filename: "benchmark_3sites_2des_blocking"
+    use_timestamp: false

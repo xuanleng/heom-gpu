@@ -1,0 +1,48 @@
+# 3-site (pure-electronic) 2DES benchmark. Coarse short-T grid (T=0 only).
+
+system:
+  n_states: 3
+  temperature: 77.0
+  # 3-site Hamiltonian (cm^-1)
+  hamiltonian:
+    - [12400.0,  -106.0,    8.0]
+    - [ -106.0, 12540.0,   28.0]
+    - [    8.0,   28.0, 12120.0]
+  w0: 12300.0                  # rotating frame = params/params.2dfft w0
+  dipoles:
+    - [-0.7410, -0.5606, -0.3696]
+    - [-0.8571,  0.5038, -0.1073]
+    - [-0.1971,  0.9574, -0.2110]
+  strengths: [1.0, 1.0, 1.0]
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 70.0                    # params.sd col1 = 2λ = 70 (λ_reorg = η/2 = 35 cm^-1)
+  gamma_inverse: 100.0         # params.sd col2 = 1/γ (fs)
+  expansion_method: pade
+  n_extra_poles: 1
+  L_cutoff: 3
+
+filter:
+  enabled: true
+  tolerance: 1.0e-6
+  start_step: 8
+  warmup_factor: 1.0e-1
+  ulist: 0.9          # U-list whole-step launch: 0=off, (0,1]=on & gate τ
+
+2des:
+  integrator: rk4
+  dt: 8.0
+  print_interval: 0
+  tau_max: 600.0
+  dtau: 8.0
+  tw: ["0"]                    # T = 0 only
+  t_max: 600.0
+  dt_detect: 8.0
+  pathways: ["SE", "GSB", "ESA"]
+  signals: ["rephasing", "nonrephasing"]
+  orientation: "isotropic"
+  output:
+    save_path: "tests/benchmark_data"
+    filename: "benchmark_3sites_2des"
+    use_timestamp: false

@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the article below."
+type: software
+title: heom-gpu
+version: 1.0.0
+date-released: 2026-08-31
+license: MIT
+authors:
+  - family-names: Ren
+    given-names: Xin-ling
+    affiliation: Ningbo University
+  - family-names: Zhang
+    given-names: Ting
+    affiliation: Ningbo Polytechnic University
+  - family-names: Cheng
+    given-names: Jiong
+    affiliation: Ningbo University
+  - family-names: Zhang
+    given-names: Wen-zhao
+    affiliation: Ningbo University
+  - family-names: Leng
+    given-names: Xuan
+    affiliation: Ningbo University
+    email: lengxuan@nbu.edu.cn
+preferred-citation:
+  type: article
+  title: "GPU-Accelerated Hierarchical Equations of Motion for Polarization-Resolved Two-Dimensional Electronic Spectra of Disordered Excitonic Systems"
+  journal: Journal of Chemical Theory and Computation
+  status: submitted
+  year: 2026
+  authors:
+    - family-names: Ren
+      given-names: Xin-ling
+      affiliation: Ningbo University
+    - family-names: Zhang
+      given-names: Ting
+      affiliation: Ningbo Polytechnic University
+    - family-names: Cheng
+      given-names: Jiong
+      affiliation: Ningbo University
+    - family-names: Zhang
+      given-names: Wen-zhao
+      affiliation: Ningbo University
+    - family-names: Leng
+      given-names: Xuan
+      affiliation: Ningbo University

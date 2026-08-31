@@ -1,0 +1,56 @@
+# Minimal 2-pigment 2DES smoke config.
+#
+# - No `basis:` field — the '2des' task auto-selects double_excited (ESA) and
+#   the driver builds a with_ground context internally for SE/GSB.
+# - Tiny tau/tw/t grids (n_tau=8, n_tw=2, n_t=8) keep the smoke test fast.
+# - Axis spacings (dtau/dt_detect) and tw samples are integer multiples of 2des.dt
+#   (resolve_2des_config rejects otherwise).
+
+system:
+  n_states: 2
+  temperature: 77.0
+  hamiltonian:
+    - [12100.0, -50.0]
+    - [ -50.0, 12300.0]
+  w0: 12000.0
+  dipoles:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+  strengths: [4.5, 4.5]
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 35.0
+  gamma_inverse: 100.0
+  expansion_method: matsubara
+  n_extra_poles: 1
+  L_cutoff: 2
+
+filter:
+  enabled: true
+  tolerance: 1.0e-7
+
+2des:
+  batch: true          # 1.27s→0.26s here; see config/3sites_2des.yaml for why
+                       # small systems win so much and what the filter-union
+                       # caveat is. Safe for this config: its two consumers
+                       # (test_integration smoke, test_benchmark_infra
+                       # self-comparison) never check committed golden values.
+  integrator: rk4
+  # dt is the HEOM integration step; the 2des driver derives step counts from
+  # the τ/t grid (no n_steps / output_interval here).
+  dt: 1.0
+  print_interval: 200
+  # 2DES axes (fs). dt_detect (NOT dt) names the detection-axis spacing.
+  tau_max: 14.0
+  dtau: 2.0          # steps_per_tau = 2 ; n_tau = 8
+  tw: ["0:2:2"]      # waiting times: 0, 2 fs ; n_tw = 2
+  t_max: 14.0
+  dt_detect: 2.0     # steps_per_t = 2 ; n_t = 8
+  pathways: ["SE", "GSB", "ESA"]
+  signals: ["rephasing", "nonrephasing"]
+  orientation: "isotropic"
+  output:
+    save_path: "data/dimer_2des/"
+    filename: "auto"          # resolve_2des_config -> "dimer_2des_2des"
+    use_timestamp: false

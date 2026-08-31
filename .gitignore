@@ -1,0 +1,100 @@
+# Build directories
+build/
+*/build/
+
+# Compiled files
+*.o
+*.so
+*.a
+*.out
+
+# Executables
+heom_solver
+heom_solver_cpu
+
+# Data output
+data/
+data1/
+data2/
+*/data/
+*.txt
+*.h5
+*.hdf5
+*.png
+
+# Temporary files
+*.log
+*.tmp
+/tmp/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+__MACOSX/
+._*
+
+# Backup files
+*.bak
+*~
+
+# Benchmark results
+benchmark_results.csv
+tools/output/
+
+# Local backup bundles
+backup/
+
+
+
+
+# LaTeX temporary files
+*.aux
+*.toc
+*.lof
+*.lot
+*.out
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.nav
+*.snm
+*.vrb
+*.synctex.gz
+*.synctex(busy)
+*-diff.tex
+*-diffHEAD.tex
+*.fdb_latexmk
+*.fls
+*.xdv
+missfont.log
+*.pdf
+*.yaml
+*.yml
+!heom-gpu/config/fmo.yaml
+!.github/workflows/heom-tools.yml
+
+# Python files
+.venv-absorption-post/
+jctc/pk/.venv-tenso/
+jctc/pk/.venv-tenso-gpu/
+jctc/pk/runs/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc

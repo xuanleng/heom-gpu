@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "heom-tools"
+version = "0.1.0"
+description = "Post-processing and static-disorder Monte Carlo tools for heom-gpu"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23",
+  "h5py>=3.0",
+  "matplotlib>=3.5",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+rqmc = ["scipy>=1.13"]
+
+[project.scripts]
+pop-plot = "heom_tools.population.cli:main"
+pop-compare = "heom_tools.population.compare_cli:main"
+las-post = "heom_tools.absorption.post.cli:main"
+las-plot = "heom_tools.absorption.plot.cli:main"
+las-compare = "heom_tools.absorption.plot.compare_cli:main"
+twodes-post = "heom_tools.twodes.post.cli:main"
+twodes-plot = "heom_tools.twodes.plot.cli:main"
+twodes-animate = "heom_tools.twodes.animate.cli:main"
+twodes-compare = "heom_tools.twodes.compare.cli:main"
+twodes-merge = "heom_tools.twodes.merge.cli:main"
+mc-disorder-gen = "heom_tools.mc_disorder.generate:main"
+mc-disorder-merge = "heom_tools.mc_disorder.merge:main"
+mc-disorder-run = "heom_tools.mc_disorder.run:main"
+mc-disorder-status = "heom_tools.mc_disorder.status:main"
+mc-disorder-calibrate = "heom_tools.mc_disorder.calibrate:main"
+mc-probe = "heom_tools.mc_disorder.probe:main"
+
+[dependency-groups]
+dev = ["pytest>=7.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["heom_tools"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = [
+  "tests",
+]
+filterwarnings = [
+  "ignore:Unable to import Axes3D:UserWarning",
+]

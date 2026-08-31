@@ -1,0 +1,49 @@
+# Benchmark: FMO-7 double_excited basis (N=29, L=3, K=2)
+# Uses n_hat_n site-occupation bath coupling: d^(n)_i = 1 iff site n excited in state i.
+# Hierarchy dimension = n_states×(K+1) = 7×3 = 21 (not n_sites=29), giving M=2024 ADOs.
+# Double-excited states |m,p> couple to baths m and p correctly.
+
+system:
+  n_states: 7
+  basis: "double_excited"
+  temperature: 77.0
+  hamiltonian:
+    - [12400.0, -106.0,    8.0,   -5.0,    6.0,   -8.0,   -4.0]
+    - [-106.0, 12540.0,   28.0,    6.0,    2.0,   13.0,    1.0]
+    - [    8.0,   28.0, 12120.0,  -62.0,   -1.0,   -9.0,   17.0]
+    - [   -5.0,    6.0,  -62.0, 12295.0,  -70.0,  -19.0,  -57.0]
+    - [    6.0,    2.0,   -1.0,  -70.0, 12440.0,   40.0,   -2.0]
+    - [   -8.0,   13.0,   -9.0,  -19.0,   40.0, 12480.0,   32.0]
+    - [   -4.0,    1.0,   17.0,  -57.0,   -2.0,   32.0, 12380.0]
+  w0: 12000.0
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 70.0
+  gamma_inverse: 60.0
+  expansion_method: matsubara
+  n_extra_poles: 2
+  L_cutoff: 3
+
+filter:
+  enabled: true
+  tolerance: 1.0e-6
+
+dynamics:
+  integrator: rk4
+  dt: 2.0
+  n_steps: 100
+  output_interval: 10
+  print_interval: 10
+  initial_state:
+    # `excited_site` is a 1-based PHYSICAL pigment index.
+    # double_excited basis → pigment 2 maps to Hilbert index 2 (single-excitation
+    # block: ground=0, |1⟩=1, |2⟩=2, ...). Old code mapped Hilbert index 2 → 1
+    # (which was |1⟩); the new mapping (Hilbert 2) is the physically intended
+    # |2⟩ excitation. If you need the old behaviour, downgrade to pigment 1.
+    type: "site_excitation"
+    excited_site: 2
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "benchmark_fmo7_n29"
+    use_timestamp: false

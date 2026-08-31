@@ -1,0 +1,59 @@
+# Benchmark: FMO-7 with_ground basis (N=1+7=8, L=3, K=2)
+#
+# This benchmark exists specifically to lock in the basis-aware
+# `excited_site` mapping.
+#
+#   excited_site: 1  (1-based PHYSICAL pigment)
+#   basis        : with_ground       → ground occupies Hilbert index 0,
+#                                      so pigment 1 maps to Hilbert index 1.
+#
+# Contrast with benchmark_fmo7.yaml (EXCITED_ONLY): same pigment 1 there
+# maps to Hilbert index 0. The two physical initial states are identical
+# (pigment 1 is excited); only the Hilbert-space encoding differs.
+#
+# What this benchmark guards against:
+#   - regression of the parse_site_excitation() basis-aware mapping
+#   - regression of hilbert_to_pigment() inverse mapping in console output
+#   - regression of HDF5 attribute "excited_site" (must remain 1-based pigment)
+#
+# Hierarchy: n_bath = n_states = 7, modes = K+1 = 3 → very fast (M=120).
+
+system:
+  n_states: 7
+  basis: "with_ground"
+  temperature: 77.0
+  hamiltonian:
+    - [12400.0, -106.0,    8.0,   -5.0,    6.0,   -8.0,   -4.0]
+    - [-106.0, 12540.0,   28.0,    6.0,    2.0,   13.0,    1.0]
+    - [    8.0,   28.0, 12120.0,  -62.0,   -1.0,   -9.0,   17.0]
+    - [   -5.0,    6.0,  -62.0, 12295.0,  -70.0,  -19.0,  -57.0]
+    - [    6.0,    2.0,   -1.0,  -70.0, 12440.0,   40.0,   -2.0]
+    - [   -8.0,   13.0,   -9.0,  -19.0,   40.0, 12480.0,   32.0]
+    - [   -4.0,    1.0,   17.0,  -57.0,   -2.0,   32.0, 12380.0]
+  w0: 12000.0
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 70.0
+  gamma_inverse: 60.0
+  expansion_method: matsubara
+  n_extra_poles: 2
+  L_cutoff: 3
+
+filter:
+  enabled: true
+  tolerance: 1.0e-6
+
+dynamics:
+  integrator: rk4
+  dt: 2.0
+  n_steps: 100
+  output_interval: 10
+  print_interval: 50
+  initial_state:
+    type: "site_excitation"
+    excited_site: 1
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "benchmark_fmo7_with_ground"
+    use_timestamp: false

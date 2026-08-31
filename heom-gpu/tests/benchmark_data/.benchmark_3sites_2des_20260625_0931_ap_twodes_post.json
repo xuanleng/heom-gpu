@@ -1,0 +1,20 @@
+{
+  "dw": 10.0,
+  "w0": 12300.0,
+  "window": [
+    12000.0,
+    12800.0
+  ],
+  "fft_method": "axis",
+  "pol": "ap",
+  "tw_index": "all",
+  "time_domain": true,
+  "plot": true,
+  "write_h5": false,
+  "h5_spectra": null,
+  "levels": 25,
+  "lines": [],
+  "pathways": "SE,GSB,ESA",
+  "source_mtime": 1782351074489695283,
+  "source_size": 1685144
+}
