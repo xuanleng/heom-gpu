@@ -118,7 +118,7 @@ def generate_rqmc(n_node, n_site, sigma_cm, master_seed, replica=0):
         from scipy.stats import qmc, norm
     except ImportError as e:
         raise ImportError(
-            "RQMC requires scipy: pip install 'heom-tools[rqmc]'"
+            "heom-tools requires scipy; reinstall the package"
         ) from e
     rng = np.random.default_rng(
         np.random.SeedSequence([int(master_seed), int(replica)]))

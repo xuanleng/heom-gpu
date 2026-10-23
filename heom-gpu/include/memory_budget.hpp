@@ -5,16 +5,15 @@
 //
 // Purpose: given a fully-loaded Config and the hierarchy size M (known only
 // after HierarchyTruncation::generate_hierarchy_indices()), predict every
-// cudaMalloc + every persistent host allocation that HEOMSolver will issue,
-// and refuse to start if the result would not fit on the selected device.
+// cudaMalloc + every persistent host allocation that SystemContext and
+// HEOMTrajectory will issue, and refuse to start if the result would not fit
+// on the selected device. Pure functions (no GPU side-effects) so unit tests
+// can drive them on any host.
 //
-// This complements the existing "X MB allocated" line in HEOMSolver::initialize()
-// (heom_solver.cpp:55-61) which fires AFTER cudaMalloc and therefore cannot
-// avoid OOM, only report it. The functions below are pure (no GPU side-effects)
-// so unit tests can drive them on any host.
-//
-// All formulas trace 1:1 to allocate_gpu_memory() in heom_solver.cpp; if that
-// function gains/loses a buffer, update estimate_budget() in lockstep.
+// The GPU side walks plan_gpu_buffers() (gpu_alloc_plan.hpp) — the same list
+// the allocators walk — so the estimate and the real cudaMalloc cannot drift.
+// Driver-owned 2DES allocations (hierarchy snapshots, detection grid) are
+// outside the plan; see gpu_alloc_plan.hpp SCOPE for who accounts for them.
 
 #include "heom_config.hpp"
 #include <cstddef>
@@ -25,23 +24,33 @@ namespace heom {
 /**
  * @brief Estimated memory footprint, broken down by purpose.
  *
- * Sizes are in bytes. The GPU buckets sum exactly to the post-allocation
- * total printed by HEOMSolver::initialize(); the host buckets cover persistent
+ * Sizes are in bytes. The GPU buckets sum exactly to what SystemContext +
+ * HEOMTrajectory allocate from the plan; the host buckets cover persistent
  * std::vectors that survive past initialization (transient buffers like the
  * h_active_flags upload staging are excluded — they are dwarfed by the
  * persistent ones for any non-trivial M).
  */
 struct MemoryBudget {
     // ---- GPU buckets (bytes) ----
-    size_t rho_tensor;          // d_rho_                         = 1 · M · N² · 16
-    size_t rk4_workspace;       // d_workspace_                   = 3 · M · N² · 16
+    size_t rho_tensor;          // d_rho_                         = 1 · M · Nb · 16
+    size_t rk4_workspace;       // d_workspace_                   = 3 · M · Nb · 16
     size_t hierarchy_maps;      // d_plus_map + d_minus_map + d_level_indices
                                 //   = M · n_bath · (K+1) · (4+4+1)
     size_t filter_buffers;      // d_ado_norms + d_active_flags + d_level_counts
                                 //   (zero if !use_filtering)
     size_t auxiliary;           // d_hamiltonian + d_c_bath + d_markov_residue
                                 //   + d_total_decay + d_d_coupling
-    size_t gpu_total;           // sum of the five buckets above
+    size_t optional;            // config-dependent trajectory extras outside the
+                                //   IF-RK4 factor tables (2·M·complex_t,
+                                //   integrator=if_rk4) + U-closure builder work
+                                //   arrays (M·9B, filter on). Zero otherwise.
+    size_t driver;              // driver-owned extras outside the plan, added by
+                                //   the caller (2DES snapshots + detection grid)
+    size_t gpu_total;           // sum of the seven buckets above
+    // SystemContext's read-only tables (hierarchy_maps + auxiliary) when the
+    // estimate was made with Resident::SystemTables: already on the device, so
+    // those two buckets are 0 and this is shown for information only.
+    size_t resident;
 
     // ---- Host buckets (bytes) ----
     // host_hierarchy and host_neighbor_maps are TRANSIENT: built by
@@ -64,8 +73,9 @@ struct MemoryBudget {
     // ---- Echo of derived parameters (for printing / debugging) ----
     size_t M;                   // number of ADOs
     int    N;                   // Hilbert dimension
+    int    rho_elems;           // Nb: elements stored per ADO (rho_capacity(cfg))
     int    n_bath;              // bath count (= n_states)
-    int    K;                   // n_bath_modes_total
+    int    D;                   // total ladder count Σ_n P_n (phys.n_ladders())
     int    L;                   // L_cutoff
     size_t batch;               // batch width B (d_rho / d_workspace scale by B)
     bool   use_filtering;
@@ -79,12 +89,33 @@ struct MemoryBudget {
  * @param cfg Fully-loaded HEOM configuration.
  * @param M   Number of ADOs after HierarchyTruncation::generate_hierarchy_indices().
  *            Pass 0 to estimate everything except the M-dependent terms (rare).
- * @param batch Batch width B (default 1). Scales the two O(M·N²) mutable
+ * @param batch Batch width B (default 1). Scales the two O(M·Nb) mutable
  *            buffers (d_rho, d_workspace) and the mixed Kahan carry; read-only
  *            structure is unaffected. B==1 reproduces the pre-batch estimate.
+ * @param resident What is on the device already. Nothing: the SystemContext
+ *            pre-upload check. SystemTables: any check made after SystemContext
+ *            uploaded (a batched trajectory, the 2DES walk guard) — cudaMemGetInfo
+ *            no longer counts those tables as free, so they must not be
+ *            counted again (that was a false refusal of ~10% on FMO 2DES).
  */
+enum class Resident { Nothing, SystemTables };
 MemoryBudget estimate_budget(const HEOMConfig::Config& cfg, size_t M,
-                             size_t batch = 1);
+                             size_t batch = 1, Resident resident = Resident::Nothing);
+
+/**
+ * @brief Elements of ρ stored per ADO, Nb, for this config's task and basis.
+ *
+ * ρ is stored compacted to its manifold block, so the trajectory has to
+ * be allocated for the LARGEST block the run will ever hold. Task + basis +
+ * n_states determine that completely:
+ *   Dynamics    full(N)                          → N²
+ *   Absorption  (e,g)                            → n_e · 1
+ *   TwoDES      (g,g) ∪ every pathway segment    → max(n_e², n_f·n_e)
+ * This is the ONE source for that number: estimate_budget() and SystemContext
+ * both read it, so the budget check and the cudaMalloc cannot disagree.
+ * Pure; no GPU.
+ */
+int rho_capacity(const HEOMConfig::Config& cfg);
 
 /**
  * @brief Pretty-print a full per-bucket budget to std::cout.

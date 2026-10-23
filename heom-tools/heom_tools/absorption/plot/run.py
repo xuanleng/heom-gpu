@@ -139,7 +139,7 @@ def run_las_pipeline(
         print(
             f"[{cmd_name}] matplotlib import failed — PNG not written "
             "(metrics above are still valid). "
-            "Use tools/environment-heom-post.yml / upgrade numpy.\n"
+            "Use heom-tools/environment-heom-post.yml / upgrade numpy.\n"
             f"  {e}",
             file=sys.stderr,
         )

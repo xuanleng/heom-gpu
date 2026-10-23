@@ -40,13 +40,20 @@ public:
 
     int M() const       { return M_; }
     int N() const       { return N_; }
-    int K() const       { return K_; }
+    int D() const       { return D_; }        // total ladder count Σ_n P_n
     int n_bath() const  { return n_bath_; }
     int L() const       { return L_; }        // occupation cutoff (= L_cutoff)
+    // Nb the trajectory buffers are sized for: the largest manifold block this
+    // config's task will ever store per ADO (heom::rho_capacity). Computed once
+    // here so the budget check, the alloc plan and HEOMTrajectory::capacity_
+    // are the same number.
+    int rho_capacity() const { return rho_capacity_; }
 
-    // Eigen decomposition of H_site, computed unconditionally at construction
+    // Eigen decomposition of H, computed unconditionally at construction
     // (cheap even for LHC-II): consumed by HDF5 metadata and by the
-    // HEOMTrajectory exciton-basis ρ_0 builder.
+    // HEOMTrajectory exciton-basis ρ_0 builder. Per manifold, not global:
+    // columns [lo(m), hi(m)) are manifold m's eigenvectors, energy-ascending
+    // within it, so column ground_slots(basis) + k is the k-th exciton.
     const Eigen::VectorXd&  eigenvalues()  const { return eigenvalues_; }
     const Eigen::MatrixXcd& eigenvectors() const { return eigenvectors_; }
 
@@ -58,17 +65,24 @@ public:
     // kernel reads them per (thread, n, k), so FP64 storage would mean a
     // per-read cvt on the 1/64-rate FP64 pipe. Rounded once at upload.
     const heom::complex_t* d_c_bath()        const { return d_c_bath_.get(); }
+    // Right-action coefficients c̄_k (Term 5's ρ·Q side). Real poles: c̄ = c*;
+    // conjugate pairs: the partner's c*. Filled by physics_utils::set_cbar.
+    const heom::complex_t* d_cbar_bath()     const { return d_cbar_bath_.get(); }
     // No d_nu_bath(): ν_k is host-only (total_decay precompute); the GPU never
     // needs the bath frequencies, so no device mirror is allocated.
-    // No d_abs_c_bath(): |c_{nk}| is host-only now (it fed only the Term 4/5
-    // sqrt, which is precomputed per-ADO into coeff_plus/coeff_minus below).
+    // No d_abs_c_bath(): the Shi scale s_{nk} = √(|c||c̄|) is host-only (it
+    // feeds only the Term 4/5 sqrt, precomputed per-ADO into coeff_plus/minus).
     const heom::real_t*    d_coeff_plus()    const { return d_coeff_plus_.get(); }
     const heom::real_t*    d_coeff_minus()   const { return d_coeff_minus_.get(); }
     const heom::real_t*    d_markov_residue() const { return d_markov_residue_.get(); }
-    // FP64: read once per thread (Term 2) and consumed by the compute_if_factors
-    // exp() precompute, which wants the exact Σ α_{nk}ν_k.
-    const double*          d_total_decay()   const { return d_total_decay_.get(); }
+    // FP64 complex: read once per thread (Term 2) and consumed by the
+    // compute_if_factors exp() precompute, which wants the exact Σ α_{nk}ν_k.
+    // Complex because ν of a vibrational pair is ν± = γ ± iω₁.
+    const cuDoubleComplex* d_total_decay()   const { return d_total_decay_.get(); }
     const int8_t*          d_d_coupling()    const { return d_d_coupling_.get(); }
+    // Ladder prefix sums [n_bath+1]; the kernel's Term 4/5 bath loop reads it
+    // to find each bath's slot range. Host twin: cfg.physics.mode_off.
+    const int*             d_mode_off()      const { return d_mode_off_.get(); }
 
 private:
     const HEOMConfig::Config& cfg_;
@@ -76,9 +90,10 @@ private:
 
     int M_       = 0;
     int N_       = 0;
-    int K_       = 0;
+    int D_       = 0;
     int n_bath_  = 0;
     int L_       = 0;
+    int rho_capacity_ = 0;
 
     Eigen::VectorXd  eigenvalues_;
     Eigen::MatrixXcd eigenvectors_;
@@ -87,12 +102,14 @@ private:
     GPUMemory<int>             d_plus_map_;
     GPUMemory<int>             d_minus_map_;
     GPUMemory<int8_t>          d_level_indices_;
-    GPUMemory<heom::complex_t> d_c_bath_;       // [n_bath*(K+1)] c_{nk}
-    GPUMemory<heom::real_t>    d_coeff_plus_;   // [M*n_bath*(K+1)] √[(α+1)|c|] (Term 4)
-    GPUMemory<heom::real_t>    d_coeff_minus_;  // [M*n_bath*(K+1)] √[α/|c|]    (Term 5)
+    GPUMemory<heom::complex_t> d_c_bath_;       // [D] c_{nk}
+    GPUMemory<heom::complex_t> d_cbar_bath_;    // [D] c̄_{nk} (right action)
+    GPUMemory<heom::real_t>    d_coeff_plus_;   // [M*D] √[(α+1)s] (Term 4)
+    GPUMemory<heom::real_t>    d_coeff_minus_;  // [M*D] √[α/s]    (Term 5)
     GPUMemory<heom::real_t>    d_markov_residue_; // [n_bath] per-site Markov term (Term 3)
-    GPUMemory<double>          d_total_decay_;
+    GPUMemory<cuDoubleComplex> d_total_decay_;  // [M] Σ α_{nk}ν_{nk}, complex
     GPUMemory<int8_t>          d_d_coupling_;
+    GPUMemory<int>             d_mode_off_;     // [n_bath+1] ladder prefix sums
 
     // Aggregate of host-side hierarchy data; lives only inside the constructor
     // body so it is destroyed once GPU upload completes.

@@ -8,9 +8,9 @@ fills a single card — do **not** pin multiple workers to one GPU.
 Low-level plumbing: ``heom_solver <task> <cfg> --rank N``. This launcher:
 
 1. Locates the solver
-2. Mints a shared ``--run-id`` and resets the queue
+2. Mints a shared ``--run-id`` (the queue file is per run-id + interval)
 3. Launches one worker per GPU (or one unpinned worker when ``--gpus`` omitted)
-4. Prints the ``las-post`` step
+4. Prints the post-processing step (``las-post`` / ``flu-post`` / ``twodes-post``)
 
 Injected flags: (1) ``--run-id <TS>`` shared by every worker; (2) ``--r-begin/
 --r-end`` from ``--range`` for incremental runs.
@@ -55,7 +55,9 @@ from heom_tools.mc_disorder.config_io import (
 from heom_tools.mc_disorder.manifest import read_rqmc_manifest
 
 # MC applies to spectroscopy only; dynamics disorder averaging is future work.
-MC_TASKS = ("absorption", "2des")
+MC_TASKS = ("absorption", "fluorescence", "2des")
+# Post-processor that folds this task's shards (each merges by key itself).
+POST_TOOL = {"absorption": "las-post", "fluorescence": "flu-post", "2des": "twodes-post"}
 
 # How often to refresh the terminal progress line (seconds). A node is many
 # seconds of GPU work, so polling an 8-byte counter this often is free.
@@ -225,7 +227,7 @@ def save_path_lock(save_path):
         fh.close()
         raise RuntimeError(
             f"another mc-disorder-run holds the lock on '{save_path}' "
-            "(shared save_path / mc.queue); wait or stop the other run")
+            "(shared save_path); wait or stop the other run")
     try:
         yield
     finally:
@@ -299,9 +301,10 @@ def _emit_progress(claimed, n_total, elapsed, n_alive, tty):
         print(msg, flush=True)
 
 
-def reset_queue(queue_path):
-    """Remove the shared counter so a fresh run starts realizations at 0. A
-    stale counter (== N from a finished run) would make every worker a no-op."""
+def remove_queue(queue_path):
+    """Drop a batch's counter once no worker is left to read it. Only tidiness:
+    the name is per batch (mc_naming.queue_file_name), so a leftover is never
+    read by another batch."""
     try:
         os.remove(queue_path)
     except FileNotFoundError:
@@ -371,10 +374,11 @@ def _rename_log_to_shard(save_path, run_id, r_begin, r_end, rank, log):
         pass
 
 
-def launch(solver, task, config, save_path, queue_path,
+def launch(solver, task, config, save_path,
            run_id, r_begin, r_end, gpu_of_rank):
     """Spawn one worker per entry in ``gpu_of_rank`` over [r_begin, r_end]
-    (1-based inclusive) and poll the shared queue for progress.
+    (1-based inclusive) and poll the batch's queue for progress; the queue file
+    is removed once every worker has exited.
 
     Rank is 1..len(gpu_of_rank). Each worker's stdout+stderr goes to a temp
     <save_path>/worker_rank{N}.log during the run (live-tail with `tail -f`);
@@ -385,6 +389,8 @@ def launch(solver, task, config, save_path, queue_path,
     ``gpu_of_rank[i]`` is the CUDA_VISIBLE_DEVICES string for rank i+1, or None
     to inherit the parent env. Returns [(rank, exit, log)] for failures."""
     os.makedirs(save_path, exist_ok=True)
+    queue_path = os.path.join(save_path,
+                              mc_naming.queue_file_name(run_id, r_begin, r_end))
     n_total = r_end - r_begin + 1
     begin0 = r_begin - 1                     # queue counter base (0-based)
     n_workers = len(gpu_of_rank)
@@ -422,6 +428,7 @@ def launch(solver, task, config, save_path, queue_path,
         time.sleep(PROGRESS_POLL_S)
     if tty:
         print()  # terminate the in-place \r line
+    remove_queue(queue_path)
 
     failed = []
     for rank, proc, fh, log in workers:
@@ -464,7 +471,6 @@ def _run_batch(*, solver, task, config, save_path, draws, gpu_of_rank,
                gpu_line, run_id, r_begin, r_end, resume, precision,
                disorder_identity=None, replica_banner=None):
     """Run one MC interval (fresh or resume) for a single draws_file. Returns 0/1."""
-    queue_path = os.path.join(save_path, "mc.queue")
     n_file = read_n_node(draws)
     n_total = r_end - r_begin + 1
     n_workers = len(gpu_of_rank)
@@ -485,10 +491,9 @@ def _run_batch(*, solver, task, config, save_path, draws, gpu_of_rank,
         print(f"  on disk  : {len(done0)} r; re-running gaps {gaps}")
         rc = 0
         for lo, hi in gaps:
-            reset_queue(queue_path)
             clean_stale_interval_shards(save_path, lo, hi, disorder_identity)
             failed = launch(solver, task, config,
-                            save_path, queue_path, run_id, lo, hi, gpu_of_rank)
+                            save_path, run_id, lo, hi, gpu_of_rank)
             if failed:
                 rc = 1
                 for rank, code, log in failed:
@@ -496,11 +501,10 @@ def _run_batch(*, solver, task, config, save_path, draws, gpu_of_rank,
                           f"FAILED (exit {code}); tail of {log}:", file=sys.stderr)
                     print(_log_tail(log), file=sys.stderr)
         if rc == 0:
-            print(f"[mc-disorder-run] resume done. Next:\n  las-post "
+            print(f"[mc-disorder-run] resume done. Next:\n  {POST_TOOL[task]} "
                   f"{save_path}*_rank1.h5   # merges shards for this replica by key")
         return rc
 
-    reset_queue(queue_path)
     n_stale = clean_stale_interval_shards(save_path, r_begin, r_end,
                                           disorder_identity)
 
@@ -511,7 +515,8 @@ def _run_batch(*, solver, task, config, save_path, draws, gpu_of_rank,
     print(f"  draws    : {draws}")
     print(f"  range    : [{r_begin},{r_end}] (1-based inclusive, {n_total} nodes "
           f"of {n_file if n_file is not None else '?'} in {draws})")
-    print(f"  queue    : {queue_path} (reset)")
+    print(f"  queue    : {save_path}"
+          f"{mc_naming.queue_file_name(run_id, r_begin, r_end)} (this batch only)")
     if n_stale:
         print(f"  cleaned  : {n_stale} stale r{r_begin}-{r_end} shard/log file(s) "
               "from a previous run of this interval")
@@ -521,7 +526,7 @@ def _run_batch(*, solver, task, config, save_path, draws, gpu_of_rank,
           f"(temp; renamed to <shard>.log on success)")
 
     failed = launch(solver, task, config,
-                    save_path, queue_path, run_id, r_begin, r_end, gpu_of_rank)
+                    save_path, run_id, r_begin, r_end, gpu_of_rank)
 
     if failed:
         for rank, code, log in failed:
@@ -531,7 +536,7 @@ def _run_batch(*, solver, task, config, save_path, draws, gpu_of_rank,
         return 1
 
     print(f"[mc-disorder-run] all {n_workers} worker(s) done. Next:")
-    print(f"  las-post {save_path}*_{run_id}_r{r_begin}-{r_end}_rank1.h5   "
+    print(f"  {POST_TOOL[task]} {save_path}*_{run_id}_r{r_begin}-{r_end}_rank1.h5   "
           "# auto-merges by param key (across batches), then makes the spectrum")
     return 0
 
@@ -570,7 +575,7 @@ def _main_manifest(p, args, solver, save_path, gpu_of_rank, gpu_line, precision)
                   f"(cfg {os.path.basename(cfg)})")
         # Per-replica run_id: info bit only (merge keys on disorder_identity),
         # but distinct timestamps make shard dirs easier to debug.
-        repl_run_id = f"{time.strftime('%Y%m%d_%H%M')}_repl{repl}"
+        repl_run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_repl{repl}"
         rc = _run_batch(
             solver=solver, task=args.task, config=cfg, save_path=save_path,
             draws=draws, gpu_of_rank=gpu_of_rank,
@@ -584,7 +589,7 @@ def _main_manifest(p, args, solver, save_path, gpu_of_rank, gpu_line, precision)
             return rc
 
     print(f"[mc-disorder-run] all {n_rep} replica(s) done. Next:")
-    print("  las-post <save_path>/*_rank1.h5   # per replica (distinct merge keys)")
+    print(f"  {POST_TOOL[args.task]} <save_path>/*_rank1.h5   # per replica (distinct merge keys)")
     print("  mc-disorder-merge --combine-replicas --out rqmc.h5 rep0.h5 ...")
     return 0
 
@@ -651,10 +656,10 @@ def main(argv=None):
               f"explicit solver path in effect ({solver})", file=sys.stderr)
 
     # One timestamp for the whole launch, handed to every worker so their shards
-    # share one prefix (a per-worker now() would split across a minute). Format
-    # matches the solver's resolve_output_path (%Y%m%d_%H%M). It is an info bit in
+    # share one prefix (a per-worker now() would split across a second). Format
+    # matches the solver's local_timestamp (%Y%m%d_%H%M%S). It is an info bit in
     # the filename only — grouping/merging keys on the parameter key, not the TS.
-    run_id = time.strftime("%Y%m%d_%H%M")
+    run_id = time.strftime("%Y%m%d_%H%M%S")
 
     if gpus is not None:
         gpu_line = (f"  gpus     : {gpus}  ({n_workers} worker(s), one per card; "

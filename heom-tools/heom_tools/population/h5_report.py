@@ -77,25 +77,41 @@ def _print_spectral_density(f: h5py.File) -> None:
 def _print_matsubara(f: h5py.File) -> None:
     if "/derived/bath_c_cm2" not in f or "/derived/bath_nu_cm" not in f:
         return
-    c = np.asarray(f["/derived/bath_c_cm2"][...], dtype=np.complex128)
-    nu = np.asarray(f["/derived/bath_nu_cm"][...], dtype=np.float64)
-    FS_TO_AU, CM_TO_AU = 41.341374575751, 4.556335e-6
+    def _cplx(a):
+        a = np.asarray(a)
+        if a.dtype.kind in "fc":
+            return a.astype(np.complex128)
+        return a["r"] + 1j * a["i"]
 
-    c = np.atleast_2d(c)
-    nu = np.atleast_2d(nu)
-    n_bath = c.shape[0]
+    c = _cplx(f["/derived/bath_c_cm2"][...])
+    nu = _cplx(f["/derived/bath_nu_cm"][...])
+    FS_TO_AU, CM_TO_AU = 41.341374, 4.556335e-6
+    kind_name = {0: "Drude", 1: "pole", 2: "BO+", 3: "BO-"}
 
-    print("\n[Matsubara Expansion Parameters]")
-    print("# site  k    c_k (real)       c_k (imag)       ν_k          1/ν_k")
-    print("#                     (cm^-1)         (cm^-1)         (cm^-1)      (fs)")
+    # Mode layout: flat [D] in slot order, site n owns [mode_off[n], mode_off[n+1]).
+    # Older files are [n_bath][K+1] with real ν: synthesize the same view.
+    if c.ndim == 2:
+        n_bath, per = c.shape
+        mode_off = np.arange(n_bath + 1) * per
+        c, nu = c.reshape(-1), nu.reshape(-1)
+        kind = np.where(np.arange(c.size) % per == 0, 0, 1)
+    else:
+        mode_off = np.asarray(f["/derived/mode_off"][...])
+        kind = np.asarray(f["/derived/mode_kind"][...])
+        n_bath = mode_off.size - 1
+
+    print("\n[Bath Expansion Parameters]")
+    print("# site  k  kind     c_k (real)       c_k (imag)       Re ν_k       Im ν_k      1/Re ν_k")
+    print("#                        (cm^-1)         (cm^-1)         (cm^-1)      (cm^-1)      (fs)")
     for n in range(n_bath):
-        for k in range(c.shape[1]):
-            nu_inv = (
-                1.0 / (nu[n, k] * CM_TO_AU) / FS_TO_AU if nu[n, k] > 0 else 0.0
-            )
+        for idx in range(mode_off[n], mode_off[n + 1]):
+            k = idx - mode_off[n]
+            re_nu = nu[idx].real
+            nu_inv = 1.0 / (re_nu * CM_TO_AU) / FS_TO_AU if re_nu > 0 else 0.0
             print(
-                f"#  {n + 1:2d} {k:2d}   {c[n, k].real:14.6f}   {c[n, k].imag:14.6f}"
-                f"   {nu[n, k]:14.6f}   {nu_inv:10.4f}"
+                f"#  {n + 1:2d} {k:2d}  {kind_name.get(int(kind[idx]), '?'):5s}"
+                f"   {c[idx].real:14.6f}   {c[idx].imag:14.6f}"
+                f"   {re_nu:12.6f} {nu[idx].imag:12.6f}   {nu_inv:10.4f}"
             )
 
 

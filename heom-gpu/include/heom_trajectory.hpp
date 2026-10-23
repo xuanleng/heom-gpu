@@ -9,308 +9,225 @@
 #include "core/precision.hpp"          // heom::complex_t (hier precision buffers)
 
 #include <Eigen/Dense>
-#include <cuComplex.h>
-#include <complex>       // StepCallback uses std::complex<double>*
-#include <functional>    // StepCallback is std::function<...>
+#include <complex>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-class HDF5Writer;
 class UListBuilder;  // compact launch set U = E (opt-in via time_evolution.ulist)
 
-// Device-resident carry-through snapshot. Holds the active ADO blocks gathered
-// ON the GPU — no D2H/H2D and no per-element cuDoubleComplex↔std::complex
-// conversion in the τ/T tree (a host-side snapshot would pay both per point).
-// Buffers are grow-only so they are reused across the whole tree with no
-// per-point cudaMalloc churn; two are live at once (τ and T).
+// Device-resident copy of a trajectory's whole state, for the 2DES τ/T tree.
+// restore(snapshot()) is the identity: propagating on from a restored state is
+// propagating on from the original, bit for bit, in both builds. Everything
+// here is what the next step reads; the U-list is not, because the first step
+// after a restore scans all M, which yields the same flags.
+//
+// The mixed build's Kahan carry is state too. Restarting it at zero on every
+// restore looked like an ulp-level shortcut and measured as 5x the build's own
+// error on a branch-every-step tree (FMO L=5: 1.9e-7 vs 3.7e-8 against FP64;
+// historical snapshot-identity probe notes).
+//
+// A snapshot is replayed only on the SystemContext that took it, at a width
+// the target can hold: restore/expand check both before writing anything. The
+// ρ buffer is sized once, to batch·M·rho_capacity, on the first capture — the
+// figure the 2DES budget reserves for it — so it never grows mid-tree.
 struct DeviceHierarchySnapshot {
-    int    N           = 0;
-    int    n_active    = 0;
-    int    batch       = 1;              // # slots captured (2DES batched-walk variable width)
-    double alpha0_norm = 0.0;            // max_b ‖ρ_0^(b)‖_F at snapshot (divergence baseline)
-    GPUMemory<heom::complex_t> blocks;   // [batch·n_active·N²] gathered active blocks (hier precision)
-    GPUMemory<int>             ids;      // [n_active] ascending ADO ids (incl. α=0), SHARED by all slots
-    GPUMemory<int8_t>          flags;    // [M] active_flags snapshot (filtering on), SHARED by all slots
+    const SystemContext* sys = nullptr;  // producer; null ⇒ never filled
+    int  batch = 0;                      // slots captured
+    heom::ManifoldBlock support;         // where ρ lives (its storage shape)
+    std::vector<char> fresh;             // [batch] fill window open (see fresh_state_)
+    std::vector<int>  fresh_zeros;       // [batch] zero-ADO counts (see fresh_zeros_)
+    std::vector<double> norm0;           // [batch] per-slot divergence baselines
+    GPUMemory<heom::complex_t> rho;      // [batch·M·Nb] verbatim, Nb = support.elems()
+    GPUMemory<int8_t>          flags;    // [batch·M] per-slot active_flags (filtering on)
+    GPUMemory<heom::complex_t> kahan;    // [batch·M·Nb] RK4 carry (mixed build only)
 };
 
 /**
- * @brief One propagation run on top of an immutable SystemContext.
+ * @brief The propagation engine: B density-matrix hierarchies on top of an
+ * immutable SystemContext, and the primitives that move them.
  *
- * Owns trajectory-specific GPU buffers (d_rho_, d_workspace_, filter
- * state), the host mirror of ρ_0, the HDF5 writer, divergence flag,
- * and timing. RK4 combines in-place into d_rho_ (no ping-pong buffer).
+ * Owns the trajectory-specific GPU buffers (d_rho_, d_workspace_, filter
+ * state), the hier-precision host mirror of ρ_0, the divergence flag, and the
+ * running step counter. RK4 combines in-place into d_rho_ (no ping-pong).
+ * Cheap to construct against the same SystemContext, by design.
  *
- * Cheap to construct against the same SystemContext, by design — for 2DES
- * we need ~10⁴ HEOMTrajectory instances per Hamiltonian.
+ * The state is ρ plus two facts about it that every launch needs:
+ *   - its WIDTH  (active_batch(): how many slots hold a matrix), and
+ *   - its SUPPORT (support(): the manifold block it lives in).
+ * Both change only where ρ does. Four calls replace ρ and each carries the
+ * new width and support with it — set_initial(rho0s, block), apply_dipole(
+ * mus, side, block_after), restore_device(snap), expand_slots(parent, map) —
+ * and propagate_steps(n) advances whatever is there. That is the whole
+ * protocol; dynamics, absorption and 2DES are all callers of it.
  *
- * Usage (1D site/exciton excitation, current default):
- *   SystemContext sys(cfg);
- *   HEOMTrajectory traj(sys);
- *   traj.set_initial_from_config();
- *   traj.solve();
- *   traj.save_results();
+ * Every state-touching call is batched: it takes B matrices / dipoles and acts
+ * on B slots. B==1 is the batched API with a one-element vector.
  *
- * Usage (2DES, future):
- *   SystemContext sys(cfg);
- *   HEOMTrajectory traj(sys, false);   // second arg = enable_hdf5
- *   traj.set_initial(rho_pathway);
- *   traj.solve();
- *   double trace = traj.final_trace();
- *
- * Replaces the "per-trajectory" half of the old HEOMSolver
- * (solve, save_results, initialize_density_matrices, allocate_gpu_memory
- * for mutable buffers).
+ * Not here, by design:
+ *   - the output loop / HDF5 file / "Final trace" — heom::run_output_loop and
+ *     heom::run_dynamics (dynamics_run.hpp), built on propagate_steps;
+ *   - device-side 2DES detection — heom::Detector (detector.hpp), built on
+ *     device_rho().
  */
 class HEOMTrajectory {
 public:
     /**
-     * @param sys          Immutable system context (must outlive this trajectory).
-     * @param enable_hdf5  If true (default), opens an HDF5 file on solve() and
-     *                     writes timesteps. For 2DES in-memory loops, pass false.
-     * @param batch        Batch width B: propagate B density matrices that share
-     *                     one SystemContext (H / maps / bath) in a single launch.
-     *                     B==1 (default) is bit-exact to the historical single
-     *                     path. The ctor sizes every mutable buffer by B and runs
-     *                     the GPU budget check with B up front — one-shot, no
-     *                     re-alloc/re-check window (hence a ctor arg, not a setter).
+     * @param sys    Immutable system context (must outlive this trajectory).
+     * @param batch  Batch width B: propagate B density matrices that share one
+     *               SystemContext (H / maps / bath) in a single launch. The
+     *               ctor sizes every mutable buffer by B and runs the GPU
+     *               budget check with B up front — one-shot, no re-alloc /
+     *               re-check window (hence a ctor arg, not a setter).
      */
-    explicit HEOMTrajectory(const SystemContext& sys, bool enable_hdf5 = true,
-                            int batch = 1);
+    explicit HEOMTrajectory(const SystemContext& sys, int batch = 1);
     ~HEOMTrajectory();
 
     HEOMTrajectory(const HEOMTrajectory&)            = delete;
     HEOMTrajectory& operator=(const HEOMTrajectory&) = delete;
 
-    /// Set initial state from an arbitrary N×N density matrix.
-    /// The α=0 ADO slot is loaded with rho0; all α>0 slots are zeroed.
-    /// Single-state API: throws on a batched trajectory (use set_initial_batch).
-    void set_initial(const Eigen::MatrixXcd& rho0);
-
-    /// Batched initial state: rho0s[b] is written to slot b's α=0 block, all
-    /// α>0 slots zeroed. Requires rho0s.size() == batch(). The divergence
-    /// ceiling uses max_b ‖ρ0_b‖_F (holds for the most energetic slot too).
+    /// Initial state: rho0s[b] is written to slot b's α=0 block, all α>0 slots
+    /// zeroed. The active width becomes rho0s.size() (1 ≤ size ≤ batch()): the
+    /// 2DES τ layer sets 3 matrices on a batch=21 trajectory and runs at width
+    /// 3 from there. Slot b's divergence baseline becomes ‖rho0s[b]‖_F.
     /// Resets the internal step counter (opens a fresh tree for every slot).
-    void set_initial_batch(const std::vector<Eigen::MatrixXcd>& rho0s);
-
-    /// Convenience wrapper: build initial ρ_0 from cfg.initial (YAML path).
-    /// Internally calls set_initial(). Also captures pigment / exciton
-    /// metadata for HDF5 attributes when enable_hdf5 is true.
-    void set_initial_from_config();
-
-    /// Per-output-record callback the solver
-    /// invokes after each D2H copy of ρ_0 (the α=0 ADO).
-    ///   record_idx     : 0 == t=0 initial state; thereafter +1 per
-    ///                    output_interval HEOM step.
-    ///   t_fs           : simulation time at this record.
-    ///   h_rho_alpha0   : host pointer, length N²; row-major i*N+j layout
-    ///                    matching GPU kernels and HDF5 datasets.
-    ///   N              : Hilbert dimension (== sys.N()).
-    /// Pure host-side type — spectra/dipole.hpp etc. need no CUDA include.
-    using StepCallback = std::function<
-        void(int record_idx,
-             double t_fs,
-             const std::complex<double>* h_rho_alpha0,
-             int N)>;
-
-    /// Run the time evolution. Reads time params from sys_.config().time.
-    /// If enable_hdf5 is true, opens the HDF5 file and writes timesteps.
-    /// If on_output_step is non-empty, it is invoked once per output record
-    /// (record 0 == t=0 initial state, then every output_interval step).
-    /// The default empty callback preserves the historical zero-overhead
-    /// path for the dynamics CLI and 2DES in-memory drivers.
-    void solve(const StepCallback& on_output_step = {});
-
-    /// Batched per-output-record callback: h_rho_batch points to [batch][N²]
-    /// (slot-major, contiguous), the B physical density matrices at this record.
-    ///   record_idx : 0 == t=0 initial state; then +1 per output_interval step.
-    ///   t_fs       : simulation time at this record.
-    ///   N          : Hilbert dimension (== sys.N()).
-    ///   batch      : number of slots B (== batch()).
-    using BatchStepCallback = std::function<
-        void(int record_idx,
-             double t_fs,
-             const std::complex<double>* h_rho_batch,
-             int N,
-             int batch)>;
-
-    /// Batched time evolution: propagate all B slots together and fan each
-    /// output record out through the BatchStepCallback. Requires the trajectory
-    /// was constructed with enable_hdf5=false (the HDF5 schema is single-ρ0).
-    /// B==1 is equivalent to solve() with a single-state callback.
-    void solve_batch(const BatchStepCallback& on_output_step);
+    ///
+    /// `support` is where ρ lives — rows [row_off, +n_row) × cols [col_off,
+    /// +n_col) — and every launch from here on is confined to it (see
+    /// support_). Dynamics passes ManifoldBlock::full(N); absorption (e,g); a
+    /// 2DES tree starts at the ground block. Checked, not trusted: an element of
+    /// any rho0s[b] outside the block that is not exactly 0.0 throws
+    /// invalid_argument before anything reaches the device.
+    void set_initial(const std::vector<Eigen::MatrixXcd>& rho0s,
+                     const heom::ManifoldBlock& support);
 
     /// Batch width B this trajectory was constructed with.
     int batch() const { return batch_; }
 
-    /// 2DES batched-walk variable width: set the number of ACTIVE slots B_active
-    /// (1 ≤ B_active ≤ batch()). Every subsequent launch (derivatives / RK4 /
-    /// filter / detection / divergence) spans only the first B_active slots via
-    /// grid.y = ctx_.batch. The τ/T/t layers of the 3→9→21 walk run at width
-    /// 3/9/21 on ONE batch=21 trajectory. Directly updates ctx_.batch too:
-    /// build_context() is idempotent (ctx_built_ guard), so mutating only the
-    /// member would leave ctx_.batch frozen and silently pin the launch width.
-    /// Default active_batch_ == batch_ ⇒ B==1 and absorption (B=3) unchanged.
-    void set_active_batch(int batch);
-
-    /// Current active batch width (see set_active_batch).
+    /// Number of ACTIVE slots B_active ≤ batch(): how many density matrices the
+    /// current ρ holds. Every launch (derivatives / RK4 / filter / detection /
+    /// divergence) spans only these via grid.y = ctx_.batch. It is a property
+    /// of ρ, so it changes only where ρ does: set_initial (rho0s.size()),
+    /// restore_device (snap.batch), expand_slots (child_to_parent.size()). The
+    /// τ/T/t layers of the 3→9→21 walk run at width 3/9/21 on ONE batch=21
+    /// trajectory. Default == batch() ⇒ B==1 and absorption (B=3) unchanged.
     int active_batch() const { return active_batch_; }
 
-    /// Declare that ρ's support is confined to rows [row_off, row_off+n_row) ×
-    /// cols [col_off, col_off+n_col), so every launch can skip the rest.
-    ///
-    /// This is a CLAIM ABOUT THE PHYSICS, and the kernel takes it literally:
-    /// elements outside the block are neither read nor written, so if any is
-    /// actually nonzero it is silently frozen and the answer is wrong. Only
-    /// declare a block a pulse sequence guarantees — after μ_ge the support is
-    /// (e,g), after a second μ on an ESA pathway it is (f,e).
-    ///
-    /// The two ranges must be identical or disjoint (manifolds partition the
-    /// basis); anything else throws.
-    ///
-    /// The descriptor is NOT sticky across a ρ replacement: dipole / restore /
-    /// expand each call on_rho_replaced(), which clears it back to the whole
-    /// matrix. Forgetting to re-declare a block therefore costs speed, never
-    /// correctness — the failure mode that leaves fingerprints instead of the
-    /// one that doesn't.
-    ///
-    /// Setting HEOM_NO_MANIFOLD_BLOCK in the environment makes the kernel run
-    /// the whole matrix anyway, which is how you A/B the optimisation without
-    /// touching a config (and hence without perturbing config_hash). The switch
-    /// acts where the descriptor is CONSUMED, not here: this call still records
-    /// and still validates, so both halves of an A/B run take the same path and
-    /// propagations_without_block() keeps measuring the driver rather than the
-    /// environment.
-    void set_manifold_block(int row_off, int n_row, int col_off, int n_col);
+    /// Where the current ρ has support (see set_initial / apply_dipole). It is
+    /// the STORAGE SHAPE: every ADO holds exactly the elems() elements inside
+    /// this block, row-major, and nothing outside exists in device memory.
+    /// Changed only by the four calls that replace ρ, each of which checks the
+    /// new ρ actually fits (and that the block fits the allocated capacity)
+    /// before installing it. Empty until set_initial.
+    const heom::ManifoldBlock& support() const { return support_; }
 
-    /// Drop back to the whole N×N matrix. Idempotent, silent.
-    void clear_manifold_block();
+    bool diverged() const { return diverged_; }
 
-    /// Propagation segments that ran without any declared block, i.e. over the
-    /// whole N×N matrix. Correct but unaccelerated, and invisible to a bitwise
-    /// A/B gate — the two runs agree precisely because nothing was blocked. The
-    /// 2DES driver asserts this is zero; absorption declares the e×g block, so
-    /// it too should stay at zero. Dynamics never declares one (ρ fills the ee
-    /// block), so for it a nonzero count is simply the truth.
-    long long propagations_without_block() const {
-        return propagations_without_block_;
+    /// The α=0 block of every ACTIVE slot, read out in double: out is resized
+    /// to active_batch()·N² (slot-major, row-major N×N) and each element is
+    /// the hier-precision device value promoted via c_re/c_im — where the
+    /// dynamics observable crosses FP32→FP64 in the mixed build. The
+    /// spectra observables do not come through here: Detector takes Tr(μ·ρ)
+    /// on the device (trace_BR), so in the mixed build that sum is FP32 and
+    /// only its result is promoted. One D2H.
+    /// This is what the output loop hands to its sink and what the HDF5 file
+    /// receives; throws before set_initial.
+    void read_alpha0(std::vector<std::complex<double>>& out);
+
+    /// Per-filter-step records accumulated so far (empty with filtering off).
+    /// The dynamics writer stores them; nothing in the core reads them back.
+    const std::vector<FilteringRecord>& filtering_history() const {
+        return filtering_history_;
     }
 
-    /// Close HDF5 file (if open) and print final trace.
-    /// Safe to call even if enable_hdf5 was false — just prints trace.
-    void save_results();
-
-    bool diverged()                 const { return diverged_; }
-    double simulation_time_seconds() const { return simulation_time_seconds_; }
-
-    /// Tr(ρ_0) reading from the host mirror. Cheap (N additions).
-    double final_trace() const;
-
-    /// Copy ρ_0 from device to a fresh Eigen matrix. Used by 2DES drivers
-    /// for response-function expectation values. Performs one D2H copy.
-    Eigen::MatrixXcd final_rho0() const;
-
     /// Copy slot b's α=0 block (device) to a fresh N×N matrix (one D2H). b must
-    /// be in [0, batch()). Per-slot readback for the 2DES batched parity tests
-    /// (final_rho0() only sees slot 0). Reads the raw device state — no filter /
-    /// no host-mirror dependency.
+    /// be in [0, batch()). Per-slot readback for the 2DES batched parity tests.
+    /// Reads the raw device state — no filter / no host-mirror dependency.
     Eigen::MatrixXcd slot_rho0(int b) const;
 
     // 2DES carry-through primitives.
-    /// Apply a single-side dipole μ (N×N host matrix) to the FULL ADO
-    /// hierarchy; result is written back into d_rho_. Post-condition: if
-    /// filtering is on, immediately refilter (recompute norms→flags) + rebuild
-    /// ulist — μ shifts the norm distribution, so stale flags are invalid.
-    void apply_dipole_full_hierarchy(const Eigen::MatrixXcd& mu,
-                                     heom::spectra::DipoleSide side);
-
-    /// 2DES per-slot dipole. Apply a distinct operator to each of the
-    /// active_batch_ slots' full hierarchy in one batched launch: slot b gets
-    /// mus[b] on the given `side`. mus.size() must equal active_batch(). Post:
-    /// same as apply_dipole_full_hierarchy but batched — refilter (union over
-    /// active slots) and refresh the divergence baseline to the max ||rho0||,
-    /// so the t-scan's check_divergence_now uses the post-dipole
-    /// baseline, not the pre-excitation one). B=1 degenerates bit-for-bit to
-    /// apply_dipole_full_hierarchy.
-    void apply_dipole_per_slot(const std::vector<Eigen::MatrixXcd>& mus,
-                               heom::spectra::DipoleSide side);
+    /// Apply a single-side dipole to the FULL ADO hierarchy of every active
+    /// slot in one launch: slot b gets mus[b] (N×N host matrix) on the given
+    /// `side`; mus.size() must equal active_batch(). Result is written back
+    /// into d_rho_. Post: the hierarchy is marked all-active (μ replaced ρ, so
+    /// the old active set describes nothing) and slot b's divergence baseline
+    /// becomes ‖μ_b ρ_0‖ (or ‖ρ_0 μ_b‖) — the t-scan's check_divergence_now
+    /// then uses the post-dipole baseline, not the pre-excitation one.
+    ///
+    /// `support_after` is where μρ (Left) or ρμ (Right) lives. Checked against
+    /// μ on the host before the launch: Left keeps the columns and may only
+    /// move rows to those μ(i,k) ≠ 0 reaches from the current rows k; Right is
+    /// the transpose statement. A μ that would carry a nonzero outside the
+    /// declared block throws invalid_argument — the block is a claim about the
+    /// physics and this is the one place the claim can be falsified cheaply.
+    void apply_dipole(const std::vector<Eigen::MatrixXcd>& mus,
+                      heom::spectra::DipoleSide side,
+                      const heom::ManifoldBlock& support_after);
 
     /// Device-resident snapshot/restore (the 2DES carry-through primitive).
-    /// snapshot: recompute norms→flags, gather the active ADO blocks; restore:
-    /// zero+scatter+flags+ulist. The gathered blocks stay on the GPU (D2D),
-    /// eliminating the per-τ/T-point n_active·N² D2H/H2D and the host element-
-    /// conversion loops. `snap` buffers grow-only and are reused across the tree
-    /// by the caller. Restore is safe to propagate immediately afterwards (no
-    /// "wait for next filter step" window).
+    /// snapshot copies the state out (D2D: ρ, the flags, the mixed build's
+    /// Kahan carry) and changes nothing; restore copies it back. `snap` is reused across the
+    /// tree by the caller. Restore throws invalid_argument, before any write,
+    /// if `snap` came from another SystemContext (or was never filled) or holds
+    /// more slots than this trajectory has.
     void snapshot_device(DeviceHierarchySnapshot& snap);
     void restore_device(const DeviceHierarchySnapshot& snap);
 
-    /// 2DES batched-walk fan-out primitive. Expand a parent snapshot
-    /// (B_parent slots, shared ids/flags) into B_child = child_to_parent.size()
-    /// slots of d_rho_: child slot c is filled from parent slot child_to_parent[c]
-    /// (a general, possibly uneven, map — 3→9 by m1, 9→21 by (m1,m2)). Zeroes the
-    /// B_child·M·N² working prefix, scatters each child from its parent's active
-    /// blocks (shared ids), restores the shared flags/ulist + divergence baseline
-    /// from the parent, and sets active_batch_ = B_child. child_to_parent[c] must
-    /// be in [0, parent.batch).
+    /// 2DES batched-walk fan-out primitive. Child slot c becomes a
+    /// copy of parent slot child_to_parent[c] — its ρ, Kahan carry and
+    /// divergence baseline — for a general, possibly uneven map (3→9 by m1, 9→21 by
+    /// (m1,m2)); the shared flags come from the parent and active_batch_ =
+    /// child_to_parent.size(). Same checks as restore_device, plus every
+    /// child_to_parent[c] in [0, parent.batch), all before any write.
     void expand_slots(const DeviceHierarchySnapshot& parent,
                       const std::vector<int>& child_to_parent);
+
+    /// ‖ρ − snap.rho‖_F / ‖ρ‖_F over every stored element of every ADO of the
+    /// active slots, accumulated in double. In the mixed build both sides are
+    /// the Kahan-corrected values ρ − comp. Deterministic: fixed grid, per-block
+    /// partials summed on the host in index order. Throws invalid_argument if
+    /// snap is from another SystemContext or its width / support differ from
+    /// the current state, runtime_error if ‖ρ‖ = 0.
+    double relative_distance(const DeviceHierarchySnapshot& snap);
+
+    /// Fill every α>0 ADO of every active slot from α=0, tier by tier, with the
+    /// solution of L₀σ = 0 (Terms 2 + 3 + 5 only; fluorescence theory
+    /// eq:dressed):
+    ///   ρ̃_α[ij] = −i Σ_{n,k} √(α_nk/s_nk)(c_nk d_i − c̄_nk d_j) ρ̃_{α−e_nk}[ij]
+    ///             / (Σ α_nk ν_nk + Σ_n Δ_n (d_i − d_j)²).
+    /// The exact steady state for a monomer and for uncoupled sites; otherwise
+    /// what is left to relax is only what the inter-site coupling causes. The
+    /// result is a new unpropagated hierarchy: Kahan carry cleared, all ADOs
+    /// active on the next step. Throws logic_error before set_initial.
+    void dress_ados();
 
     /// Propagate n internal RK4 steps with no reset / no HDF5 / no record
     /// callback (carry-through). Uses the cross-segment internal step counter.
     /// check_div=true (default) keeps the per-segment ‖ρ_0‖_F divergence guard
-    /// (one N² D2H at the end of the call). The 2DES t-scan passes false so the
-    /// innermost advance does NOT pay a per-t-point D2H+sync; the driver runs
-    /// one check_divergence_now() per t-scan instead.
+    /// (one N² D2H at the end of the call). Callers that already pay a D2H at
+    /// their own cadence pass false and call check_divergence_now() there:
+    /// dynamics once per record (after read_alpha0), the 2DES t-scan once per
+    /// scan instead of per t-point.
     void propagate_steps(int n_internal_steps, bool check_div = true);
 
-    /// Public one-shot divergence guard for the 2DES carry-through driver:
-    /// one N² D2H of ρ_0 + Frobenius-norm ceiling test. Latches diverged() and
-    /// returns it. Lets the t-scan coarsen divergence detection to once per scan
-    /// instead of once per t-point.
-    bool check_divergence_now(double t_fs, int step);
+    /// Public one-shot divergence guard: one N² D2H of ρ_0 + Frobenius-norm
+    /// ceiling test. Latches diverged() and returns it. The output loop calls
+    /// it once per record (n_total = the run's step count, for the report);
+    /// the 2DES t-scan once per scan instead of once per t-point, with no
+    /// meaningful total (0).
+    bool check_divergence_now(double t_fs, int step, int n_total = 0);
 
-    // ── 2DES batched device-side detection ─────────────
-    /// Begin a detection batch for one pathway tree: upload the (fixed) μ_det
-    /// operator once and size the device result grid to n_samples. Replaces
-    /// the per-t-point expectation() host round-trip.
-    void detect_begin(const Eigen::MatrixXcd& mu_det, int n_samples);
-    /// Sample Tr(μ_det·ρ_0) into device slot `idx` (async, no sync / no D2H).
-    /// Must be called after detect_begin and a propagate; reads the α=0 block.
-    void detect_sample(int idx);
-    /// Flush the whole detection grid to host with ONE D2H (n_samples scalars),
-    /// converting cuDoubleComplex → std::complex into out_host[0..n_samples).
-    void detect_flush(std::complex<double>* out_host, int n_samples);
+    /// The immutable system this trajectory propagates.
+    const SystemContext& sys() const { return sys_; }
 
-    /// 2DES batched detection. Set up B_det = mus_det.size()
-    /// distinct detection dipoles (one per slot / pathway) and a
-    /// [B_det·n_samples] result grid. The detection width is taken from
-    /// mus_det.size() and stored (detect_batch_) — it is DECOUPLED from
-    /// active_batch_, which may differ at the call site; detect_sample_batch
-    /// always launches at detect_batch_. B_det must be in [1, batch()].
-    void detect_begin_batch(const std::vector<Eigen::MatrixXcd>& mus_det,
-                            int n_samples);
-    /// Sample Tr(μ_det^(b)·ρ_0^(b)) for every detection slot b into column idx
-    /// (async, no sync / no D2H). grid.y = detect_batch_; slot b reads its own
-    /// α=0 block (b·M·N²) and its own μ_det (b·N²), writes out[b·n_samples+idx].
-    void detect_sample_batch(int idx);
-    /// Flush the [B_det·n_samples] grid to host (ONE D2H). out_host must hold
-    /// detect_batch()·n_samples scalars, slot-major: slot b at [b·n_samples..).
-    void detect_flush_batch(std::complex<double>* out_host, int n_samples);
-    /// Detection width set by the last detect_begin/detect_begin_batch.
-    int detect_batch() const { return detect_batch_; }
-
-    /// Manifold-occupancy probe. Reports, for
-    /// every (row manifold, column manifold) block, the max |ρ| found anywhere
-    /// in the hierarchy; prints ONLY the occupied blocks plus their count, so a
-    /// line carrying two block names IS the violation. Gated by the
-    /// HEOM_BLOCK_PROBE environment variable; a plain early return otherwise.
-    ///
-    /// ACCEPTANCE TOOLING, NOT A ROUTINE SWITCH: each call D2Hs the entire
-    /// [B][M][N][N] hierarchy (2 GB per call at FMO B=21). Use it on
-    /// dimer-scale recipes to localise which block a bookkeeping bug landed in
-    /// — never on a production grid.
-    void probe_blocks(const char* where) const;
+    /// Borrowed device pointer to the hierarchy, [batch][M][Nb] in hier
+    /// precision with Nb = support().elems() (compact block storage, so the
+    /// layout changes whenever support() does — read both together). Allocated
+    /// once in the ctor and never moved, so the pointer is stable for the
+    /// trajectory's lifetime. For read-only side consumers (Detector); nothing
+    /// outside this class writes through it.
+    const heom::complex_t* device_rho() const { return d_rho_.get(); }
 
     /// 2DES structured logging: prefix prepended to every per-step filtering
     /// statistics line (the ones gated by print_interval). Lets the 2DES driver
@@ -347,33 +264,31 @@ public:
     /// label always matches the shown active set and t-prints land on round j.
     void set_cadence_logging(bool on) { cadence_logging_ = on; }
 
-    /// Physical-layer expectation Tr(B·ρ_0). Performs its OWN D2H of the α=0
-    /// block — do NOT use final_rho0() here, its host mirror is stale after
-    /// propagate_steps() (which does not emit).
-    std::complex<double> expectation(const Eigen::MatrixXcd& B) const;
-
-    /// Number of output records this trajectory will emit, given the time
-    /// configuration in sys_.config().time. Forwards to the free function
-    /// `output_record_count(TimeParameters)` defined in include/types.hpp
-    /// (single source of truth for the formula).
-    int n_output_records() const {
-        return output_record_count(sys_.config().time);
-    }
-
 private:
     const SystemContext& sys_;
-    const bool enable_hdf5_;
 
-    // Batch width B (ctor arg). Every mutable O(M·N²) buffer (d_rho_,
+    // Batch width B (ctor arg). Every mutable O(M·Nb) buffer (d_rho_,
     // d_workspace_, d_kahan_comp_) and the α=0 host mirror are sized by B;
     // read-only system tables stay single-copy. B==1 ⇒ pre-batch layout.
     const int batch_;
 
-    // 2DES batched-walk active width B_active ≤ batch_ (set_active_batch). Drives
+    // Elements per ADO the mutable buffers are allocated for (Nb_cap =
+    // sys_.rho_capacity()). Every block installed through set_support_ must
+    // satisfy elems() ≤ capacity_; that check is what makes the compacted
+    // layout safe to write into.
+    const int capacity_;
+
+    // 2DES batched-walk active width B_active ≤ batch_ (see active_batch()). Drives
     // grid.y for every launch and the slot count for filter/divergence/init.
     // Initialised to batch_ so the non-2DES paths (dynamics/absorption) are
     // unchanged. Buffers stay sized by batch_ (max); only the launch width moves.
     int active_batch_;
+
+    // The one write point for active_batch_ (1 ≤ w ≤ batch_, else throws).
+    // Also updates ctx_.batch when the context already exists: build_context()
+    // is idempotent, so mutating only the member would leave the launch width
+    // frozen at whatever it was first built with (the idempotency trap).
+    void set_width_(int w);
 
     // GPU mutable buffers (per-trajectory). d_rho_ is always the current
     // state: rk4_step's final combine is in-place (rho += dt/6 · acc), so
@@ -385,77 +300,70 @@ private:
     // Kahan compensation carry for the RK4 final combine. Only
     // allocated + zero-inited in the mixed-precision build (heom::kMixedPrecision);
     // empty (nullptr) in the FP64 build so rk4_step's combine stays bit-identical
-    // to history. Persists across steps — the carry lives here.
+    // to history. Persists across steps — the carry lives here. Same layout as
+    // d_rho_ (the combine indexes both with one offset), so a snapshot copies
+    // it with ρ's extents.
     GPUMemory<heom::complex_t> d_kahan_comp_;
 
-    // Manifold block descriptor (see set_manifold_block). blk_set_ == false
-    // means "whole matrix"; ctx_ then gets (0,N,0,N) rather than a sentinel for
-    // the kernel to interpret. blk_set_ means exactly "the driver declared a
-    // block for the current ρ" — HEOM_NO_MANIFOLD_BLOCK does not touch it.
-    int  blk_row_off_ = 0;
-    int  blk_n_row_   = 0;
-    int  blk_col_off_ = 0;
-    int  blk_n_col_   = 0;
-    bool blk_set_     = false;
+    // Support of the current ρ (see support()). State, not a hint: written by
+    // exactly the four calls that replace ρ (set_initial / apply_dipole /
+    // restore_device / expand_slots), always through set_support_(), always
+    // BEFORE the ρ it describes is written (shape first: the block is the
+    // storage shape and the capacity check must precede the first write).
+    // Empty (validate() rejects it) until set_initial; initial_set_ guards
+    // every reader.
+    heom::ManifoldBlock support_;
 
-    long long propagations_without_block_ = 0;
+    // The one write point for support_: validate, store, and if ctx_ already
+    // exists copy it into ctx_.block (build_context is idempotent, so a built
+    // ctx has to be updated here). ctx_.block is always support_ — the kernel
+    // launches over exactly the block ρ lives in, nothing else.
+    void set_support_(const heom::ManifoldBlock& blk, const char* who);
 
-    // The single place ctx_'s four launch-domain ints are written, so the
-    // descriptor and the context cannot drift apart. Also the single place the
-    // kill switch is honoured: we know the block, we choose not to use it.
-    void apply_manifold_block_to_ctx();
-
-    // Invariant hook: call this immediately after ANY operation that replaces ρ
-    // wholesale (dipole / restore / expand / set_initial). Everything derived
-    // from the OLD ρ is invalid at that instant — the Kahan carry records bits
-    // lost while accumulating it, so a stale carry is injected straight back
-    // into elements the replacement just cleared. Clearing is not an
-    // optimisation, it is the lifecycle rule.
+    // Invariant hook: call this immediately after ρ is replaced by a NEW,
+    // unpropagated hierarchy (set_initial / apply_dipole). The Kahan carry
+    // records bits lost while accumulating the OLD ρ, so a stale carry would be
+    // injected straight back into the new one: it is cleared. Clearing is not
+    // an optimisation, it is the lifecycle rule. Sets fresh_state_.
     //
-    // Zeroes the WHOLE buffer, not the active prefix: the prefix version needs
-    // the reader to carry "slots past the prefix are always re-zeroed by the
-    // next widening" in their head, and these calls happen once per τ/T segment
-    // against a propagation that touches the same footprint on every RK4 stage.
+    // restore_device / expand_slots do not come here: they reinstall a state,
+    // carry and fresh flag included, rather than start one.
     //
-    // Also clears the manifold block, for the same reason: it described where
-    // the OLD ρ had support.
+    // Zeroes the WHOLE carry buffer, not the active prefix: the prefix version
+    // needs the reader to carry "slots past the prefix are always re-zeroed by
+    // the next widening" in their head, and these calls happen once per τ/T
+    // segment against a propagation that touches the same footprint on every
+    // RK4 stage.
     void on_rho_replaced();
 
-    // 2DES: lazy-allocated device scratch for the N×N dipole μ
-    // (apply_dipole_full_hierarchy). Single-side μ needs a distinct output
-    // buffer; we reuse d_workspace_ as the output then copy back into d_rho_.
+    // Restore/expand precondition: `snap` was taken on sys_ and its `width`
+    // slots fit. Throws invalid_argument naming `who`; touches nothing.
+    void check_snapshot_(const DeviceHierarchySnapshot& snap, int width,
+                         const char* who) const;
+
+    // 2DES: lazy-allocated device scratch for the [B·N²] per-slot dipoles μ
+    // (apply_dipole). Single-side μ needs a distinct output buffer; we reuse
+    // d_workspace_ as the output then copy back into d_rho_.
     GPUMemory<heom::complex_t> d_mu_scratch_;
 
-    // 2DES: reusable host buffer for packing the N×N μ matrix before its H2D
-    // (apply_dipole_full_hierarchy). A member so we don't heap-alloc a fresh
-    // std::vector on every pulse interaction.
+    // relative_distance's [2·kDistMaxBlocks] partial sums and their host twin.
+    GPUMemory<double>   d_dist_partials_;
+    std::vector<double> h_dist_partials_;
+
+    // 2DES: reusable host buffer for packing the [B·N²] μ matrices before their
+    // H2D (apply_dipole). A member so we don't heap-alloc a fresh std::vector
+    // on every pulse interaction.
     std::vector<heom::complex_t> h_mu_pack_;
 
-    // 2DES batched detection. d_mu_det_ holds the per-tree
-    // μ_det (N²); d_detect_ is the per-tree result grid (n_samples scalars)
-    // the trace kernel writes into; h_detect_ stages the single bulk D2H.
-    // Lazy-allocated on the first detect_begin; dynamics/absorption never pay.
-    GPUMemory<heom::complex_t> d_mu_det_;
-    GPUMemory<heom::complex_t> d_detect_;
-    std::vector<heom::complex_t> h_detect_;
-
-    // 2DES batched detection width + result-grid column count, set by
-    // detect_begin[_batch]. detect_batch_ drives the trace launch grid.y and the
-    // out[b·n_samples+idx] slot stride; single-slot detect keeps detect_batch_=1
-    // with the historical out[idx] layout. detect_n_samples_ is the n_samples
-    // stored at begin (the per-slot column count for the batched trace).
-    int detect_batch_     = 1;
-    int detect_n_samples_ = 0;
-
     // Cached HEOM context: immutable device pointers + scalars borrowed from
-    // SystemContext, built once (build_context()) and reused by solve() and
+    // SystemContext, built once (build_context()) and reused by every
     // propagate_steps(). Per-filter fields (u_list/u_count) still mutate each
     // filter step.
     HEOMContext ctx_;
     bool ctx_built_ = false;
 
     // Running internal-step counter for propagate_steps(): accumulates across
-    // carry-through segments so filter warmup/interval stays continuous.
+    // carry-through segments so the stats cadence stays continuous.
     // set_initial() resets it (opening a new tree).
     int internal_step_ = 0;
 
@@ -469,16 +377,31 @@ private:
     // dynamics/absorption. See set_cadence_logging.
     bool cadence_logging_ = true;
 
-    // Filter buffers (only allocated when filtering is on)
+    // Filter buffers (only allocated when filtering is on). One row of M per
+    // slot ([batch][M]): every slot has its own active set (2026-10-22-batch-
+    // per-slot), so a batched slot computes what it would compute alone.
     GPUMemory<double>  d_ado_norms_;
     GPUMemory<int8_t>  d_active_flags_;
     GPUMemory<int>     d_level_counts_;
+    // One device int, |= 1 by the filter kernel when any scanned ADO norm is
+    // NaN. Read only in check_divergence (piggybacks on its existing D2H).
+    // Never cleared: it latches like diverged_ — one NaN anywhere in a 2DES
+    // tree voids the whole run.
+    GPUMemory<int>     d_nan_flag_;
+    GPUMemory<int>     d_zero_count_;   // [batch] count_zero_norms scratch
+    std::vector<int>   h_zero_counts_;  // its host twin
 
-    // Host mirror of ρ_0 only (N², not M·N²). hier precision
-    // (matches d_rho_'s element type for the raw D2H). Consumers uplift each
-    // element to std::complex<double> via c_re/c_im (observable uplift):
-    // the FP32→FP64 promotion is exactly the "read out in double" boundary.
+    // Host mirror of ρ_0 only (N², not M·N²), [B][N²] FULL
+    // matrix. hier precision (matches d_rho_'s element type). Consumers uplift
+    // each element to std::complex<double> via c_re/c_im (observable
+    // uplift): the FP32→FP64 promotion is exactly the "read out in double"
+    // boundary. Deliberately NOT compacted: 1.9 MB of host memory
+    // keeps read_alpha0 / HDF5 / rho0_norm_ untouched.
     std::vector<heom::complex_t> h_rho0_;
+    // Compact [B][Nb_cap] staging for the α=0 D2H/H2D: the device holds the
+    // block, the host mirror holds the full matrix, this is the wire format
+    // between them (expand_block_ does the conversion).
+    std::vector<heom::complex_t> h_pack_;
     std::vector<int> h_level_counts_;
 
     // slot_active_stats() scratch (batched per-slot diagnostic, log_per_slot).
@@ -488,60 +411,49 @@ private:
     std::vector<double> h_slot_norms_;
     std::vector<char>   h_slot_union_;
 
-    // FP64 staging for the HDF5 writer (which is float64-only, schema unchanged).
-    // In the FP64 build complex_t IS cuDoubleComplex, so rho0_as_fp64() returns
-    // h_rho0_ directly (zero copy); in the mixed build it fills this on demand.
-    mutable std::vector<cuDoubleComplex> h_rho0_fp64_;
-
-    // Lazy std::complex mirror of rho_0 used to
-    // hand out a stable host pointer to StepCallback. Only allocated on the
-    // first solve() call that actually has a callback (zero overhead for
-    // the dynamics CLI / 2DES enable_hdf5=false drivers that don't pass
-    // one). Layout matches h_rho0_ (row-major, length N²) but with the
-    // CUDA-free std::complex<double> element type required by the public
-    // callback signature.
-    std::vector<std::complex<double>> h_rho_alpha0_mirror_;
-
-    // U-list launch compaction (only when time_evolution.ulist is on). Builds the
-    // compact closure set U = E = A ∪ neighbors(A) each filter step and exposes
-    // a device int list the kernels launch over. Until the first build it is
-    // the identity (full launch), so warmup stays byte-equal.
+    // Closure builder (whenever the filter is on). Builds U = E = A ∪ neighbors(A)
+    // each filter step: its membership flags gate the full launch
+    // (ctx.u_flags), and with filter.ulist on its compact list is what the
+    // kernels launch over. Until the first build the list is the identity.
     std::unique_ptr<UListBuilder> ulist_builder_;
 
     // Adaptive gate (hard threshold, no hysteresis): at a filter step a dense
     // interval (|E|/M > gate) falls back to the full grid (ctx.u_list=nullptr,
-    // full M·N² launch, byte-equal, no u_list indirection); else it runs the
+    // full M·N² launch gated by ctx.u_flags, bit-identical to compact, no
+    // u_list indirection); else it runs the
     // compact whole-step. Guards the non-sparse regime (dynamics, E/M≈0.82) from
-    // indirection overhead. `gate` value from filter.ulist (env HEOM_ULIST_TAU
-    // overrides for sweeps; kept for backward compat). ulist_dense_ is the live
+    // indirection overhead. `gate` value from filter.ulist. ulist_mode_ is the live
     // gate state, updated every step and read by emit_ado_stats to log a mode
-    // flip; last_logged_dense_ is the last mode actually printed (so a flip is
+    // flip; last_logged_mode_ is the last mode actually printed (so a flip is
     // logged once, on the stats line that follows it, not by a separate line).
-    double ulist_tau_        = 0.5;
-    int    ulist_dense_      = -1;   // -1 unset, 0 compact, 1 full fallback
-    int    last_logged_dense_ = -1;  // last mode emitted by emit_ado_stats
+    // Unset = ulist off / before the first build ⇒ no flip line.
+    // ulist_tau_ = filter.ulist; 0 = compact launch off.
+    enum class UlistMode { Unset, Compact, Dense };
+    double    ulist_tau_        = 0.0;
+    bool ulist_on() const { return ulist_tau_ > 0.0; }
+    UlistMode ulist_mode_       = UlistMode::Unset;
+    UlistMode last_logged_mode_ = UlistMode::Unset;
     // Last closure size |E| = |A ∪ neighbors(A)| from the most recent filter
     // step's rebuild (raw, pre-gate; the fallback below zeroes ctx.u_count but
-    // not |E|). -1 means no |E| available (ulist off or before first build), in
-    // which case print_filtering_statistics falls back to the |A|/M-only line.
-    int    closure_count_ = -1;
+    // not |E|). Empty means no |E| available (ulist off or before first build),
+    // in which case print_filtering_statistics falls back to the |A|/M-only line.
+    std::optional<int> closure_count_;
 
-    // Output / state
-    std::unique_ptr<HDF5Writer> writer_;
+    // State
     std::vector<FilteringRecord> filtering_history_;
     bool diverged_ = false;
     bool initial_set_ = false;
-    double simulation_time_seconds_ = 0.0;
 
-    // Divergence guard: ‖ρ_0(0)‖_F captured at set_initial() time. The
-    // solve() loop fails loud once ‖ρ_0(t)‖_F exceeds K · initial_norm_
-    // (K = kDivergenceNormFactor below). This catches both trace-violating
-    // exponential growth and traceless off-diagonal explosion — the latter
-    // mattering most for spectroscopy paths where ρ(0) = μ⁺·ρ_eq is
-    // off-diagonal-only and trace stays ≈ 0 even when the trajectory
-    // numerically blows up. See the bug 3 fix in the issue tracker for
-    // the prior trace-only guard's failure mode.
-    double initial_norm_ = 0.0;
+    // Divergence guard baselines, one per slot: norm0_[b] = ‖ρ_0^(b)‖_F at the
+    // last set_initial / apply_dipole, the only two calls that set them
+    // (restore and expand inherit the snapshot's). Slot b fails loud once
+    // ‖ρ_0^(b)(t)‖_F exceeds K · norm0_[b] (K = kDivergenceNormFactor below),
+    // so a batched walk judges every slot exactly as the reuse walk judges
+    // that leaf alone. The norm catches both trace-violating exponential
+    // growth and traceless off-diagonal explosion — the latter mattering most
+    // for spectroscopy paths where ρ(0) = μ⁺·ρ_eq is off-diagonal-only and
+    // trace stays ≈ 0 even when the trajectory numerically blows up.
+    std::vector<double> norm0_;
 
     // Filtering knobs (cached from cfg.filter.enabled / cfg.filter.tolerance)
     bool   use_filtering_;
@@ -554,79 +466,79 @@ private:
     // are allocated ONLY on the IfRk4 path (rk4 keeps zero extra footprint) and
     // recomputed (compute_if_factors) only when the internal dt changes.
     Integrator integrator_;
-    GPUMemory<heom::real_t> d_if_e_half_; // [M] exp(-½·dt·g_α); empty unless IfRk4
-    GPUMemory<heom::real_t> d_if_e_full_; // [M] exp(-dt·g_α)
-    double            last_if_dt_ = -1.0;  // dt (a.u.) the factors were built for
-    // Count of filter passes that have actually run this trajectory. The
-    // first-ever pass (index 0) is pinned to the warmup threshold so the
-    // warmup knob can never silently no-op. See run_one_internal_step.
-    int    filter_pass_index_ = 0;
-
-    // "ρ was just replaced, the hierarchy is not populated yet." Set by
-    // on_rho_replaced() — the single choke point for all four replacements
-    // (set_initial_batch / apply_dipole / restore_device / expand_slots) — and
-    // consumed by the first run_one_internal_step after it.
+    GPUMemory<heom::complex_t> d_if_e_half_; // [M] exp(-½·dt·g_α), complex; empty unless IfRk4
+    GPUMemory<heom::complex_t> d_if_e_full_; // [M] exp(-dt·g_α)
+    std::optional<double> if_factors_dt_;  // dt (a.u.) the factors were built for; empty = not yet
+    // "ρ was replaced and the hierarchy is still filling from zero." Set by
+    // on_rho_replaced() (set_initial / apply_dipole), reinstalled from the
+    // snapshot by restore_device / expand_slots, and cleared by
+    // hierarchy_filling_() once a full step stops removing exact zeros.
     //
     // It guards ONE invariant: a filter pass must never decide the fate of an
-    // ADO that has not had a chance to be populated. Norms of a fresh hierarchy
-    // are exactly 0 for every α>0, and `norms[α] > threshold` is false at ANY
-    // positive threshold (ado_filter.cu), so filtering here marks the whole
-    // hierarchy inactive and Term 4/5's neighbor gate then holds it there —
-    // an error with no tolerance dependence at all.
+    // ADO that has not had a chance to be populated. Such an ADO's norm is
+    // exactly 0, and `norms[α] > threshold` is false at ANY positive threshold
+    // (ado_filter.cu), so filtering marks it inactive and Term 4/5's neighbor
+    // gate then releases the hierarchy one level per step — an error with no
+    // tolerance dependence at all.
+    //
+    // One full step is not enough to populate it. FMO needs ⌈L/2⌉ (one RK4
+    // step applies 𝓛 four times, each new site costs two applications), a
+    // sparser H needs more. Hence a data-driven window, not a step count.
     //
     // This used to be spelled `step > 0`, which covered only the trajectory
     // start and therefore only dynamics/absorption; every 2DES dipole walked
     // straight into it. Keying off ρ replacement instead of the step counter
     // makes the guard structural rather than something each caller must know.
-    bool   fresh_state_ = true;
-
-    // Initial state metadata captured at set_initial_from_config time
-    // (HDF5 writes pigment-1-based excited_site / exciton_index attrs).
-    Eigen::MatrixXcd initial_rho_;   // exact ρ_0 used; passed to HDF5
+    // Evidence: filter growth-throttle / warmup-removal studies (filter→0
+    // must match filter-off bit-for-bit on the same hierarchy).
+    //
+    // Per slot ([batch]): each slot opens and closes its own window.
+    std::vector<char> fresh_state_;
+    // Per-slot exact-zero ADO count at the start of the last fill-window
+    // step; -1 = no step of this window has run yet.
+    std::vector<int>  fresh_zeros_;
+    // d_ado_norms_ holds max|ρ_α|² (IEEE bits) folded by the last step's
+    // fused kFinal over exactly the ADOs it wrote (per slot: [batch×M]), and
+    // nothing has touched ρ or d_ado_norms_ since. The next filter pass then
+    // skips the standalone norm kernel. Set only by run_step; cleared by the
+    // filter that consumes it and by every other writer of ρ or d_ado_norms_.
+    bool   norms_fused_ = false;
 
     void allocate_trajectory_buffers();
-    // Gather the B α=0 device blocks (slot stride M·N²) into the contiguous
-    // host mirror h_rho0_ ([B][N²]) with one cudaMemcpy2D. B==1 degenerates to
-    // a single N² D2H, bit-identical to the historical copy_to_host.
+    // Gather the B compact α=0 device blocks (slot stride M·Nb) into h_pack_
+    // with one cudaMemcpy2D, then expand each into the full-matrix host mirror
+    // h_rho0_ ([B][N²]) with exact +0 outside the block.
     void d2h_alpha0_batch();
-    // Shared main loop for solve()/solve_batch(): `emit(record_idx, t_fs)` owns
-    // the per-record D2H + fan-out; the loop is fan-out-agnostic.
-    void run_solve_loop(const std::function<void(int, double)>& emit);
+    // Compact [n_row][n_col] (support_) → full [N][N], +0 outside the block.
+    void expand_block_(const heom::complex_t* packed, heom::complex_t* full) const;
     // Build the cached ctx_ once (immutable fields + initial ulist pointers).
     // Idempotent: guarded by ctx_built_.
     void build_context();
     // Recompute norms → active_flags. U-local contract: scan_list
-    // must cover the previous write set of ρ (nullptr = full M). Cold paths
-    // (dipole apply, snapshot, restore) pass nullptr; the per-step cadence in
-    // run_one_internal_step passes the previous step's launch set.
+    // must cover the previous write set of ρ (nullptr = full M). The per-step
+    // cadence in run_one_internal_step passes the previous step's launch set,
+    // or nullptr after a dense step or a restore.
     // The manifold block bounds the element scan the same way it bounds the
-    // derivative launch; it has NO default, so every caller has to say whether
-    // it means a real block or the whole matrix (0, N, 0, N). Cold callers must
-    // pass the whole matrix — see the trap documented at the call site in
-    // refresh_active_set_and_ulist().
+    // derivative launch; it has NO default, so every caller has to say what it
+    // scans: the cadence path passes ctx.block (== support_ by construction).
     void perform_ado_filtering(double threshold,
-                               int row_off, int n_row, int col_off, int n_col,
+                               const heom::ManifoldBlock& blk,
                                const int* scan_list = nullptr,
-                               int scan_count = 0);
-    // Rebuild the compact launch set U = A∪neighbors(A) from the current device
-    // active_flags and point ctx_ at it (also updates closure_count_ for stats).
-    // No-op when ulist is off. This is the identical tail every cold path used
-    // to inline; the per-step cadence in run_one_internal_step keeps its own
-    // variant because it layers the adaptive dense/compact gate on top.
-    void rebuild_ulist_into_ctx();
-    // "State just changed, resync the active set" — the shared cold-path
-    // primitive: build ctx_, refilter ρ's norms → active_flags (full-M scan),
-    // then rebuild_ulist_into_ctx(). Used after a dipole pulse and at snapshot
-    // time, where the norm distribution shifted and stale flags are invalid.
-    // Restore paths deliberately do NOT call this: their flags come from the
-    // snapshot, so they only rebuild_ulist_into_ctx() (no refilter).
-    void refresh_active_set_and_ulist(double threshold);
+                               int scan_count = 0,
+                               const int* scan_off = nullptr);
     // "ρ was replaced, so nothing is known about the new hierarchy yet" — mark
     // every ADO active and put `ctx` on the dense launch. Marking active is
     // never wrong, only slower: it means "compute all six terms for this ADO".
     // The next propagation step's own filter pass prunes on propagated data.
     // Called instead of a filter pass when fresh_state_ is set.
     void activate_all_ados(HEOMContext& ctx);
+    // Fill-window rule: the first step after a ρ replacement is always full;
+    // after that, stay full while the previous step cut the number of
+    // exact-zero ADOs and some are left. A count that stalls above 0 (ADOs
+    // that are zero in the exact solution too) also ends the window, so it
+    // always terminates. One full-M norm scan + one [width]-int D2H per call.
+    // Updates fresh_state_[b] / fresh_zeros_[b] of every slot still filling.
+    void hierarchy_filling_(const heom::ManifoldBlock& blk);
     void print_filtering_statistics(int step, double t_fs);
     // Compose+print one ADO-stats line ("|A|/|E|/M ... [L..]") with the given
     // prefix. Read-only: recomputes the level distribution from current
@@ -634,49 +546,44 @@ private:
     // (print_filtering_statistics) and the forced path (log_stats).
     void emit_ado_stats(const std::string& prefix);
 
-    // Lazily build the UListBuilder (device-side, borrows GPU maps) and, when
-    // set, the initial identity list. No-op unless filtering is on and
-    // time_evolution.ulist is on. rebuild_ulist() recomputes U from the current device
-    // active_flags at a filter step and returns |U| (ctx.u_count).
-    void init_ulist_if_enabled();
+    // Build the UListBuilder (device-side, borrows GPU maps) and read
+    // filter.ulist. No-op unless filtering is on. rebuild_ulist() recomputes U
+    // from the current device active_flags at a filter step and returns |U|.
+    void init_closure_builder();
     int  rebuild_ulist();
 
-    // One internal RK4 step (filter + ulist rebuild/gate
-    // + RK4), shared by solve() and propagate_steps() so the step logic has
-    // exactly one copy (DRY). `step` is the running index driving filter
-    // warmup and ulist gate logging. Filtering runs EVERY step (>0) on both
-    // paths — one cadence, no interval knob (Phase 3 / cadence unification).
+    // One internal RK4 step (filter + ulist rebuild/gate + RK4); the only
+    // step logic there is, propagate_steps() loops over it. `step` is the
+    // running index for the stats cadence and the logged time. Filtering runs
+    // EVERY step after the fill window on both
+    // paths — one cadence, no interval knob (cadence unification).
     void run_one_internal_step(HEOMContext& ctx, int step);
     void run_step(HEOMContext& ctx, double dt_internal_au);
-    void report_divergence(double t_fs, double rho_norm, double norm_ceiling,
-                           int step, int n_steps);
+    void report_divergence(double t_fs, int slot, double rho_norm,
+                           double norm_ceiling, int step, int n_steps,
+                           bool nan_in_hierarchy);
 
-    // Single source of truth for the norm-based divergence guard, shared by
-    // solve() (output-step cadence) and propagate_steps() (the 2DES carry-
-    // through path, which never calls solve()). Refreshes the host α=0 mirror
-    // via one N² D2H, compares ‖ρ_0‖_F against the ceiling, and on a blow-up
-    // (or NaN/Inf) prints the report and latches diverged_. Returns diverged_.
+    // Single source of truth for the norm-based divergence guard, behind both
+    // propagate_steps(check_div) and check_divergence_now(). Refreshes the
+    // host α=0 mirror via one D2H, compares every active slot's ‖ρ_0‖_F
+    // against that slot's ceiling, also reads the filter's NaN flag
+    // (hierarchy NaN that ρ_0 has not felt yet), and on a blow-up prints the
+    // report and latches diverged_. Returns diverged_.
+    // With filtering off there is no norm pass and hence no flag; a NaN then
+    // reaches ρ_0 unfiltered within ≤ L steps and the ‖ρ_0‖_F test catches it.
     bool check_divergence(double t_fs, int step, int n_steps);
 
-    /// Frobenius norm of the physical density matrix ρ_α=0(t) read from
-    /// the host mirror h_rho0_. Caller must have refreshed h_rho0_ via the
-    /// solve() loop's emit lambda (D2H copy) before calling this. Pure
-    /// host-side N² float-ops; cheap.
-    double rho0_frobenius_norm() const;
-
-    // FP64 view of the ρ_0 host mirror for the float64-only HDF5 writer. FP64
-    // build: returns h_rho0_.data() reinterpreted (same type, zero copy). Mixed
-    // build: uplifts h_rho0_ (float) into h_rho0_fp64_ and returns that. The one
-    // place the observable crosses FP32→FP64 for on-disk output.
-    const cuDoubleComplex* rho0_as_fp64() const;
+    /// Frobenius norm of slot b's ρ_α=0, read from the host mirror h_rho0_.
+    /// Caller must have refreshed it (d2h_alpha0_batch) first.
+    double rho0_norm_(int b) const;
 };
 
-/// Multiplicative safety factor for the ‖ρ‖_F divergence ceiling:
-///     ceil = max(initial_norm_ * kDivergenceNormFactor, kDivergenceNormFloor)
-/// Picked at 10 to leave one order of magnitude of slack over the initial
+/// Multiplicative safety factor for the ‖ρ‖_F divergence ceiling of slot b:
+///     ceil_b = max(norm0_[b] * kDivergenceNormFactor, kDivergenceNormFloor)
+/// Picked at 10 to leave one order of magnitude of slack over the baseline
 /// norm, well above transient hierarchy build-up but tight enough to catch
 /// any actual exponential blow-up before NaN/Inf hits. The floor at 10
-/// keeps the bound meaningful when initial_norm_ is sub-unity (e.g. weak
+/// keeps the bound meaningful when the baseline is sub-unity (e.g. weak
 /// dipole in absorption). Tunable in one place if a future spectroscopy
 /// pathway proves it routinely needs more headroom.
 inline constexpr double kDivergenceNormFactor = 10.0;

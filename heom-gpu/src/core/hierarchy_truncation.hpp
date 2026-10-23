@@ -20,7 +20,7 @@ class HierarchyTruncation {
 public:
     /**
      * @brief Constructor.
-     * @param params    Physical parameters (provides n_states, n_bath_modes_total).
+     * @param params    Physical parameters (provides n_states and the ladder layout mode_off).
      * @param L_cutoff  Occupation cap (see class doc).
      * @param log       Progress / statistics sink. Defaults to &std::cout so
      *                  existing callers are byte-identical. Pass nullptr to
@@ -54,9 +54,8 @@ private:
     int L_cutoff_;   // Occupation cap (Σα ≤ L_cutoff)
     std::ostream* log_;  // Injected info sink; nullptr => silent. See ctor doc.
 
-    int index_width() const {
-        return phys_params_.n_states * (phys_params_.n_bath_modes_total + 1);
-    }
+    heom::ModeLayout mode_layout() const { return phys_params_.mode_layout(); }
+    int index_width() const { return mode_layout().channels(); }
 
     /**
      * @brief Recursive generator. `current` is a scratch row of index_width()

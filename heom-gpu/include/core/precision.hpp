@@ -4,10 +4,12 @@
 // Mixed-precision types, selected by HEOM_MIXED_PRECISION.
 //
 // Undefined: FP64 (complex_t = cuDoubleComplex); wrappers forward to cuC*.
-// Defined:   the large O(M*N^2) arrays are FP32 (cuComplex).
+// Defined:   hierarchy ADO and RK4 workspace are FP32 (cuComplex).
 //
-// Coefficients, the Hamiltonian, and setup stay FP64 and are narrowed once
-// on the hot-path read. Narrowing is explicit.
+// Setup stays host FP64. Hamiltonian, bath coefficients, and the Markov
+// residue are narrowed on upload. total_decay stays FP64 and is narrowed
+// once at the Term 2 read; the integrating-factor table uses double exp().
+// Narrowing is explicit.
 //
 // Wrappers are __host__ __device__, shared by host staging and kernels.
 
@@ -49,7 +51,7 @@ __host__ __device__ __forceinline__ complex_t c_conj(complex_t z)             { 
 
 #endif
 
-// Narrow an FP64 coefficient to hierarchy precision on the hot-path read.
+// Narrow a device FP64 value to hierarchy precision (total_decay).
 // Identity when complex_t is cuDoubleComplex.
 __host__ __device__ __forceinline__ complex_t c_from_double(cuDoubleComplex z) {
     return c_make(static_cast<real_t>(cuCreal(z)),

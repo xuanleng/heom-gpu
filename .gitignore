@@ -14,13 +14,30 @@ heom_solver_cpu
 
 # Data output
 data/
-data1/
-data2/
 */data/
 *.txt
 *.h5
 *.hdf5
 *.png
+
+# Curated regression baselines. Other *.h5 stay ignored.
+!heom-gpu/tests/benchmark_data/benchmark_fmo7.h5
+!heom-gpu/tests/benchmark_data/benchmark_fmo7_n29.h5
+!heom-gpu/tests/benchmark_data/benchmark_fmo7_with_ground.h5
+!heom-gpu/tests/benchmark_data/benchmark_fmo7_filtered_site[1-7].h5
+!heom-gpu/tests/benchmark_data/benchmark_fmo7_nofilter_site[1-7].h5
+!heom-gpu/tests/benchmark_data/benchmark_absorption_fmo7.h5
+!heom-gpu/tests/benchmark_data/benchmark_fluorescence_fmo7.h5
+!heom-gpu/tests/benchmark_data/benchmark_3sites_2des.h5
+!heom-gpu/tests/benchmark_data/mc_gold_*.h5
+
+# MC disorder run scratch and worker leftovers
+heom-gpu/data_dis_in_heom/
+*.queue
+worker_rank*.log
+
+# twodes_post parameter-cache sidecars
+.*_ap_twodes_post.json
 
 # Temporary files
 *.log
@@ -50,17 +67,18 @@ __MACOSX/
 
 # Backup files
 *.bak
-*~
 
 # Benchmark results
 benchmark_results.csv
-tools/output/
+heom-tools/output/
 
 # Local backup bundles
 backup/
 
-
-
+# Local experiment trees stay out of this repo.
+# `git clean -x` / `-X` deletes them.
+/experiments/
+/fmo_w_mode/
 
 # LaTeX temporary files
 *.aux
@@ -84,16 +102,13 @@ backup/
 *.xdv
 missfont.log
 *.pdf
-*.yaml
-*.yml
-!heom-gpu/config/fmo.yaml
-!.github/workflows/heom-tools.yml
 
-# Python files
-.venv-absorption-post/
-jctc/pk/.venv-tenso/
-jctc/pk/.venv-tenso-gpu/
-jctc/pk/runs/
+# Python
+.pytest_cache/
+.venv/
+venv/
+dist/
+*.egg-info/
 __pycache__/
 *.py[cod]
 *$py.class

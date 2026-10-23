@@ -12,6 +12,11 @@ namespace heom::mc {
 // and the driver picks the accumulate + write branch accordingly.
 enum class Estimator { Mean, Quadrature };
 
+// Significant digits of each σ inside disorder_identity. ON-DISK CONTRACT:
+// every shard ever written groups by the exact identity string, so changing
+// this orphans them all. See load_realizations for why 6 is also sufficient.
+constexpr int kSigmaIdentityDigits = 6;
+
 /**
  * @brief In-memory image of a disorder_realizations.h5 node file.
  *

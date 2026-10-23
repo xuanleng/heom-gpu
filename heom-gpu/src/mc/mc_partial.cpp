@@ -29,8 +29,23 @@ void write_int64_array_attr(hid_t parent, const char* name,
 void append_mc_provenance(const std::string& path, const Accumulator& acc,
                           const std::string& config_fingerprint,
                           const std::string& disorder_identity) {
+    // /mc must be created with a v2 object header (HDF5 1.8 format). r_done is
+    // an int64 attribute with one entry per folded realization; in the earliest
+    // format an attribute has to fit in the object header, whose messages are
+    // capped at 64 KiB, so a shard over ~8190 realizations (8000 ok, 8191
+    // fails) failed to close. The 1.8 format moves large attributes to dense
+    // storage instead. Only objects
+    // created in this call take the new format: /results and the superblock are
+    // left as written, and readers see the same attribute either way.
+    hid_t fapl;
+    HDF5_CHECK_HID(fapl, H5Pcreate(H5P_FILE_ACCESS));
+    HDF5_CHECK_ERR(H5Pset_libver_bounds(fapl, H5F_LIBVER_V18, H5F_LIBVER_LATEST));
     hid_t file;
-    HDF5_CHECK_HID(file, H5Fopen(path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT));
+    HDF5_CHECK_HID(file, H5Fopen(path.c_str(), H5F_ACC_RDWR, fapl));
+    HDF5_CHECK_ERR(H5Pclose(fapl));
+    // The shard is finished only once /mc is in it: a crash below must leave
+    // no "complete" behind.
+    heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Running);
 
     hid_t mc;
     HDF5_CHECK_HID(mc, H5Gcreate2(file, "/mc", H5P_DEFAULT, H5P_DEFAULT,
@@ -88,6 +103,7 @@ void append_mc_provenance(const std::string& path, const Accumulator& acc,
     heom::hdf5::write_string_attr(mc, "disorder_identity", disorder_identity);
 
     HDF5_CHECK_ERR(H5Gclose(mc));
+    heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Complete);
     HDF5_CHECK_ERR(H5Fclose(file));
 }
 

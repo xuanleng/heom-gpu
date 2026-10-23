@@ -57,6 +57,20 @@ def fft_time_weight(dtau: float, dt: float) -> float:
     return float(dtau) * float(dt)
 
 
+def trapezoid_endpoints(S: np.ndarray) -> np.ndarray:
+    """Copy of slab[τ, t] with the τ=0 row and t=0 column at ½ (corner ¼).
+
+    Both time integrals are one-sided. rp and nr coincide at τ=0 and are summed
+    into the 2DES total, so full weight counts that row twice; full weight on
+    t=0 is the rectangle rule. Full weight adds stripes ≈ Γ·Δ/4 of the peak
+    along both frequency axes (8 fs, 100 cm^-1: ~4 %, peak +8 %; 2.1.2).
+    """
+    W = np.array(S, dtype=complex, copy=True)
+    W[0, :] *= 0.5
+    W[:, 0] *= 0.5
+    return W
+
+
 def _pad_slab(S: np.ndarray, n_tau: int, n_t: int) -> np.ndarray:
     """Zero-pad slab[τ, t] to (n_tau, n_t)."""
     out = np.zeros((n_tau, n_t), dtype=complex)
@@ -107,9 +121,13 @@ def _fft_max_rel_err(a: np.ndarray, b: np.ndarray) -> float:
 def cross_check_two_d_fft(
     S, signal, n_tau, n_t, *, dtau: float = 1.0, dt: float = 1.0, label: str = ""
 ) -> Tuple[np.ndarray, Dict[str, float]]:
-    """Verify axis≡separable; report axis vs mode-3 fft2. Returns axis spectrum."""
+    """Verify axis≡separable; report axis vs mode-3 fft2. Returns axis spectrum.
+
+    All three transforms see the same ``trapezoid_endpoints`` slab.
+    """
     from .fft_legacy import two_d_fft_legacy_mode3
 
+    S = trapezoid_endpoints(S)
     axis = two_d_fft_axis(S, signal, n_tau, n_t, dtau=dtau, dt=dt)
     sep = two_d_fft_separable(S, signal, n_tau, n_t, dtau=dtau, dt=dt)
     # Legacy stays unweighted internally; apply the same measure for the check.
@@ -132,8 +150,10 @@ def two_d_fft(S, signal, n_tau, n_t, method: str = "axis", *,
 
     Multiplies by ``dtau * dt`` (fs²) so absolute amplitudes are comparable
     across time grids. Pass dtau=dt=1.0 (default) for the historical unweighted
-    scale used by unit tests.
+    scale used by unit tests. The τ=0 / t=0 samples enter at trapezoid weight
+    (``trapezoid_endpoints``); the per-method kernels below stay plain DFTs.
     """
+    S = trapezoid_endpoints(S)
     if method == "axis":
         return two_d_fft_axis(S, signal, n_tau, n_t, dtau=dtau, dt=dt)
     if method == "legacy_mode3":

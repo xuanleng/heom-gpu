@@ -17,7 +17,7 @@ first input. Overlapping waiting times are compared slice-by-slice; mismatches a
 reported and merge is refused unless --on-overlap keep-first|keep-last is set.
 
 Output metadata (parameters, derived, provenance) is taken from the first file.
-parameters/config_yaml spectroscopy.tw and root config_hash are updated to the
+parameters/config_yaml 2des.tw and root config_hash are updated to the
 merged waiting-time list.
 """
 

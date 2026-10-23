@@ -6,11 +6,12 @@
 // ρ_xyz tensors agree:
 //   - filtering OFF : bit-identical (atol == 0) — grid.y batching does not
 //                     change per-slot arithmetic order.
-//   - filtering ON  : within a filter-scale tolerance — the batch path uses the
-//                     UNION active set, so it freezes fewer ADOs
-//                     than the per-direction serial filter; not bit-identical.
+//   - filtering ON  : bit-identical too — every slot keeps its OWN active set
+//                     (2026-10-22-batch-per-slot; it used to be the union of
+//                     the three, which was only within filter tolerance).
 
 #include "spectra/linear_response.hpp"
+#include "harness.hpp"
 #include "spectra/dipole.hpp"
 #include "heom_config.hpp"
 #include "system_context.hpp"
@@ -26,7 +27,7 @@
 namespace {
 
 std::string write_abs_yaml(bool filter_on) {
-    const std::string path = std::string("/tmp/test_abs_batch_")
+    const std::string path = heom_test::tmp("test_abs_batch_")
                            + (filter_on ? "filt" : "nofilt") + ".yaml";
     std::ofstream f(path);
     f << "system:\n"
@@ -50,8 +51,6 @@ std::string write_abs_yaml(bool filter_on) {
       << "filter:\n"
       << "  enabled: " << (filter_on ? "true" : "false") << "\n"
       << "  tolerance: 1.0e-6\n"
-      << "  start_step: 2\n"
-      << "  warmup_factor: 1.0e-1\n"
       << "  ulist: 0.0\n"
       << "absorption:\n"
       << "  integrator: rk4\n"
@@ -60,7 +59,7 @@ std::string write_abs_yaml(bool filter_on) {
       << "  output_interval: 1\n"
       << "  print_interval: 0\n"
       << "  output:\n"
-      << "    save_path: \"/tmp/\"\n"
+      << "    save_path: \"" << heom_test::tmp_dir() << "/\"\n"
       << "    filename: \"abs_batch_test\"\n"
       << "    use_timestamp: false\n";
     return path;
@@ -80,10 +79,10 @@ double run_and_diff(bool filter_on) {
     heom::spectra::LinearResponseRequest req;
     req.dipole = mu;
 
-    cfg.absorption_batch = false;
+    cfg.linear_batch = false;
     const auto serial = heom::spectra::compute_linear_response(sys, req);
 
-    cfg.absorption_batch = true;
+    cfg.linear_batch = true;
     const auto batch = heom::spectra::compute_linear_response(sys, req);
 
     if (serial.rho_xyz.size() != batch.rho_xyz.size()) {
@@ -110,15 +109,13 @@ bool test_filter_off_bitexact() {
 }
 
 bool test_filter_on_tol() {
-    const double tol = 1e-6;
     const double d = run_and_diff(/*filter_on=*/true);
-    if (d > tol) {
+    if (d != 0.0) {
         std::cout << "absorption batch (filter on): FAIL — max|Δ|=" << d
-                  << " > " << tol << "\n";
+                  << " (expected 0: per-slot active sets)\n";
         return false;
     }
-    std::cout << "absorption batch (filter on, union within " << tol
-              << "): PASS  (max|Δ|=" << d << ")\n";
+    std::cout << "absorption batch (filter on, per-slot, serial==batch bit-exact): PASS\n";
     return true;
 }
 
@@ -143,7 +140,7 @@ bool test_eg_block_support() {
 
     heom::spectra::LinearResponseRequest req;
     req.dipole = mu;
-    cfg.absorption_batch = false;
+    cfg.linear_batch = false;
     const auto res = heom::spectra::compute_linear_response(sys, req);
 
     const int N = res.N;
@@ -185,9 +182,8 @@ bool test_eg_block_support() {
 }  // namespace
 
 int main() {
-    if (!test_filter_off_bitexact()) return 1;
-    if (!test_filter_on_tol()) return 1;
-    if (!test_eg_block_support()) return 1;
-    std::cout << "test_absorption_batch: ALL PASS\n";
-    return 0;
+    RUN_BOOL(test_filter_off_bitexact);
+    RUN_BOOL(test_filter_on_tol);
+    RUN_BOOL(test_eg_block_support);
+    return heom_test_summary("test_absorption_batch");
 }

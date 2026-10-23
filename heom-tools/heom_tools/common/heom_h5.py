@@ -4,13 +4,16 @@
 
 The C++ writer (src/output/hdf5_metadata.cpp) emits four sibling groups:
 
-    /                attrs: task, config_hash, simulation_time_seconds
+    /                attrs: task, config_hash, simulation_time_seconds,
+                     status (written last; see require_complete),
+                     n_records_written (dynamics)
     /parameters/     every user knob + Hamiltonian + dipoles/strengths
                      + initial_density_matrix + config_yaml.
                      Per-site bath inputs (eta_cm, gamma_cm, gamma_inverse_fs,
                      static_disorder_fwhm_cm) are 1-D [n_bath] datasets.
     /derived/        eigenvalues_relative_cm, eigenvectors,
-                     bath_c_cm2 / bath_nu_cm (2-D [n_bath][K+1]),
+                     bath_c_cm2 / bath_cbar_cm2 / bath_nu_cm (flat [D], complex;
+                     site n owns slots mode_off[n]..mode_off[n+1]), mode_kind,
                      M_total, final_active_ados
     /results/        time + density_matrix | rho_xyz
     /provenance/     cpu/gpu/os/cuda/compiler + config_path
@@ -37,6 +40,8 @@ __all__ = [
     "derived",
     "provenance",
     "root_attr",
+    "IncompleteRunError",
+    "require_complete",
     "task",
     "eigenvalues_absolute_cm",
     "is_dynamics_run",
@@ -126,6 +131,32 @@ def root_attr(f: h5py.File, name: str, default=None):
     ``simulation_time_seconds``).
     """
     return get_attr(f, name, default)
+
+
+class IncompleteRunError(RuntimeError):
+    """The solver says this file is not a finished run."""
+
+
+def require_complete(f: h5py.File) -> None:
+    """Refuse a file the solver marked unfinished.
+
+    The solver sets root attribute ``status="running"`` when it creates the
+    file and its final value LAST: ``"complete"``, ``"diverged"`` (dynamics
+    stopped at a divergence check; only ``n_records_written`` records are
+    real, the rest are zero) or ``"aborted"`` (an exception unwound the
+    writer). ``"running"`` left behind means the process was killed. Any
+    value other than ``"complete"`` raises :class:`IncompleteRunError`. A
+    file WITHOUT ``status`` predates the attribute and is accepted.
+    """
+    status = root_attr(f, "status", None)
+    if status is None or status == "complete":
+        return
+    n = root_attr(f, "n_records_written", None)
+    extra = f", n_records_written={n}" if n is not None else ""
+    raise IncompleteRunError(
+        f"{f.filename}: status={status!r}{extra} -- not a finished run; "
+        "refusing to post-process it"
+    )
 
 
 def task(f: h5py.File) -> str:

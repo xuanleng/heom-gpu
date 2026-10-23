@@ -5,7 +5,7 @@ systems coupled to harmonic baths, with Python post-processing for
 population dynamics, linear absorption and polarization-resolved
 two-dimensional electronic spectra (2DES) of disordered systems.
 
-This snapshot is tag `v1.0.0`.
+This snapshot is tag `v2.2.0`.
 
 The code accompanies
 

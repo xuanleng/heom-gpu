@@ -1,20 +1,23 @@
 #include "heom_config.hpp"
 #include "system_context.hpp"
-#include "heom_trajectory.hpp"
+#include "dynamics_run.hpp"
 #include "spectra/absorption.hpp"
 #include "spectra/dipole.hpp"
+#include "spectra/fluorescence.hpp"
 #include "spectra/two_dim.hpp"
 #include "mc/mc_driver.hpp"
 #include "output/spectrum_writer.hpp"
 #include "output/console_printer.hpp"
 #include "heom_version.hpp"
+#include "util/timestamp.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <cmath>
-#include <ctime>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -51,14 +54,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 int run_dynamics(const SystemContext& sys, const HEOMConfig::Config& /*cfg*/) {
-    HEOMTrajectory traj(sys);
-    std::cout << "Initializing density matrix..." << std::flush;
-    traj.set_initial_from_config();
-    std::cout << " done.\n\n";
-
-    traj.solve();
-    traj.save_results();
-    return traj.diverged() ? 2 : 0;
+    return heom::run_dynamics(sys) ? 2 : 0;
 }
 
 int run_absorption(const SystemContext& sys, const HEOMConfig::Config& cfg) {
@@ -71,7 +67,7 @@ int run_absorption(const SystemContext& sys, const HEOMConfig::Config& cfg) {
         cfg.physics.n_sites);
 
     // Total wall-clock across the x/y/z propagations. Each direction already
-    // prints its own "computation time" from inside HEOMTrajectory::solve();
+    // prints its own "computation time" from inside heom::run_output_loop;
     // this brackets all three (the same pattern future 2DES run_* reuse).
     const auto t_start = std::chrono::steady_clock::now();
     auto out = heom::spectra::compute_absorption(sys, mu);
@@ -88,6 +84,19 @@ int run_absorption(const SystemContext& sys, const HEOMConfig::Config& cfg) {
     // Linear response cannot "diverge" via the same mechanism as a populated
     // ρ_eq dynamics run (compute_linear_response throws on divergence
     // instead of returning a half-built result), so reaching here means OK.
+    return 0;
+}
+
+int run_fluorescence(const SystemContext& sys, const HEOMConfig::Config& cfg) {
+    auto mu = heom::spectra::DipoleOperator::from_pigment_dipoles(
+        cfg.physics.dipoles, cfg.physics.strengths, cfg.physics.basis, cfg.physics.n_sites);
+    const auto t_start = std::chrono::steady_clock::now();
+    auto out = heom::spectra::compute_fluorescence(sys, mu);
+    const double total_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+    std::cout << "Total fluorescence computation time (equilibration + emission): "
+              << heom::console::format_computation_time(total_s) << "\n\n";
+    heom::output::write_fluorescence(cfg, sys, out, total_s);
     return 0;
 }
 
@@ -131,17 +140,20 @@ struct TaskEntry {
     std::string_view name;
     void (*resolve)(HEOMConfig::Config&);
     int  (*run)(const SystemContext&, const HEOMConfig::Config&);
+    // MC static-disorder worker (`--rank`); nullptr ⇒ MC does not apply.
+    int  (*mc_run)(const HEOMConfig::Config&, const heom::mc::MCOptions&);
     std::string_view description;
 };
 
 constexpr TaskEntry kTasks[] = {
-    {"dynamics",   HEOMConfig::resolve_dynamics_config,   run_dynamics,
+    {"dynamics",   HEOMConfig::resolve_dynamics_config,   run_dynamics,    nullptr,
      "Population dynamics (HEOM time evolution)"},
-    {"absorption", HEOMConfig::resolve_absorption_config, run_absorption,
+    {"absorption", HEOMConfig::resolve_absorption_config, run_absorption,  heom::mc::run_absorption_mc,
      "Linear absorption spectroscopy"},
-    {"2des",       HEOMConfig::resolve_2des_config,       run_2des,
+    {"fluorescence", HEOMConfig::resolve_fluorescence_config, run_fluorescence, heom::mc::run_fluorescence_mc,
+     "Steady-state fluorescence (equilibrated excited-state hierarchy)"},
+    {"2des",       HEOMConfig::resolve_2des_config,       run_2des,        heom::mc::run_2des_mc,
      "Two-dimensional electronic spectroscopy (carry-through HEOM)"},
-    // Future: emission / cd / fluorescence / ta — add a row here.
 };
 
 const TaskEntry* find_task(std::string_view name) {
@@ -162,7 +174,7 @@ void print_help(std::ostream& os, const char* prog) {
        << "  " << prog << " <task> <config.yaml> --rank <N> [--run-id <TS>] "
           "[--r-begin <A> --r-end <B>]\n"
        << "      MC static-disorder worker N. Low-level plumbing — normally\n"
-       << "      launched by `mc-disorder-run <task> <config.yaml> --workers K`.\n"
+       << "      launched by `mc-disorder-run <task> <config.yaml> [--gpus 0,1]`.\n"
        << "        --rank <N>              1-based worker index (N >= 1).\n"
        << "        --run-id <TS>           shared stem for a worker set "
           "(YYYYMMDD_HHMM or YYYYMMDD_HHMMSS)\n"
@@ -185,68 +197,71 @@ void print_help(std::ostream& os, const char* prog) {
     }
 }
 
-// Parse the optional MC worker knobs from argv[3..]. Returns -1 when `--rank`
-// is absent (single-shot). `--run-id TS` (optional, only meaningful with
-// --rank) is the shared timestamp the launcher hands to every worker so their
-// rank files share one prefix; captured into `run_id`. `--r-begin N` /
+// Parse the optional MC worker knobs from argv[3..]. `rank` stays nullopt when
+// `--rank` is absent (single-shot). `--run-id TS` (optional, only meaningful
+// with --rank) is the shared timestamp the launcher hands to every worker so
+// their rank files share one prefix; captured into `run_id`. `--r-begin N` /
 // `--r-end M` give this worker's 1-based INCLUSIVE realization interval (must be
-// given together or both omitted ⇒ 0/0 sentinel ⇒ driver uses the whole file);
-// the driver does the single 1-based→0-based conversion. The disorder node file
-// and flock queue are still derived from the config. Unknown flags / missing
-// values throw so a typo cannot silently mis-run.
-int parse_worker_rank(int argc, char** argv, std::string& run_id,
-                      int& r_begin, int& r_end) {
-    int rank = -1;
-    r_begin = 0;
-    r_end = 0;
-    bool has_begin = false, has_end = false;
+// given together, or both omitted ⇒ `range` nullopt ⇒ driver uses the whole
+// file); the driver does the single 1-based→0-based conversion. The disorder
+// node file and flock queue are still derived from the config. Unknown flags,
+// missing or non-integer values ("1x"), and worker flags without --rank all
+// throw so a typo cannot silently mis-run.
+struct WorkerArgs {
+    std::optional<int> rank;
+    std::string run_id;
+    std::optional<heom::mc::Interval> range;
+};
+
+int parse_int_arg(std::string_view flag, std::string_view text) {
+    int v = 0;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+    if (ec != std::errc() || end != text.data() + text.size()) {
+        throw std::invalid_argument(std::string(flag) + " expects an integer, got '" +
+                                    std::string(text) + "'");
+    }
+    return v;
+}
+
+WorkerArgs parse_worker_args(int argc, char** argv) {
+    WorkerArgs w;
+    std::optional<int> r_begin, r_end;
     for (int i = 3; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--rank") {
             if (i + 1 >= argc) throw std::invalid_argument("--rank requires a value");
-            rank = std::stoi(argv[++i]);
+            const int rank = parse_int_arg(flag, argv[++i]);
             if (rank < 1) {
                 throw std::invalid_argument(
                     "--rank must be >= 1 (workers are 1-based); "
-                    "use `mc-disorder-run <task> <cfg> --workers K` to launch workers");
+                    "use `mc-disorder-run <task> <cfg> [--gpus 0,1]` to launch workers");
             }
+            w.rank = rank;
         } else if (flag == "--run-id") {
             if (i + 1 >= argc) throw std::invalid_argument("--run-id requires a value");
-            run_id = argv[++i];
+            w.run_id = argv[++i];
         } else if (flag == "--r-begin") {
             if (i + 1 >= argc) throw std::invalid_argument("--r-begin requires a value");
-            r_begin = std::stoi(argv[++i]);
-            has_begin = true;
+            r_begin = parse_int_arg(flag, argv[++i]);
         } else if (flag == "--r-end") {
             if (i + 1 >= argc) throw std::invalid_argument("--r-end requires a value");
-            r_end = std::stoi(argv[++i]);
-            has_end = true;
+            r_end = parse_int_arg(flag, argv[++i]);
         } else {
             throw std::invalid_argument("unknown option: " + std::string(flag));
         }
     }
-    if (has_begin != has_end) {
+    if (!w.rank && (r_begin || r_end || !w.run_id.empty())) {
+        throw std::invalid_argument(
+            "--run-id / --r-begin / --r-end only apply to an MC worker (--rank N); "
+            "a single-shot run would ignore them");
+    }
+    if (r_begin.has_value() != r_end.has_value()) {
         throw std::invalid_argument(
             "--r-begin and --r-end must be given together (1-based inclusive "
             "range) or both omitted (whole node file)");
     }
-    return rank;
-}
-
-// Timestamp stem matching resolve_output_path's `YYYYMMDD_HHMM`, so a worker
-// with no --run-id names its shard exactly like a single-shot would.
-std::string local_timestamp() {
-    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm tm{};
-    localtime_r(&t, &tm);
-    std::ostringstream ts;
-    ts << std::setfill('0')
-       << std::setw(4) << (tm.tm_year + 1900)
-       << std::setw(2) << (tm.tm_mon + 1)
-       << std::setw(2) << tm.tm_mday << "_"
-       << std::setw(2) << tm.tm_hour
-       << std::setw(2) << tm.tm_min;
-    return ts.str();
+    if (r_begin) w.range = heom::mc::Interval{*r_begin, *r_end};
+    return w;
 }
 
 }  // namespace
@@ -286,9 +301,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        std::string run_id;
-        int r_begin = 0, r_end = 0;
-        const int rank = parse_worker_rank(argc, argv, run_id, r_begin, r_end);
+        const WorkerArgs w = parse_worker_args(argc, argv);
 
         auto cfg = HEOMConfig::Config::load_yaml(yaml);
         // resolve_<task>_config(cfg) MUST run BEFORE SystemContext
@@ -306,12 +319,12 @@ int main(int argc, char** argv) {
         // ⇒ single-shot (byte-for-byte the pre-MC dispatch). `--rank N` ⇒ this
         // process is MC worker N; it hands off to the MC shell which builds its
         // own per-realization contexts.
-        if (rank < 0) {
+        if (!w.rank) {
             if (have_draws) {
                 std::cerr << "[note] static_disorder.draws_file is set but no "
                              "--rank given; running single-shot. Use "
                              "`mc-disorder-run " << task_name << " " << yaml
-                          << " --workers K` for disorder averaging.\n";
+                          << "` (add `--gpus` for multi-GPU).\n";
             }
             SystemContext sys(cfg);
             return task->run(sys, cfg);
@@ -322,18 +335,20 @@ int main(int argc, char** argv) {
                 "--rank given but config has no `static_disorder.draws_file` "
                 "(add the block, or drop --rank for a single-shot run)");
         }
+        if (!task->mc_run) {
+            throw std::invalid_argument(
+                "MC static disorder does not apply to task '" + std::string(task_name) +
+                "' (dynamics runs single-shot; drop --rank)");
+        }
         // Workers of one launch share the TS (launcher passes --run-id); a lone
         // worker mints its own. The driver builds the shard stem itself — it
         // needs disorder_identity (from the node file) for the merge key.
-        const std::string ts = run_id.empty() ? local_timestamp() : run_id;
         heom::mc::MCOptions opts;
         opts.draws_file = cfg.disorder_draws_file;
-        opts.queue      = cfg.output.save_path + "mc.queue";
-        opts.r_begin    = r_begin;   // 1-based inclusive (0 = sentinel ⇒ whole file)
-        opts.r_end      = r_end;
-        opts.run_id     = ts;
-        opts.rank       = rank;
-        return heom::mc::run_mc(std::string(task_name), cfg, opts);
+        opts.range      = w.range;
+        opts.run_id     = w.run_id.empty() ? heom::local_timestamp() : w.run_id;
+        opts.rank       = *w.rank;
+        return task->mc_run(cfg, opts);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

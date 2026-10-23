@@ -1,12 +1,11 @@
-# heom-gpu 1.0.0
+# heom-gpu 2.2.0
 
 GPU solver for hierarchical equations of motion (HEOM) with a Drude–Lorentz
 bath. Released under the **MIT License** (`LICENSE`).
 
-Figure scripts and production data are on the Zenodo record of the article,
-not in this tree. In the monorepo layout the sibling `../heom-tools/` package
-ships with the same checkout; a solver-only staged archive may omit it (then
-set `-DHEOM_TOOLS_DIR=` or skip the MC generator tests).
+Figure scripts and production data for the accompanying article are on
+Zenodo and are not needed to build this tree. The post-processing package
+is in `../heom-tools/`.
 
 ## Requirements
 
@@ -52,16 +51,17 @@ Optional checks: `cd build && ctest --output-on-failure`.
 
 ## Run
 
-Tasks are `dynamics`, `absorption`, and `2des`. Each run reads one YAML.
+Tasks are `dynamics`, `absorption`, `fluorescence`, and `2des`. Each run reads one YAML.
 
 ```bash
-./build/heom_solver_mp dynamics   config/fmo.yaml
-./build/heom_solver_mp absorption config/fmo.yaml
-./build/heom_solver_mp 2des       config/fmo.yaml
+./build/heom_solver_mp dynamics     config/fmo.yaml
+./build/heom_solver_mp absorption   config/fmo.yaml
+./build/heom_solver_mp 2des         config/fmo.yaml
+./build/heom_solver    fluorescence config/fmo_fluorescence.yaml
 ```
 
 HDF5 output carries `/provenance` attributes `software_name=heom-gpu` and
-`software_version=1.0.0`. Do not strip or alter them.
+`software_version=2.2.0`. Do not strip or alter them.
 
 ## Cite
 
@@ -73,5 +73,5 @@ cite the article and name the software:
 > Two-Dimensional Electronic Spectra of Disordered Excitonic Systems,
 > *J. Chem. Theory Comput.* **2026**. Use the published DOI when available.
 
-Identify the code as **heom-gpu 1.0.0**. Do not describe it as independently
-developed. Questions about the release: lengxuan@nbu.edu.cn.
+Identify the code as **heom-gpu 2.2.0**. Questions about the release:
+lengxuan@nbu.edu.cn.

@@ -1,35 +1,38 @@
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys
 import pytest
-import run_all_benchmarks as rab  # tests/ is on sys.path
+import regress  # tests/ is on sys.path
 
 ROOT = os.environ.get("HEOM_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SOLVER = os.environ.get("HEOM_SOLVER", os.path.join(ROOT, "build", "heom_solver"))
-PROBE_DIR = os.path.join(ROOT, "tests", "benchmark_data")
+# ctest passes the CMake-validated checkout, or "" for a solver-only tree.
 TOOLS = os.environ.get("HEOM_TOOLS_DIR", os.path.normpath(os.path.join(ROOT, "..", "heom-tools")))
 GEN = os.path.join(TOOLS, "heom_tools", "mc_disorder", "generate.py") if TOOLS else None
-needs_tools = pytest.mark.skipif(
-    not GEN or not os.path.isfile(GEN),
-    reason="no heom-tools (HEOM_TOOLS_DIR empty or missing generate.py)",
-)
+needs_tools = pytest.mark.skipif(GEN is None, reason="no heom-tools (HEOM_TOOLS_DIR empty)")
 
-def test_template_parses_under_current_schema():
-    """The benchmark template parses and runs under the current solver."""
-    os.makedirs(PROBE_DIR, exist_ok=True)
-    content = rab.TEMPLATE.format(filter_enabled="false", tolerance="1.0e-7",
-                                  filter_start_step=10, filter_warmup_factor="1.0e-3",
-                                  print_interval=0, site=1,
-                                  output_dir=PROBE_DIR + "/",
-                                  output_name="_infra_probe")
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        f.write(content); path = f.name
-    try:
-        r = subprocess.run([SOLVER, "dynamics", path],
-                           capture_output=True, text=True, timeout=600)
-        assert r.returncode == 0, f"solver rejected TEMPLATE:\n{r.stderr[-800:]}"
-    finally:
-        os.unlink(path)
-        probe = os.path.join(PROBE_DIR, "_infra_probe.h5")
-        if os.path.exists(probe): os.unlink(probe)
+
+def test_template_parses_under_current_schema(tmp_path):
+    """The FMO-7 per-site template parses and runs under the current solver."""
+    path = tmp_path / "probe.yaml"
+    path.write_text(regress.fmo7_site_config(site=1, use_filter=False,
+                                             output_dir=str(tmp_path), output_name="probe"))
+    r = subprocess.run([SOLVER, "dynamics", str(path)],
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, f"solver rejected TEMPLATE:\n{r.stderr[-800:]}"
+
+
+@pytest.mark.parametrize("argv, msg", [
+    (["--rank", "1x"], "expects an integer, got '1x'"),
+    (["--rank", "1", "--r-begin", "2", "--r-end", "3e"], "expects an integer, got '3e'"),
+    (["--rank", ""], "expects an integer"),
+    (["--run-id", "20260101_0000"], "only apply to an MC worker"),
+    (["--r-begin", "1", "--r-end", "4"], "only apply to an MC worker"),
+])
+def test_worker_flags_are_strict(argv, msg):
+    """Worker flags are parsed before the YAML is read, so no config is needed:
+    a mistyped integer or a worker flag without --rank must fail, not be ignored."""
+    r = subprocess.run([SOLVER, "absorption", "/nonexistent.yaml", *argv],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and msg in r.stderr, r.stderr
 
 
 def _run_task(task, cfg_dict, out_name, out_dir):
@@ -61,19 +64,33 @@ def _run_mc_single(task, cfg_dict, out_name, out_dir, draws):
     return shards[0]
 
 
-def test_compare_absorption_self_identical(tmp_path):
-    import yaml, compare_benchmark as cb
+def _assert_compare_catches_perturbation(h5, dset, tmp_path):
+    """compare_files must accept the file itself and reject a copy with one
+    payload element moved by 1e-9 — a self-compare alone proves nothing."""
+    import h5py
+    bad = os.path.join(tmp_path, "perturbed.h5")
+    shutil.copy(h5, bad)
+    with h5py.File(bad, "a") as f:
+        v = f[dset][...]
+        v.flat[v.size // 2] += 1e-9
+        f[dset][...] = v
+    assert regress.compare_files(h5, h5, tol=1e-15) is True
+    assert regress.compare_files(h5, bad, tol=1e-12) is False
+
+
+def test_compare_absorption_catches_perturbation(tmp_path):
+    import yaml
     # Tracked CI fixture: FMO7 absorption, disorder OFF, output_interval>0.
     cfg = yaml.safe_load(open(os.path.join(ROOT, "tests", "configs", "benchmark_absorption_fmo7.yaml")))
     h5 = _run_task("absorption", cfg, "_abs_probe", str(tmp_path))
-    assert cb.compare_files(h5, h5, tol=1e-15) is True
+    _assert_compare_catches_perturbation(h5, "/results/rho_xyz", tmp_path)
 
 
-def test_compare_2des_self_identical(tmp_path):
-    import yaml, compare_benchmark as cb
+def test_compare_2des_catches_perturbation(tmp_path):
+    import yaml
     cfg = yaml.safe_load(open(os.path.join(ROOT, "tests", "configs", "dimer_2des.yaml")))
     h5 = _run_task("2des", cfg, "_2des_probe", str(tmp_path))
-    assert cb.compare_files(h5, h5, tol=1e-15) is True
+    _assert_compare_catches_perturbation(h5, "/results/resp", tmp_path)
 
 
 @needs_tools
@@ -102,6 +119,29 @@ def test_absorption_single_node_bit_identical(tmp_path):
             "shard /results/rho_xyz != single-shot rho_xyz"
         assert p["/mc/count"][()] == 1
         assert list(p["/mc"].attrs["r_done"]) == [0]
+
+
+@needs_tools
+def test_fluorescence_single_node_bit_identical(tmp_path):
+    """sigma = 0, one node: the fluorescence shard matches the single-shot
+    rho_xyz. The shard omits rho_eq and equilibration."""
+    import h5py, numpy as np, yaml
+    cfg = yaml.safe_load(open(os.path.join(ROOT, "tests", "configs", "dimer_fluorescence.yaml")))
+    ref = _run_task("fluorescence", cfg, "_fl_ref", str(tmp_path))
+
+    draws = os.path.join(tmp_path, "dfl.h5")
+    subprocess.run([sys.executable, GEN, "--out", draws, "--n-node", "1",
+                    "--n-site", str(cfg["system"]["n_states"]), "--fwhm", "0.0",
+                    "--seed", "1", "--method", "iid"], check=True)
+
+    part = _run_mc_single("fluorescence", cfg, "_fl_ref", str(tmp_path), draws)
+
+    with h5py.File(part) as p, h5py.File(ref) as rf:
+        assert np.array_equal(p["/results/rho_xyz"][...], rf["/results/rho_xyz"][...]), \
+            "shard /results/rho_xyz != single-shot rho_xyz"
+        assert "/results/rho_eq" in rf and "/results/rho_eq" not in p
+        assert "/results/equilibration" not in p
+        assert p["/mc/count"][()] == 1
 
 
 @needs_tools

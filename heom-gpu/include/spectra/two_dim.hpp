@@ -2,6 +2,7 @@
 #define HEOM_SPECTRA_TWO_DIM_HPP
 
 #include "types.hpp"            // BasisType (CUDA-free)
+#include "core/manifold_layout.hpp"   // ManifoldBlock / ManifoldLayout
 #include "heom_config.hpp"     // TwoDESConfig (host-only)
 #include "spectra/dipole.hpp"  // DipoleOperator (host-only)
 
@@ -30,6 +31,12 @@ struct TwoDESResult {
     int n_component = 0;  // always 3: isotropic rotational invariants (I1,I2,I3)
     std::vector<double> tau_fs, tw_fs, t_fs;            // per-axis sample times
     std::vector<std::complex<double>> resp;             // layout via idx()
+    // Resolved walk width actually used (1/7/21). Set by compute_2des even when
+    // the request carried kBatchAuto; write_2des records this as @batch_width.
+    int batch_width = 1;
+    // Non-empty only when the request was auto: human-readable selection reason
+    // (chosen width, why, MiB for 21/7/1). Written as @batch_auto_reason.
+    std::string batch_auto_reason;
     // Layout [n_component][n_signal][n_pathway][n_tau][n_tw][n_t], row-major.
     size_t idx(int c, int s, int p, int it, int k, int j) const {
         return ((((static_cast<size_t>(c) * n_signal + s) * n_pathway + p)
@@ -77,31 +84,12 @@ const std::array<PathSpec, 6>& two_des_path_table();
 // can no longer falsify it.
 // ---------------------------------------------------------------------------
 
-// A (row manifold, col manifold) block of ρ, in the (offset,count) form
-// HEOMTrajectory::set_manifold_block takes. The three manifolds are CONTIGUOUS
-// index ranges by construction of the Hilbert basis (compute_hilbert_dim), so
-// no mask / index table is ever needed.
-struct ManifoldBlock {
-    int row_off = 0, n_row = 0, col_off = 0, n_col = 0;
-    bool operator==(const ManifoldBlock& o) const {
-        return row_off == o.row_off && n_row == o.n_row
-            && col_off == o.col_off && n_col == o.n_col;
-    }
-};
-
-// g/e/f index ranges for one basis. f is empty unless DOUBLE_EXCITED.
-// Throws on EXCITED_ONLY (no ground manifold — 2DES never uses it) AND on an
-// N that does not match the basis: WITH_GROUND wants 1+n, DOUBLE_EXCITED wants
-// 1+n+n(n-1)/2. That check is the whole point of taking N as an argument — the
-// one mistake this API exists to prevent is building the layout for one basis
-// out of the OTHER context's N (compute_2des keeps sys_single and sys_double
-// alive simultaneously, so the wrong one is always within reach).
-struct ManifoldLayout {
-    static ManifoldLayout from(BasisType basis, int n_states, int N);
-    ManifoldBlock block(int row_level, int col_level) const;  // 0=g,1=e,2=f
-    int n_level = 0;                   // 2 (WITH_GROUND) or 3 (DOUBLE_EXCITED)
-    std::array<int, 4> bound{};        // bound[L]..bound[L+1) is manifold L
-};
+// ManifoldBlock / ManifoldLayout are core types (core/manifold_layout.hpp):
+// the trajectory, the kernels and absorption use the same ones. Re-exported
+// here so 2DES code keeps reading as before. Every pathway starts at |g><g|,
+// so compute_2des refuses a layout whose g manifold is empty (EXCITED_ONLY).
+using heom::ManifoldBlock;
+using heom::ManifoldLayout;
 
 // Support of ρ after one dipole interaction. Ladder rule: Left ⇒ the ROW level
 // moves, Right ⇒ the COLUMN level moves, and a RAISING operator applied from
@@ -135,13 +123,31 @@ struct TwoDESRequest {
     std::vector<int>    tw_gap_steps;
     std::vector<std::string> signals;       // subset/order of {"rephasing","nonrephasing"}
     std::vector<std::string> pathways;      // subset/order of {"SE","GSB","ESA"}
-    bool orient_reuse = false;              // isotropic 3->9->21 prefix-share walk;
-                                            // off = flat 21-tree (bit-exact).
-    bool batch = false;                     // isotropic 3->9->21 lockstep batched walk;
-                                            // supersedes orient_reuse.
+    // Walk width B_t ∈ {1, 7, 21}, or kBatchAuto (0). All widths walk the same
+    // 3->9->21 isotropic prefix tree; only the execution width differs. Filter
+    // off ⇒ bit-identical across widths. auto is resolved inside compute_2des.
+    int batch = 1;
     const DipoleOperator* dipole_single = nullptr;  // WITH_GROUND μ⁺ blocks
     const DipoleOperator* dipole_double = nullptr;  // DOUBLE_EXCITED μ⁺ blocks
 };
+
+// YAML / request sentinel for 2des.batch: auto (same value as HEOMConfig::kTwoDESBatchAuto).
+inline constexpr int kBatchAuto = 0;
+
+// Auto search order: largest width first.
+inline constexpr std::array<int, 3> kBatchWidthCandidates = {21, 7, 1};
+
+// Pure selection for `batch: auto`. need_bytes[i] is the walk GPU total for
+// kBatchWidthCandidates[i] (max over the pathway contexts). Uses the same
+// usable = gpu_free * safety_margin rule as check_budget. gpu_free == 0
+// (query failed) ⇒ treat as unknown capacity and pick 21, matching the
+// explicit-width path that lets BudgetCheck::Unknown through.
+// On success fills `reason` and returns 21/7/1; if none fit, throws with the
+// three MiB figures in the message.
+int pick_batch_width(const std::array<size_t, 3>& need_bytes,
+                     size_t gpu_free,
+                     std::string& reason,
+                     double safety_margin = 0.95);
 
 // Build the axis/sampling fields of a TwoDESRequest from a resolved
 // TwoDESConfig and the HEOM step dt (fs). Does NOT set the dipole pointers
@@ -195,6 +201,12 @@ struct BranchPlan {
 // (m1 → m2 → leaves), so leaves[b].comp_idx == b (the reuse walk's canonical
 // accumulation order). Pure host, no GPU.
 BranchPlan build_branch_plan();
+
+// The plans one batched walk of width `width` runs, in order: {plan} for 21,
+// the 3 m1 subtrees of plan (B_tau=1, B_T=3, B_t=7 each; leaves keep their
+// comp_idx) for 7. Throws std::invalid_argument for any other width (the
+// width-1 reuse walk does not use a BranchPlan). Pure host, no GPU.
+std::vector<BranchPlan> walk_plans(const BranchPlan& plan, int width);
 
 // Isotropic carry-through 2DES driver. `sys_single` is the WITH_GROUND context
 // (SE/GSB); `sys_double` the DOUBLE_EXCITED context (ESA). Fills TwoDESResult

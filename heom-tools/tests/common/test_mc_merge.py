@@ -17,9 +17,9 @@ DS = "rho_xyz"
 
 def _make_shard(path, mean, count, sum_obs_sq, r_done,
                 identity="iid_gauss@v1|seed=1|sigma=42.0", fingerprint="cfg#abc",
-                precision=None):
+                precision=None, libver=None):
     mean = np.asarray(mean, dtype=np.complex128)
-    with h5py.File(path, "w") as f:
+    with h5py.File(path, "w", libver=libver) as f:
         # precision_mode is a ROOT attr (not /mc): a build choice, not physics.
         # None => omit it, mimicking legacy pre-mixed-precision shards.
         if precision is not None:
@@ -342,3 +342,58 @@ def test_convergence_status_zero_norm_rejected():
     with pytest.raises(ValueError, match="zero L"):
         convergence_status([0.0, 0.0], se_l2=0.1, count=10,
                            estimator="mean", tol=0.01)
+
+
+# --- merged r_done larger than a v1 object-header message (64 KiB) -----------
+#
+# Shards from heom-gpu <= 2.1.2 on libhdf5 1.10 are earliest-format files with a
+# v1 /mc header; h5py's default "w" is the same format, so _make_shard builds
+# exactly that layout. Before the fix the merged r_done over ~8190 entries raised
+# "object header message is too large" half-way through the write.
+
+def _attr_types(group):
+    return {n: h5py.h5a.open(group.id, n.encode()).get_type() for n in group.attrs}
+
+
+# 4500 per shard: two old-format shards (each fits) merging to 9000.
+# 50000 per shard: shards as the fixed solver writes them (1.8-format /mc),
+# merging to 100000.
+@pytest.mark.parametrize("n_per_shard,libver", [(4500, None), (50000, ("v108", "latest"))])
+def test_merge_r_done_past_object_header_limit(tmp_path, n_per_shard, libver):
+    shape = (2,)
+    n = n_per_shard
+    a = _make_shard(tmp_path / "big_rank1.h5", np.full(shape, 1.0), n,
+                    np.full(shape, float(n)), np.arange(n), libver=libver)
+    b = _make_shard(tmp_path / "big_rank2.h5", np.full(shape, 3.0), n,
+                    np.full(shape, 9.0 * n), np.arange(n, 2 * n), libver=libver)
+    with h5py.File(a, "r") as f:
+        types_before = _attr_types(f["/mc"])
+    m = merge_mc_shards([a, b], DS)
+    out = write_merged_spectrum(a, str(tmp_path / "big.h5"), m, DS)
+    with h5py.File(out, "r") as f:
+        mc = f["/mc"]
+        assert np.array_equal(np.asarray(mc.attrs["r_done"]), np.arange(2 * n))
+        assert int(mc["count"][()]) == 2 * n
+        assert mc.attrs["n_shards"] == 2
+        assert "sem" in mc and "se_l2" in mc.attrs
+        assert np.allclose(f[f"/results/{DS}"][...], 2.0)
+        for name, t in types_before.items():          # same attribute types
+            if name != "r_done":
+                assert h5py.h5a.open(mc.id, name.encode()).get_type().equal(t), name
+        assert mc.attrs["config_fingerprint"] == "cfg#abc"
+    assert sorted(p.name for p in tmp_path.iterdir()) == \
+        ["big.h5", "big_rank1.h5", "big_rank2.h5"]     # no temp file left
+
+
+def test_merge_failure_leaves_no_merged_file(tmp_path, monkeypatch):
+    import heom_tools.common.mc_merge as mm
+    a = _make_shard(tmp_path / "f_rank1.h5", [1.0], 1, [1.0], [0])
+    b = _make_shard(tmp_path / "f_rank2.h5", [3.0], 1, [9.0], [1])
+    m = merge_mc_shards([a, b], DS)
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated failure during the merged write")
+    monkeypatch.setattr(mm, "_write_merged_into", boom)
+    with pytest.raises(OSError, match="simulated"):
+        write_merged_spectrum(a, str(tmp_path / "f.h5"), m, DS)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f_rank1.h5", "f_rank2.h5"]

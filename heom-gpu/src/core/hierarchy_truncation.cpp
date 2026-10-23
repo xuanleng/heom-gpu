@@ -82,7 +82,7 @@ void HierarchyTruncation::generate_recursive(
 }
 
 // indices is sorted lexicographically by generate_hierarchy_indices(), so we
-// look neighbours up by binary search — O(log M * N*(K+1)) per query, no
+// look neighbours up by binary search — O(log M * D) per query, no
 // auxiliary container. This is preferred over a std::unordered_map<hash,int>:
 // the hash map wasted ~M*48 B of host RAM (≥500 MB at LHC-II scale), needed a
 // lazy-FNV cache on every HierarchyIndex, and required runtime collision
@@ -92,20 +92,23 @@ HierarchyTruncation::build_neighbor_maps(const HierarchyTable& indices) const {
     // log_ may be &std::cout: never leak fixed/precision to it.
     const heom::StreamFormat fmt_guard(log_);
     const int M = static_cast<int>(indices.size());
-    const int N = phys_params_.n_states;
-    const int K = phys_params_.n_bath_modes_total;
-    const int D = index_width();
-    const int total_size = M * N * (K + 1);
+    const heom::ModeLayout ml = mode_layout();
+    const int N = ml.n_bath;
+    const int D = ml.channels();
+    // size_t on purpose: this is the host table, and the comment below promises
+    // it can be larger than the GPU's int ceiling. Keep the promise.
+    const size_t total_size = static_cast<size_t>(M) * D;
 
     if (log_) *log_ << "Building neighbor maps (M=" << M << ")..." << std::flush;
 
-    // Host cost is O(M · N · (K+1) · log M): the triple loop below visits every
+    // Host cost is O(M · D · log M): the triple loop below visits every
     // (ADO, site, pole) slot and resolves each ±neighbor by std::lower_bound
     // over the sorted M-vector. Single-threaded; for the largest host-buildable
     // config (LHC-II scale, M~9M) this is the dominant CPU init cost, so it is
     // timed here. (That M is a host-side data-structure stress point only — the
-    // GPU propagation is separately capped at M·N² < 2^31; see
-    // checked_total_elements. The two limits are independent.) Revisit
+    // GPU propagation is separately capped at M·N² < 2^31 AND M·D
+    // < 2^31; see checked_rho_elements / checked_map_elements. The host
+    // table here is size_t and has neither limit.) Revisit
     // (parallelize / cache neighbors) only if this line ever shows up as a
     // startup bottleneck.
     const auto build_t0 = std::chrono::steady_clock::now();
@@ -134,7 +137,7 @@ HierarchyTruncation::build_neighbor_maps(const HierarchyTable& indices) const {
     };
 
     // One scratch row, mutated in place and restored after each probe. The
-    // old code materialised a fresh HierarchyIndex per ± neighbour (2·M·N·(K+1)
+    // old code materialised a fresh HierarchyIndex per ± neighbour (2·M·D
     // heap allocations) and recomputed Σα inside the validity test, making the
     // walk O(M·D²); the row sum is loop-invariant in (n,k), so hoist it.
     std::vector<int8_t> probe(D);
@@ -144,9 +147,10 @@ HierarchyTruncation::build_neighbor_maps(const HierarchyTable& indices) const {
         const bool can_raise = (row_sum < L_cutoff_);
 
         for (int n = 0; n < N; ++n) {
-            for (int k = 0; k <= K; ++k) {
-                const int slot       = n * (K + 1) + k;
-                const int linear_idx = i * N * (K + 1) + slot;
+            const int kc = ml.count(n);
+            for (int k = 0; k < kc; ++k) {
+                const int    slot       = ml.slot(n, k);
+                const size_t linear_idx = static_cast<size_t>(i) * D + slot;
 
                 if (can_raise) {
                     ++probe[slot];

@@ -1,0 +1,55 @@
+# Monomer: Drude + Padé K=2 + 340 / 1180 cm⁻¹ underdamped modes, 77 K, L=4.
+# Gate G4a (tests/test_fluorescence_gates.py): absorption and fluorescence
+# against the NumPy hierarchy tests/fl_monomer_ref.py on the same grid.
+# The dressed start is the exact monomer equilibrium, so equilibration stops
+# at the round-off floor within a few checks.
+
+system:
+  n_states: 1
+  temperature: 77.0
+  hamiltonian:
+    - [12000.0]
+  w0: 12000.0
+  dipoles:
+    - [1.0, 0.0, 0.0]
+  strengths: [1.0]
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 70.0
+  gamma_inverse: 100.0
+  expansion_method: pade
+  n_extra_poles: 2
+  L_cutoff: 4
+  vibrational_modes:
+    - {omega_cm: 340.0, huang_rhys: 0.05, gamma_inverse: 354.0}
+    - {omega_cm: 1180.0, huang_rhys: 0.02, gamma_inverse: 354.0}
+
+filter:
+  enabled: false
+
+absorption:
+  integrator: rk4
+  dt: 1
+  n_steps: 600
+  output_interval: 2
+  print_interval: 0
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "fl_monomer_vib_abs"
+    use_timestamp: false
+
+fluorescence:
+  integrator: rk4
+  dt: 1
+  n_steps: 600
+  output_interval: 2
+  print_interval: 0
+  equilibration:
+    t_max: 500
+    check_interval: 50
+    tolerance: 1.0e-10
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "fl_monomer_vib"
+    use_timestamp: false

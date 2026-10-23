@@ -52,22 +52,23 @@ inline std::string format_computation_time(double seconds) {
     return buf;
 }
 
-// Print the full eigenspectrum of the site Hamiltonian.
+// Print the single-exciton block of the eigenspectrum, numbered 1..n like
+// the YAML exciton_index.
 //
-//   eigenvalues  : ascending eigenvalues from Eigen::SelfAdjointEigenSolver,
-//                  in atomic units relative to w0.
-//   selected_idx : index into eigenvalues to be marked with "<- Selected"
-//                  (use -1 to disable highlighting).
-//   N            : number of eigenvalues to print.
+//   eigenvalues  : SystemContext::eigenvalues() (a.u., relative to w0),
+//                  ascending within [lo, lo + n).
+//   lo, n        : the single-excitation manifold's Hilbert range.
+//   selected_idx : Hilbert index marked with "<- Selected" (-1: none).
 //   w0_cm        : reference frequency w0 in cm^-1, used for the absolute
 //                  energy column (E_abs = E_rel + w0).
 void print_eigenspectrum(const Eigen::VectorXd& eigenvalues,
-                         int selected_idx, int N, double w0_cm);
+                         int lo, int n, int selected_idx, double w0_cm);
 
-// Print the site-basis composition of a single exciton eigenstate,
-// listing only sites whose probability exceeds 0.1%.
+// Print the pigment composition of eigenvector column `exciton_idx` over the
+// single-excitation rows [lo, lo + n), listing only pigments whose
+// probability exceeds 0.1%.
 void print_exciton_composition(const Eigen::MatrixXcd& eigenvectors,
-                               int exciton_idx, int N);
+                               int exciton_idx, int lo, int n);
 
 // Print a one-line summary of the initial site-basis density matrix:
 // non-trivial diagonals (populations > 0.01) and the first few

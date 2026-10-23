@@ -8,29 +8,42 @@ Both functions stay importable without side effects (no top-level solver runs),
 so `python -m pytest tests/test_integration.py -k 2des` collects cleanly.
 Also runnable as a plain script: `python tests/test_integration.py`.
 """
-import os, sys, subprocess, tempfile, yaml
+import os, sys, subprocess, tempfile
 
 root = os.environ.get("HEOM_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 solver = os.environ.get("HEOM_SOLVER", os.path.join(root, "build", "heom_solver"))
 
 
+# ctest reads this as "skipped", not "passed" (SKIP_RETURN_CODE in CMakeLists).
+# Reserved for genuine environment gaps (missing Python module); a missing
+# TRACKED fixture is a broken checkout and must assert, not skip.
+SKIP_EXIT_CODE = 77
+
+
 def _skip(msg):
-    try:
+    # "pytest is importable" != "pytest is running us". Under ctest this is a
+    # plain script; pytest.skip() there is an uncaught exception (exit 1).
+    if "pytest" in sys.modules:
         import pytest
-        pytest.skip(msg)
-    except ImportError:
-        print(f"SKIP: {msg}")
-        sys.exit(0)
+        pytest.skip(msg, allow_module_level=True)
+    print(f"SKIP: {msg}")
+    sys.exit(SKIP_EXIT_CODE)
+
+
+try:
+    import numpy as np
+    import yaml
+except ImportError as e:
+    _skip(f"{e.name} not installed")
 
 
 def test_fmo7_integration():
-    compare = os.path.join(root, "tests", "compare_benchmark.py")
+    regress = os.path.join(root, "tests", "regress.py")
     cfg_path = os.path.join(root, "tests", "configs", "benchmark_fmo7.yaml")
     ref_path = os.path.join(root, "tests", "benchmark_data", "benchmark_fmo7.h5")
 
-    if not os.path.exists(ref_path):
-        _skip(f"reference file {ref_path} not found")
-        return
+    assert os.path.exists(ref_path), \
+        f"reference file {ref_path} not found (tracked file — broken checkout?)"
 
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
@@ -50,7 +63,7 @@ def test_fmo7_integration():
                            capture_output=True, text=True, timeout=300)
         assert r.returncode == 0, f"solver exited {r.returncode}\n{r.stderr[-500:]}"
 
-        r2 = subprocess.run(["python3", compare, out_path, ref_path, "--tol", "1e-12"],
+        r2 = subprocess.run([sys.executable, regress, "diff", ref_path, out_path, "--tol", "1e-12"],
                             capture_output=True, text=True)
         print(r2.stdout)
         assert r2.returncode == 0, "benchmark comparison failed"
@@ -63,7 +76,6 @@ def test_fmo7_integration():
 def test_2des_dimer_smoke():
     """Run the dimer 2DES smoke. The HDF5 product is finite and shaped correctly,
     and carry-through GSB depends on the waiting time T."""
-    import numpy as np
     try:
         import h5py
     except ImportError:

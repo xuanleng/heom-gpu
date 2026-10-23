@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 
+from heom_tools.common import heom_h5
 from heom_tools.twodes.post.io import decode_attr, from_h5_complex, read_params_attrs
 
 _ARRAY_RTOL = 0.0
@@ -62,6 +63,7 @@ def _read_dataset(group: h5py.Group, name: str) -> Optional[np.ndarray]:
 
 def load_fingerprint(path: str) -> SolverFingerprint:
     with h5py.File(path, "r") as f:
+        heom_h5.require_complete(f)
         if "/results/resp" not in f:
             raise ValueError(f"{path}: missing /results/resp")
         tau = np.asarray(f["/results/tau_fs"][...], dtype=np.float64).ravel()

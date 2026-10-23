@@ -1,0 +1,42 @@
+# Coupled dimer fluorescence (with_ground, filter off) — small, ~1 s on a 3060.
+# Used by test_benchmark_infra.py (MC single-node bit identity, G8) and the
+# flu-post smoke path. Equilibrates in ~6.4 ps at tolerance 1e-6.
+
+system:
+  n_states: 2
+  temperature: 77.0
+  hamiltonian:
+    - [12100.0, 100.0]
+    - [100.0, 12300.0]
+  w0: 12200.0
+  dipoles:
+    - [0.9785, 0.2063, 0.0]
+    - [0.3030, -0.8081, 0.5051]
+  strengths: [1.0, 1.0]
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 70.0
+  gamma_inverse: 100.0
+  expansion_method: pade
+  n_extra_poles: 1
+  L_cutoff: 3
+
+filter:
+  enabled: false
+
+fluorescence:
+  integrator: rk4
+  dt: 2
+  n_steps: 500
+  output_interval: 1
+  print_interval: 0
+  batch: true
+  equilibration:
+    t_max: 10000
+    check_interval: 50
+    tolerance: 1.0e-6
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "dimer_fluorescence"
+    use_timestamp: false

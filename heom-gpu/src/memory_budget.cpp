@@ -3,6 +3,7 @@
 #include "gpu_alloc_plan.hpp"
 #include "types.hpp"
 #include "core/cuda_common.cuh"
+#include "core/manifold_layout.hpp"
 
 #include <cuComplex.h>
 #include <cuda_runtime.h>
@@ -49,7 +50,7 @@ void print_row(const char* label, size_t bytes, const std::string& annotation = 
 }
 
 // Note: vector header / allocator overhead are intentionally NOT counted in
-// host buckets. For LHC-II (M ≈ 10⁶, n_bath·(K+1) ≈ 70) the raw int8_t data
+// host buckets. For LHC-II (M ≈ 10⁶, D ≈ 70) the raw int8_t data
 // dwarfs any reasonable allocator overhead by 3+ orders of magnitude. Trying
 // to model libstdc++ + glibc ptmalloc constants here was a portability bug
 // (libc++/MSVC STL/jemalloc/tcmalloc all differ).
@@ -60,19 +61,53 @@ void print_row(const char* label, size_t bytes, const std::string& annotation = 
 // estimate_budget
 // ---------------------------------------------------------------------------
 
+int rho_capacity(const HEOMConfig::Config& cfg) {
+    const int N = cfg.physics.n_sites;
+    // Task + basis + n_states fix which manifold blocks a run will ever hold
+    // Dynamics stores the whole matrix. Absorption lives in
+    // (e,g); fluorescence in (e,e) then (e,g). A 2DES SystemContext walks {gg, eg/ge, ee, fe/ef} in its own
+    // basis; the largest is ee (n_e²) or fe (n_f·n_e). Computed from the
+    // layout, not the pathway table — heom_core cannot see spectra — and
+    // pinned to the table by test_2des_reuse (rho_capacity_matches_path_table).
+    switch (cfg.task) {
+        case HEOMConfig::Config::Task::Dynamics:
+            return N * N;
+        case HEOMConfig::Config::Task::Absorption: {
+            const auto lay = ManifoldLayout::from(cfg.physics.basis,
+                                                  cfg.physics.n_states, N);
+            return lay.block(/*row=*/1, /*col=*/0).elems();
+        }
+        case HEOMConfig::Config::Task::TwoDES: {
+            const auto lay = ManifoldLayout::from(cfg.physics.basis,
+                                                  cfg.physics.n_states, N);
+            const int n_e = lay.size(1);
+            const int n_f = lay.size(2);   // 0 in WITH_GROUND
+            return std::max(n_e * n_e, n_f * n_e);
+        }
+        case HEOMConfig::Config::Task::Fluorescence: {
+            // Equilibrates in (e,e) (n_e²), emits in (e,g) (n_e ≤ n_e²).
+            const auto lay = ManifoldLayout::from(cfg.physics.basis,
+                                                  cfg.physics.n_states, N);
+            return lay.block(/*row=*/1, /*col=*/1).elems();
+        }
+    }
+    throw std::logic_error("rho_capacity: unknown Config::Task");
+}
+
 // CAVEAT: a config that fits in GPU memory here is NOT necessarily runnable.
 // The kernels index ρ with a 32-bit linear offset, so propagation also requires
-// M·N² < 2^31 (see heom::checked_total_elements). At LHC-II scale (M ≈ 10⁶,
-// N = 106) the byte budget may sit comfortably under an 80 GB card while M·N²
-// ~ 1e10 still blows the int index ceiling. This estimator reports bytes only;
-// the index ceiling is enforced (loudly) at the first RK4 launch.
+// M·Nb < 2^31 (see heom::checked_rho_elements). A dynamics run at LHC-II scale
+// (M ≈ 10⁶, N = 106, Nb = N²) may fit an 80 GB card by bytes while M·Nb ~ 1e10
+// still blows the int index ceiling. This estimator reports bytes only; the
+// index ceiling is enforced (loudly) at trajectory construction.
 MemoryBudget estimate_budget(const HEOMConfig::Config& cfg, size_t M,
-                             size_t batch) {
+                             size_t batch, Resident resident) {
     MemoryBudget b{};
     b.M             = M;
     b.N             = cfg.physics.n_sites;
+    b.rho_elems     = rho_capacity(cfg);
     b.n_bath        = cfg.physics.n_states;
-    b.K             = cfg.physics.n_bath_modes_total;
+    b.D             = cfg.physics.n_ladders();
     b.L             = cfg.L_cutoff;
     b.batch         = batch;
     b.use_filtering = cfg.filter.enabled;
@@ -81,7 +116,8 @@ MemoryBudget estimate_budget(const HEOMConfig::Config& cfg, size_t M,
     // This is the single source of truth — allocate_gpu_memory() walks the
     // same plan, so the prediction here cannot drift from reality. batch scales
     // d_rho / d_workspace inside the plan.
-    const auto plan = plan_gpu_buffers(M, b.N, b.K, b.n_bath, b.L, b.use_filtering, batch);
+    const auto plan = plan_gpu_buffers(M, b.N, b.D, b.n_bath, b.L, b.use_filtering,
+                                       batch, static_cast<size_t>(b.rho_elems));
     using Bk = GPUBufferSpec::Bucket;
     for (const auto& s : plan) {
         switch (s.bucket) {
@@ -93,38 +129,55 @@ MemoryBudget estimate_budget(const HEOMConfig::Config& cfg, size_t M,
         }
     }
     // Mixed-precision Kahan compensation carry: same shape as ρ
-    // (M·N²·sizeof(complex_t)), persistent, allocated only in the mixed build.
+    // (M·Nb·sizeof(complex_t)), persistent, allocated only in the mixed build.
     // Not in the alloc plan (precision-mode-only cost), so add it explicitly and
     // fold into the RK4 workspace bucket — it lives with the integrator state.
     if constexpr (heom::kMixedPrecision) {
-        const size_t kahan = batch * M * static_cast<size_t>(b.N) * b.N
+        const size_t kahan = batch * M * static_cast<size_t>(b.rho_elems)
                            * sizeof(heom::complex_t);
         b.rk4_workspace += kahan;
     }
 
-    b.gpu_total = b.rho_tensor + b.rk4_workspace
-                + b.hierarchy_maps + b.filter_buffers + b.auxiliary;
+    // Config-dependent extras HEOMTrajectory allocates outside the plan (each
+    // is O(M) and only exists on its own path; see allocate_trajectory_buffers
+    // and UListBuilder's ctor — built whenever the filter is on, its flags
+    // gate the full launch too). cub's DeviceSelect temp storage is
+    // bytes-to-KiB and not modelled.
+    if (cfg.time.integrator == Integrator::IfRk4) {
+        b.optional += 2 * M * sizeof(heom::complex_t);          // d_if_e_half + d_if_e_full
+    }
+    if (cfg.filter.enabled) {
+        // d_e_flags + d_u_list + d_ids, one row per slot (UListBuilder)
+        b.optional += batch * M * (sizeof(uint8_t) + 2 * sizeof(int));
+    }
+
+    if (resident == Resident::SystemTables) {
+        b.resident       = b.hierarchy_maps + b.auxiliary;
+        b.hierarchy_maps = 0;
+        b.auxiliary      = 0;
+    }
+    b.gpu_total = b.rho_tensor + b.rk4_workspace + b.hierarchy_maps
+                + b.filter_buffers + b.auxiliary + b.optional + b.driver;
 
     // Host buckets: raw data only (allocator/header overhead negligible).
-    const size_t n_bath  = static_cast<size_t>(b.n_bath);
-    const size_t Kp1     = static_cast<size_t>(b.K) + 1;
-    const size_t map_sz  = M * n_bath * Kp1;
+    const size_t D       = static_cast<size_t>(b.D);
+    const size_t map_sz  = M * D;
     // h_rho0_ mirror element size follows hier precision; the mixed build also
     // keeps an FP64 staging copy (h_rho0_fp64_) for the float64-only HDF5 write.
     const size_t cd      = sizeof(heom::complex_t)
                          + (heom::kMixedPrecision ? sizeof(cuDoubleComplex) : 0);
 
-    // HierarchyTable is one contiguous int8_t[M][n_bath·(K+1)] buffer, plus the
-    // two int[M] row permutations the lexicographic sort holds simultaneously
+    // HierarchyTable is one contiguous int8_t[M][D] buffer, plus the two
+    // int[M] row permutations the lexicographic sort holds simultaneously
     // (freed before build_neighbor_maps runs, but part of the init peak).
-    b.host_hierarchy      = M * (n_bath * Kp1 * sizeof(int8_t) + 2 * sizeof(int));
+    b.host_hierarchy      = M * (D * sizeof(int8_t) + 2 * sizeof(int));
     b.host_neighbor_maps  = 2 * map_sz * sizeof(int);
     b.host_density_buffer = static_cast<size_t>(b.N) * b.N * cd;
     b.host_total          = b.host_hierarchy + b.host_neighbor_maps + b.host_density_buffer;
 
     // h_level_indices in upload_gpu_readonly: a flat int8 copy of the same
     // hierarchy data, allocated while host_hierarchy is still alive.
-    // h_total_decay (M·8B) and h_active_flags staging (M·1B) are negligible.
+    // h_total_decay (M·16B) and h_active_flags staging (M·1B) are negligible.
     b.host_init_peak = map_sz * sizeof(int8_t);
 
     return b;
@@ -141,8 +194,9 @@ void print_budget(const MemoryBudget& b, size_t gpu_free, size_t gpu_total) {
     // Parameter echo line (helps diagnose "M is huge because L is too high")
     std::cout << "  Params:  M=" << b.M
               << "  N=" << b.N
+              << "  Nb=" << b.rho_elems
               << "  n_bath=" << b.n_bath
-              << "  K=" << b.K
+              << "  D=" << b.D
               << "  L=" << b.L
               << "  filter=" << (b.use_filtering ? "on" : "off")
               << "\n";
@@ -159,13 +213,13 @@ void print_budget(const MemoryBudget& b, size_t gpu_free, size_t gpu_total) {
     const std::string bpref =
         (b.batch > 1) ? (std::to_string(b.batch) + " * ") : std::string();
     print_row("rho tensor (in-place RK4)", b.rho_tensor,
-              bpref + "1 * M * N^2 * " + std::to_string(csz) + "B");
+              bpref + "1 * M * Nb * " + std::to_string(csz) + "B");
     print_row("RK4 workspace (3 buffers)", b.rk4_workspace,
-              bpref + "3 * M * N^2 * " + std::to_string(csz)
+              bpref + "3 * M * Nb * " + std::to_string(csz)
               + "B  (k_curr + temp + acc"
               + (heom::kMixedPrecision ? " + Kahan)" : ")"));
     print_row("hierarchy maps (x3)", b.hierarchy_maps,
-              "M * n_bath * (K+1) * 9B");
+              "M * D * 9B");
     if (b.filter_buffers > 0) {
         print_row("filter buffers", b.filter_buffers,
                   "ado_norms + active_flags + partials");
@@ -174,6 +228,17 @@ void print_budget(const MemoryBudget& b, size_t gpu_free, size_t gpu_total) {
     }
     print_row("auxiliary", b.auxiliary,
               "H + Matsubara + decay + d_coupling");
+    if (b.optional > 0) {
+        print_row("integrator / ulist extras", b.optional,
+                  "IF-RK4 tables 2*M*16B, U closure 9B*M");
+    }
+    if (b.driver > 0) {
+        print_row("2DES snapshots + grid", b.driver, "driver-owned");
+    }
+    if (b.resident > 0) {
+        print_row("system tables (resident)", b.resident,
+                  "maps + auxiliary, already allocated: NOT in total");
+    }
     std::cout << "    " << std::left << std::setw(28) << "GPU TOTAL"
               << std::right << std::setw(12) << format_iec(b.gpu_total);
     if (gpu_total > 0) {
@@ -187,9 +252,9 @@ void print_budget(const MemoryBudget& b, size_t gpu_free, size_t gpu_total) {
     std::cout << "  Host memory (transient peak during SystemContext init,\n"
                  "              freed before solve(); only h_rho0_ persists):\n";
     print_row("hierarchy index objects", b.host_hierarchy,
-              "M * (n_bath * (K+1) + 2 * 4B)");
+              "M * (D + 2 * 4B)");
     print_row("neighbor maps (host)", b.host_neighbor_maps,
-              "2 * M * n_bath * (K+1) * 4B");
+              "2 * M * D * 4B");
     print_row("output buffer h_rho0_", b.host_density_buffer,
               "N^2 * 16B  (rho_0 only, persistent)");
     std::cout << "    " << std::left << std::setw(28) << "HOST TOTAL"
@@ -212,7 +277,7 @@ void print_budget_compact(const MemoryBudget& b, size_t gpu_free) {
         std::cout << "  (" << std::fixed << std::setprecision(1) << pct
                   << "% of free)";
     }
-    std::cout << "  M=" << b.M << " N=" << b.N
+    std::cout << "  M=" << b.M << " N=" << b.N << " Nb=" << b.rho_elems
               << "  filter=" << (b.use_filtering ? "on" : "off") << "\n";
 }
 
@@ -260,16 +325,17 @@ BudgetCheck check_budget(const MemoryBudget& b,
       << "  Suggestions (largest impact first):\n";
 
     // Mitigation hints. RK4 workspace + rho tensor together scale as
-    // 5·M·N²·16 (3 RK4 + 2 rho), dominate every realistic config — always
+    // 4·M·Nb·16 (3 RK4 + 1 rho), dominate every realistic config — always
     // show this hint.
     s << "    - Reduce L_cutoff (current=" << b.L
       << "): smaller L → fewer ADOs (M scales steeply with L)\n";
 
     // K-reduction hint is unconditional. The old `if hierarchy_maps
     // > gpu_total/4` check was dead code (ratio is ~10⁻²-10⁻⁴ in practice).
-    if (b.K > 0) {
-        s << "    - Reduce n_extra_poles (current=" << b.K
-          << "): each step removes one mode per bath in the hierarchy maps\n";
+    if (b.D > b.n_bath) {
+        s << "    - Reduce n_extra_poles / vibrational modes (ladders D=" << b.D
+          << " over " << b.n_bath << " baths): each removed pole is one ladder"
+             " fewer in the hierarchy\n";
     }
 
     if (!b.use_filtering) {

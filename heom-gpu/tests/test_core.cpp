@@ -7,78 +7,27 @@
 #include "memory_budget.hpp"
 #include "gpu_alloc_plan.hpp"
 #include "output/spectrum_writer.hpp"
-#include "spectra/dipole.hpp"          // DipoleOperator + factory
+#include "output/hdf5_metadata.hpp"
+#include "spectra/dipole.hpp"
+#include "spectra/two_dim.hpp"  // pick_batch_width, DipoleOperator + factory
 #include "output/console_printer.hpp"  // format_computation_time tiers
 #include "util/stream_format.hpp"
+#include "harness.hpp"
 
 #include <iostream>
 #include <fstream>
+#include <iterator>
 #include <iomanip>
 #include <sstream>
 #include <cmath>
 #include <cassert>
 #include <complex>
+#include <cstring>
 #include <vector>
 #include <array>
 #include <string>
 #include <stdexcept>
 #include <type_traits>
-
-static int tests_run = 0;
-static int tests_passed = 0;
-
-#define TEST(name) do { \
-    ++tests_run; \
-    std::cout << "  " << name << "... " << std::flush; \
-} while(0)
-
-#define PASS() do { ++tests_passed; std::cout << "PASS\n"; } while(0)
-
-#define ASSERT_NEAR(a, b, tol) do { \
-    double _a = (a), _b = (b); \
-    if (std::abs(_a - _b) > (tol)) { \
-        std::cout << "FAIL\n    expected " << _b << " got " << _a \
-                  << " (diff=" << std::abs(_a-_b) << ")\n"; \
-        return; \
-    } \
-} while(0)
-
-#define ASSERT_EQ(a, b) do { \
-    auto _a = (a); auto _b = (b); \
-    if (_a != _b) { \
-        std::cout << "FAIL\n    expected " << _b << " got " << _a << "\n"; \
-        return; \
-    } \
-} while(0)
-
-#define ASSERT_NE(a, b) do { \
-    auto _a = (a); auto _b = (b); \
-    if (_a == _b) { \
-        std::cout << "FAIL\n    expected != " << _b << " but both equal\n"; \
-        return; \
-    } \
-} while(0)
-
-#define ASSERT_THROWS(expr) do { \
-    bool caught = false; \
-    try { expr; } catch (const std::exception&) { caught = true; } \
-    if (!caught) { \
-        std::cout << "FAIL\n    expected exception, none thrown\n"; \
-        return; \
-    } \
-} while(0)
-
-// Dual of ASSERT_THROWS (in-house style instead of pulling in Catch2). Used by the
-// in-memory Config api-stability test below; reusable by future tests.
-#define ASSERT_NOTHROW(expr) do { \
-    try { expr; } catch (const std::exception& _e) { \
-        std::cout << "FAIL\n    threw std::exception: " << _e.what() << "\n"; \
-        return; \
-    } catch (...) { \
-        std::cout << "FAIL\n    threw unknown exception\n"; \
-        return; \
-    } \
-} while(0)
 
 // ============================================================================
 // 6.2 Matsubara expansion
@@ -95,13 +44,30 @@ static void set_homog_bath(PhysicalParameters& p, double eta_au, double gamma_au
     s.eta_cm           = eta_au / CM_TO_AU;
     s.gamma_au         = gamma_au;
     s.gamma_inverse_fs = 1.0 / (gamma_au * FS_TO_AU);
+    s.n_extra_poles    = p.n_extra_poles;   // K_n seeded from the global default, as parse_bath does
     p.bath_sites.assign(p.n_states, s);
+}
+
+// One underdamped BO mode from cm⁻¹ / Huang-Rhys / 1/γ(fs), the parser's units.
+static VibMode make_vib_mode(double omega_cm, double S, double ginv_fs) {
+    VibMode v;
+    v.omega_cm = omega_cm; v.huang_rhys = S; v.gamma_inverse_fs = ginv_fs;
+    v.omega_au  = omega_cm * CM_TO_AU;
+    v.lambda_au = S * v.omega_au;
+    v.gamma_au  = 1.0 / (ginv_fs * FS_TO_AU);
+    return v;
+}
+
+// Uniform K+1 slots per bath, the layout the bath builders produce today.
+// Tests that never call compute_*_drude need it to give HierarchyTruncation /
+// the budget a defined D.
+static void uniform_modes(PhysicalParameters& p, int K) {
+    p.set_mode_counts(std::vector<int>(p.n_states, K + 1));
 }
 
 static PhysicalParameters make_fmo7_params() {
     PhysicalParameters p;
     p.temperature = 300.0 * BOLTZMANN;
-    p.n_bath_modes_total = 5;
     p.n_extra_poles = 5;   // Snapshot user input
     p.n_states = 1;        // single-bath: flat layout == [K+1]
     p.n_sites = 1;
@@ -112,20 +78,25 @@ static PhysicalParameters make_fmo7_params() {
 }
 
 static void test_bath_modes_no_disorder_slot() {
-    TEST("bath modes: n_bath_modes_total == n_extra_poles (no disorder slot)");
+    TEST("bath modes: builders pin mode_off = n(K+1), D = n_bath(K+1)");
     PhysicalParameters p;
     p.temperature = 77.0 * BOLTZMANN; p.n_states = 2; p.n_sites = 2;
-    p.basis = BasisType::EXCITED_ONLY; p.n_extra_poles = 3; p.n_bath_modes_total = 3;
+    p.basis = BasisType::EXCITED_ONLY; p.n_extra_poles = 3;
     set_homog_bath(p, 35.0 * CM_TO_AU, 1.0 / (100.0 * FS_TO_AU));
     compute_matsubara_drude(p);
-    ASSERT_EQ(p.n_bath_modes_total, 3);   // locks: no disorder slot ⇒ always == K_drude
+    ASSERT_EQ((int)p.mode_off.size(), 3);
+    ASSERT_EQ(p.mode_off[0], 0); ASSERT_EQ(p.mode_off[1], 4); ASSERT_EQ(p.mode_off[2], 8);
+    ASSERT_EQ(p.n_ladders(), 8);
+    ASSERT_EQ((int)p.c_bath.size(), 8);
+    ASSERT_EQ((int)p.nu_bath.size(), 8);
     PASS();
 }
 
 static void test_matsubara_nu0() {
     TEST("matsubara ν_0 = γ");
     auto p = make_fmo7_params();
-    ASSERT_NEAR(p.nu_bath[0], p.bath_sites[0].gamma_au, 1e-15);
+    ASSERT_NEAR(p.nu_bath[0].real(), p.bath_sites[0].gamma_au, 1e-15);
+    ASSERT_EQ(p.nu_bath[0].imag(), 0.0);
     PASS();
 }
 
@@ -133,7 +104,7 @@ static void test_matsubara_nuk() {
     TEST("matsubara ν_k = 2πkT (k≥1)");
     auto p = make_fmo7_params();
     for (int k = 1; k <= 5; ++k)
-        ASSERT_NEAR(p.nu_bath[k], 2.0 * k * PI * p.temperature, 1e-15);
+        ASSERT_NEAR(p.nu_bath[k].real(), 2.0 * k * PI * p.temperature, 1e-15);
     PASS();
 }
 
@@ -173,7 +144,6 @@ static void test_matsubara_resonance_k1_throws() {
     PhysicalParameters p;
     p.temperature_K    = 77.0;
     p.temperature      = 77.0 * BOLTZMANN;
-    p.n_bath_modes_total      = 5;
     p.n_extra_poles = 5;
     p.n_states = 1;
     p.n_sites  = 1;
@@ -190,7 +160,6 @@ static void test_matsubara_resonance_k2_throws() {
     PhysicalParameters p;
     p.temperature_K    = 77.0;
     p.temperature      = 77.0 * BOLTZMANN;
-    p.n_bath_modes_total      = 5;
     p.n_extra_poles = 5;
     p.n_states = 1;
     p.n_sites  = 1;
@@ -213,18 +182,16 @@ static void test_matsubara_no_resonance_default_params() {
 // ============================================================================
 // Padé [K-1/K] expansion. The pole/weight algorithm is NOT
 // re-derived here — these gates pin boson_pade_NmN / compute_pade_drude to the
-// authoritative reference bath_correlation helpers and the shared
+// reference values and to the shared
 // Drude pole + Markov-residue contract with the Matsubara path.
 // ============================================================================
 
-// Builds a Padé-mode phys with K = n_extra_poles = n_bath_modes_total. Disorder
-// off (so n_bath_modes_total stays K). Drude bath in atomic units.
+// Builds a Padé-mode phys with K = n_extra_poles. Drude bath in atomic units.
 static PhysicalParameters make_pade_params(int K, double T_K,
                                            double eta_cm, double ginv_fs) {
     PhysicalParameters p;
     p.temperature_K    = T_K;
     p.temperature      = T_K * BOLTZMANN;
-    p.n_bath_modes_total = K;
     p.n_extra_poles      = K;
     p.n_states = 1;
     p.n_sites  = 1;
@@ -271,7 +238,7 @@ static void test_pade_poles_distinct() {
     ASSERT_NOTHROW(compute_pade_drude(p));
     const auto& nu = p.nu_bath;
     double maxnu = 0.0;
-    for (double v : nu) maxnu = std::max(maxnu, v);
+    for (const auto& v : nu) maxnu = std::max(maxnu, std::abs(v));
     for (size_t i = 0; i < nu.size(); ++i)
         for (size_t j = i + 1; j < nu.size(); ++j) {
             double gap = std::abs(nu[i] - nu[j]) / maxnu;
@@ -362,6 +329,8 @@ static void test_pade_markov_residue_real_only() {
         for (int k = 0; k <= K; ++k) {
             if (p.nu_bath[k] == 0.0) continue;
             retained += (p.c_bath[k] / p.nu_bath[k]).real();
+            // Real poles are self-conjugate, so c̄_k == conj(c_k) exactly.
+            ASSERT_EQ(p.cbar_bath[k], std::conj(p.c_bath[k]));
         }
         const double eta = p.bath_sites[0].eta_au;
         const double gamma = p.bath_sites[0].gamma_au;
@@ -443,7 +412,7 @@ static void test_hierarchy_count_trivial() {
     p.n_states = 2;
     p.n_sites = 2;
     p.basis = BasisType::EXCITED_ONLY;
-    p.n_bath_modes_total = 0;
+    uniform_modes(p, 0);
     HierarchyTruncation ht(p, 2);
     auto indices = ht.generate_hierarchy_indices();
     ASSERT_EQ(static_cast<int>(indices.size()), 6);
@@ -454,7 +423,7 @@ static void test_hierarchy_simple_cutoff_count() {
     TEST("hierarchy: N=2 K_drude=0 L_cutoff=2 → Σα≤2 gives exactly 6 ADOs");
     PhysicalParameters p;
     p.n_states = 2; p.n_sites = 2; p.basis = BasisType::EXCITED_ONLY;
-    p.n_bath_modes_total = 0; p.n_extra_poles = 0;
+    p.n_extra_poles = 0; uniform_modes(p, 0);
     HierarchyTruncation ht(p, /*L_cutoff=*/2);
     auto idx = ht.generate_hierarchy_indices();
     ASSERT_EQ((int)idx.size(), 6);
@@ -467,7 +436,7 @@ static void test_hierarchy_zero_index() {
     p.n_states = 3;
     p.n_sites = 3;
     p.basis = BasisType::EXCITED_ONLY;
-    p.n_bath_modes_total = 1;
+    uniform_modes(p, 1);
     HierarchyTruncation ht(p, 1);
     auto indices = ht.generate_hierarchy_indices();
     auto zero = indices[0];
@@ -483,7 +452,7 @@ static void test_hierarchy_neighbor_maps() {
     p.n_states = 2;
     p.n_sites = 2;
     p.basis = BasisType::EXCITED_ONLY;
-    p.n_bath_modes_total = 0;
+    uniform_modes(p, 0);
     HierarchyTruncation ht(p, 2);
     auto indices = ht.generate_hierarchy_indices();
     auto [plus_map, minus_map] = ht.build_neighbor_maps(indices);
@@ -508,7 +477,7 @@ static void test_hierarchy_sorted() {
     p.n_states = 3;
     p.n_sites = 3;
     p.basis = BasisType::EXCITED_ONLY;
-    p.n_bath_modes_total = 1;
+    uniform_modes(p, 1);
     HierarchyTruncation ht(p, 2);
     auto indices = ht.generate_hierarchy_indices();
     for (size_t i = 1; i < indices.size(); ++i) {
@@ -585,7 +554,7 @@ static void test_hierarchy_with_ground_uses_n_states() {
     p.n_states = 3;
     p.n_sites = 4;
     p.basis = BasisType::WITH_GROUND;
-    p.n_bath_modes_total = 0;
+    uniform_modes(p, 0);
     HierarchyTruncation ht(p, 1);
     auto indices = ht.generate_hierarchy_indices();
     // n_bath = n_states = 3, K=0, L=1 → 1 + 3 = 4 ADOs
@@ -604,7 +573,7 @@ static std::string write_temp_yaml(const std::string& basis, bool sink_enabled,
                                     int print_interval = 100,
                                     int excited_site = 1,
                                     double sink_rate = 0.001) {
-    std::string path = "/tmp/test_heom_config.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_config.yaml";
     std::ofstream f(path);
     f << "system:\n"
       << "  n_states: 7\n"
@@ -624,7 +593,7 @@ static std::string write_temp_yaml(const std::string& basis, bool sink_enabled,
       << "  eta: 70.0\n  gamma_inverse: 100.0\n  expansion_method: matsubara\n  n_extra_poles: 1\n"
       << "  L_cutoff: 1\n"
       << "filter:\n"
-      << "  enabled: true\n  tolerance: 1.0e-7\n  start_step: 10\n  warmup_factor: 0.001\n"
+      << "  enabled: true\n  tolerance: 1.0e-7\n"
       << "dynamics:\n"
       << "  integrator: rk4\n"
       << "  dt: 2.0\n  n_steps: 100\n"
@@ -635,7 +604,7 @@ static std::string write_temp_yaml(const std::string& basis, bool sink_enabled,
       << "    target_site: " << target_site << "\n"
       << "    rate: " << sink_rate << "\n"
       << "  initial_state:\n    type: \"site_excitation\"\n    excited_site: " << excited_site << "\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -661,20 +630,19 @@ static Config load_dyn(const std::string& path) {
 // Minimal valid dynamics yaml whose bath-correlation lines are injected raw, so
 // negative tests can drop/mangle expansion_method and n_extra_poles at will.
 static std::string write_corr_yaml(const std::string& corr_block) {
-    std::string path = "/tmp/test_heom_corr.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_corr.yaml";
     std::ofstream f(path);
     f << "system:\n  n_states: 2\n  basis: \"excited_only\"\n  temperature: 77.0\n"
       << "  hamiltonian:\n    - [12100, -50]\n    - [-50, 12300]\n  w0: 12000.0\n"
       << "bath:\n  spectral_density: \"Drude-Lorentz\"\n  eta: 35.0\n  gamma_inverse: 100.0\n"
       << corr_block         // injects expansion_method / n_extra_poles (bath fields)
       << "  L_cutoff: 1\n"
-      << "filter:\n  enabled: true\n  tolerance: 1.0e-7\n  start_step: 10\n"
-      << "  warmup_factor: 0.001\n"
+      << "filter:\n  enabled: true\n  tolerance: 1.0e-7\n"
       << "dynamics:\n  integrator: rk4\n  dt: 2.0\n  n_steps: 100\n  output_interval: 10\n"
       << "  print_interval: 100\n"
       << "  sink:\n    enabled: false\n    target_site: 1\n    rate: 0.001\n"
       << "  initial_state:\n    type: \"site_excitation\"\n    excited_site: 1\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -682,7 +650,7 @@ static std::string write_corr_yaml(const std::string& corr_block) {
 // Minimal with_ground absorption yaml (mirrors config/abs_dimer.yaml), filename
 // auto so resolve_absorption_config exercises the method suffix.
 static std::string write_abs_yaml(const std::string& method) {
-    std::string path = "/tmp/test_heom_abs.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_abs.yaml";
     std::ofstream f(path);
     f << "system:\n  n_states: 2\n  basis: with_ground\n  temperature: 77.0\n"
       << "  hamiltonian:\n    - [12100.0, -50.0]\n    - [-50.0, 12300.0]\n  w0: 12000.0\n"
@@ -693,7 +661,7 @@ static std::string write_abs_yaml(const std::string& method) {
       << "filter:\n  enabled: true\n  tolerance: 1.0e-7\n"
       << "absorption:\n  integrator: rk4\n  dt: 1.0\n  n_steps: 200\n  output_interval: 1\n"
       << "  print_interval: 200\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    filename: \"auto\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    filename: \"auto\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -743,6 +711,41 @@ static void test_n_matsubara_field_rejected() {
     PASS();
 }
 
+// Every required scalar goes through one helper, so a missing key and a
+// wrong-typed value both name the yaml path — not yaml-cpp's "bad conversion".
+static void test_required_key_errors_name_the_path() {
+    TEST("required key: missing / wrong type both name the yaml path");
+    auto message_of = [](const std::string& yaml_path) {
+        try { Config::load_yaml(yaml_path); }
+        catch (const std::exception& e) { return std::string(e.what()); }
+        return std::string("<no throw>");
+    };
+    // bath.eta absent (write_corr_yaml always writes it; overwrite the file by hand)
+    {
+        std::ofstream f(heom_test::tmp_dir() + "/test_heom_req.yaml");
+        f << "system:\n  n_states: 2\n  temperature: 77.0\n"
+          << "  hamiltonian:\n    - [12100, -50]\n    - [-50, 12300]\n"
+          << "bath:\n  expansion_method: pade\n  n_extra_poles: 1\n  L_cutoff: 1\n"
+          << "  gamma_inverse: 100.0\n"
+          << "filter:\n  enabled: false\n";
+    }
+    const std::string missing = message_of(heom_test::tmp_dir() + "/test_heom_req.yaml");
+    ASSERT_EQ(missing.find("bath.eta is required") != std::string::npos, true);
+    // bath.eta present but not a number
+    {
+        std::ofstream f(heom_test::tmp_dir() + "/test_heom_req.yaml");
+        f << "system:\n  n_states: 2\n  temperature: 77.0\n"
+          << "  hamiltonian:\n    - [12100, -50]\n    - [-50, 12300]\n"
+          << "bath:\n  expansion_method: pade\n  n_extra_poles: 1\n  L_cutoff: 1\n"
+          << "  eta: warm\n  gamma_inverse: 100.0\n"
+          << "filter:\n  enabled: false\n";
+    }
+    const std::string typed = message_of(heom_test::tmp_dir() + "/test_heom_req.yaml");
+    ASSERT_EQ(typed.find("bath.eta: cannot read 'warm' as a number") != std::string::npos, true);
+    ASSERT_EQ(typed.find("bad conversion") == std::string::npos, true);
+    PASS();
+}
+
 // Range [0,50] enforced in parse_bath, BEFORE compute_bath_correlation — so an
 // out-of-range count never reaches the Padé matrix builder.
 static void test_n_extra_poles_range_checked() {
@@ -764,7 +767,7 @@ static void test_n_extra_poles_range_checked() {
 // Minimal dynamics config whose dynamics-block `integrator` line is injectable
 // (pass "" to omit the key entirely).
 static std::string write_integrator_dyn_yaml(const std::string& integ_line) {
-    std::string path = "/tmp/test_heom_integrator.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_integrator.yaml";
     std::ofstream f(path);
     f << "system:\n  n_states: 2\n  basis: \"excited_only\"\n  temperature: 77.0\n"
       << "  hamiltonian:\n    - [12100, -50]\n    - [-50, 12300]\n  w0: 12000.0\n"
@@ -775,7 +778,7 @@ static std::string write_integrator_dyn_yaml(const std::string& integ_line) {
       << integ_line                        // e.g. "  integrator: rk4\n" or ""
       << "  dt: 2.0\n  n_steps: 100\n  output_interval: 10\n  print_interval: 100\n"
       << "  initial_state:\n    type: \"site_excitation\"\n    excited_site: 1\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -960,7 +963,7 @@ static void test_excited_site_out_of_range_high() {
 }
 
 static std::string write_temp_exciton_yaml(const std::string& basis, int exciton_index) {
-    std::string path = "/tmp/test_heom_exciton_config.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_exciton_config.yaml";
     std::ofstream f(path);
     f << "system:\n"
       << "  n_states: 2\n"
@@ -975,7 +978,7 @@ static std::string write_temp_exciton_yaml(const std::string& basis, int exciton
       << "  eta: 70.0\n  gamma_inverse: 100.0\n  expansion_method: matsubara\n  n_extra_poles: 1\n"
       << "  L_cutoff: 1\n"
       << "filter:\n"
-      << "  enabled: true\n  tolerance: 1.0e-7\n  start_step: 10\n  warmup_factor: 0.001\n"
+      << "  enabled: true\n  tolerance: 1.0e-7\n"
       << "dynamics:\n"
       << "  integrator: rk4\n"
       << "  dt: 2.0\n  n_steps: 100\n"
@@ -984,7 +987,7 @@ static std::string write_temp_exciton_yaml(const std::string& basis, int exciton
       << "  initial_state:\n"
       << "    type: \"exciton_excitation\"\n"
       << "    exciton_index: " << exciton_index << "\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -994,8 +997,7 @@ static void test_exciton_index_excited_only_maps_to_zero_based() {
     auto cfg = load_dyn(write_temp_exciton_yaml("excited_only", 1));
     ASSERT_EQ(cfg.initial.has_value(), true);
     ASSERT_EQ(cfg.initial->exciton_index, 0);
-    ASSERT_EQ(single_exciton_user_index_1based(cfg.initial->exciton_index,
-                                               cfg.physics.basis), 1);
+    ASSERT_EQ(hilbert_to_pigment(cfg.initial->exciton_index, cfg.physics.basis), 1);
     PASS();
 }
 
@@ -1004,8 +1006,7 @@ static void test_exciton_index_with_ground_skips_ground() {
     auto cfg = load_dyn(write_temp_exciton_yaml("with_ground", 1));
     ASSERT_EQ(cfg.initial.has_value(), true);
     ASSERT_EQ(cfg.initial->exciton_index, 1);
-    ASSERT_EQ(single_exciton_user_index_1based(cfg.initial->exciton_index,
-                                               cfg.physics.basis), 1);
+    ASSERT_EQ(hilbert_to_pigment(cfg.initial->exciton_index, cfg.physics.basis), 1);
     PASS();
 }
 
@@ -1035,7 +1036,7 @@ static void test_exciton_index_double_excited_throws() {
 }
 
 static std::string write_temp_custom_matrix_yaml(const std::string& matrix_lines) {
-    std::string path = "/tmp/test_heom_custom_matrix_config.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_custom_matrix_config.yaml";
     std::ofstream f(path);
     f << "system:\n"
       << "  n_states: 2\n"
@@ -1050,7 +1051,7 @@ static std::string write_temp_custom_matrix_yaml(const std::string& matrix_lines
       << "  eta: 70.0\n  gamma_inverse: 100.0\n  expansion_method: matsubara\n  n_extra_poles: 1\n"
       << "  L_cutoff: 1\n"
       << "filter:\n"
-      << "  enabled: true\n  tolerance: 1.0e-7\n  start_step: 10\n  warmup_factor: 0.001\n"
+      << "  enabled: true\n  tolerance: 1.0e-7\n"
       << "dynamics:\n"
       << "  integrator: rk4\n"
       << "  dt: 2.0\n  n_steps: 100\n"
@@ -1060,7 +1061,7 @@ static std::string write_temp_custom_matrix_yaml(const std::string& matrix_lines
       << "    type: \"custom_matrix\"\n"
       << "    matrix_elements:\n"
       << matrix_lines
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -1120,7 +1121,7 @@ static void test_print_interval_negative_throws() {
 // injects the raw ulist line into the filter block so each case can exercise
 // the parser.
 static std::string write_temp_ulist_yaml(const std::string& ulist_line) {
-    std::string path = "/tmp/test_heom_ulist_config.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_ulist_config.yaml";
     std::ofstream f(path);
     f << "system:\n"
       << "  n_states: 3\n"
@@ -1136,13 +1137,13 @@ static std::string write_temp_ulist_yaml(const std::string& ulist_line) {
       << "  eta: 70.0\n  gamma_inverse: 100.0\n  expansion_method: matsubara\n  n_extra_poles: 1\n"
       << "  L_cutoff: 1\n"
       << "filter:\n"
-      << "  enabled: true\n  tolerance: 1.0e-7\n  start_step: 10\n  warmup_factor: 0.001\n"
+      << "  enabled: true\n  tolerance: 1.0e-7\n"
       << ulist_line
       << "dynamics:\n"
       << "  integrator: rk4\n"
       << "  dt: 2.0\n  n_steps: 100\n  output_interval: 10\n  print_interval: 100\n"
       << "  initial_state:\n    type: \"site_excitation\"\n    excited_site: 1\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -1182,8 +1183,8 @@ static void test_disorder_off_uses_legacy_path() {
     p.n_states = 3;
     p.n_sites = 3;
     p.basis = BasisType::EXCITED_ONLY;
-    p.n_bath_modes_total = 1;
     p.n_extra_poles = 1;
+    uniform_modes(p, 1);
 
     HierarchyTruncation ht(p, /*L_cutoff=*/2);
     auto indices = ht.generate_hierarchy_indices();
@@ -1209,7 +1210,7 @@ namespace {
 std::string write_temp_disorder_yaml(bool emit_fwhm,
                                      const std::string& L_cutoff_line)
 {
-    std::string path = "/tmp/test_heom_disorder_config.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_disorder_config.yaml";
     std::ofstream f(path);
     f << "system:\n"
       << "  n_states: 2\n"
@@ -1226,10 +1227,10 @@ std::string write_temp_disorder_yaml(bool emit_fwhm,
         f << "  static_disorder_fwhm: 0\n";
     f << L_cutoff_line   // bath.L_cutoff — may be empty (missing-key test)
       << "filter:\n"
-      << "  enabled: true\n  tolerance: 1.0e-7\n  start_step: 10\n  warmup_factor: 0.001\n"
+      << "  enabled: true\n  tolerance: 1.0e-7\n"
       << "dynamics:\n  integrator: rk4\n  dt: 2.0\n  n_steps: 100\n  output_interval: 10\n  print_interval: 100\n"
       << "  initial_state:\n    type: \"site_excitation\"\n    excited_site: 1\n"
-      << "  output:\n    save_path: \"/tmp/\"\n    use_timestamp: false\n";
+      << "  output:\n    save_path: \"" << heom_test::tmp_dir() << "/\"\n    use_timestamp: false\n";
     f.close();
     return path;
 }
@@ -1267,12 +1268,15 @@ static void test_yaml_L_cutoff_int8_limit_throws() {
 // Build a Config with explicit knobs so we can vary M, basis, K, filtering
 // independently. n_states=7 matches FMO-7; tests exercise all three bases.
 static HEOMConfig::Config make_budget_config(const std::string& basis,
-                                             int n_bath_modes_total,
+                                             int K,
                                              int L_cutoff,
                                              double filter_tolerance) {
     auto path = write_temp_yaml(basis, /*sink_enabled=*/false, /*target_site=*/3);
     auto cfg = Config::load_yaml(path);
-    cfg.physics.n_bath_modes_total = n_bath_modes_total;
+    // Override the layout only: the budget and the hierarchy read D / mode_off,
+    // not the (already computed) coefficient tables.
+    cfg.physics.n_extra_poles = K;
+    uniform_modes(cfg.physics, K);
     cfg.L_cutoff                   = L_cutoff;
     // filtering on/off is now the explicit switch; tolerance==0 means "off" in
     // this test helper's contract (budget buckets keyed on filter.enabled).
@@ -1286,10 +1290,52 @@ static void test_budget_bucket_consistency() {
     auto cfg = make_budget_config("excited_only", 1, 1, 1e-7);
     auto b = heom::estimate_budget(cfg, /*M=*/100);
     size_t sum = b.rho_tensor + b.rk4_workspace + b.hierarchy_maps
-               + b.filter_buffers + b.auxiliary;
+               + b.filter_buffers + b.auxiliary + b.optional + b.driver;
     ASSERT_EQ(b.gpu_total, sum);
     sum = b.host_hierarchy + b.host_neighbor_maps + b.host_density_buffer;
     ASSERT_EQ(b.host_total, sum);
+    PASS();
+}
+
+// The two O(M) trajectory extras outside the alloc plan are counted when,
+// and only when, their path is configured. The U-closure builder exists
+// whenever the filter is on (its flags gate the full launch), ulist or not.
+static void test_budget_optional_extras() {
+    TEST("budget: IF-RK4 tables and U-closure arrays land in `optional`");
+    const size_t M = 100;
+    const size_t closure = M * (sizeof(uint8_t) + 2 * sizeof(int));
+    auto cfg = make_budget_config("excited_only", 1, 1, 1e-7);   // filter on, ulist 0
+    cfg.time.integrator = Integrator::Rk4;
+    cfg.filter.ulist_tau = 0.0;
+    ASSERT_EQ(heom::estimate_budget(cfg, M).optional, closure);
+
+    cfg.time.integrator = Integrator::IfRk4;
+    ASSERT_EQ(heom::estimate_budget(cfg, M).optional,
+              2 * M * sizeof(heom::complex_t) + closure);
+
+    cfg.filter.ulist_tau = 0.9;
+    ASSERT_EQ(heom::estimate_budget(cfg, M).optional,
+              2 * M * sizeof(heom::complex_t) + closure);
+
+    cfg.filter.enabled = false;   // no filter ⇒ no closure; tables stay
+    ASSERT_EQ(heom::estimate_budget(cfg, M).optional, 2 * M * sizeof(heom::complex_t));
+    PASS();
+}
+
+// A check made after SystemContext uploaded must not count its read-only
+// tables again — cudaMemGetInfo already took them out of "free".
+static void test_budget_resident_system_tables() {
+    TEST("budget: Resident::SystemTables drops maps + auxiliary from the total");
+    auto cfg = make_budget_config("excited_only", 1, 1, 1e-7);
+    const auto full = heom::estimate_budget(cfg, 100, 3);
+    const auto rest = heom::estimate_budget(cfg, 100, 3, heom::Resident::SystemTables);
+    ASSERT_EQ(rest.hierarchy_maps, size_t{0});
+    ASSERT_EQ(rest.auxiliary, size_t{0});
+    ASSERT_EQ(rest.resident, full.hierarchy_maps + full.auxiliary);
+    ASSERT_EQ(rest.gpu_total + rest.resident, full.gpu_total);
+    ASSERT_EQ(rest.rho_tensor, full.rho_tensor);
+    ASSERT_EQ(rest.filter_buffers, full.filter_buffers);
+    ASSERT_EQ(full.resident, size_t{0});
     PASS();
 }
 
@@ -1478,10 +1524,29 @@ static void test_plan_total_matches_budget() {
     auto cfg = make_budget_config("excited_only", 1, 1, 1e-7);
     auto b = heom::estimate_budget(cfg, /*M=*/100);
     auto plan = heom::plan_gpu_buffers(
-        100, b.N, b.K, b.n_bath, b.L, b.use_filtering);
+        100, b.N, b.D, b.n_bath, b.L, b.use_filtering, /*batch=*/1,
+        static_cast<size_t>(b.rho_elems));
     size_t sum = 0;
     for (const auto& s : plan) sum += s.bytes();
-    ASSERT_EQ(sum, b.gpu_total);
+    // `optional` is the only bucket outside the plan here (the U-closure
+    // arrays: filter on); see test_budget_optional_extras.
+    ASSERT_EQ(sum + b.optional, b.gpu_total);
+    PASS();
+}
+
+// rho_capacity is the one source of "elements per ADO" for both the budget
+// and the trajectory. A config straight out of load_yaml() is Task::Dynamics
+// and stores the full matrix; estimate_budget echoes the same number.
+static void test_rho_capacity_dynamics_is_full_matrix() {
+    TEST("rho_capacity: dynamics (and the load_yaml default) store N^2");
+    auto cfg = make_budget_config("excited_only", 1, 1, 1e-7);
+    const int N = cfg.physics.n_sites;
+    ASSERT_EQ(static_cast<int>(cfg.task),
+              static_cast<int>(HEOMConfig::Config::Task::Dynamics));
+    ASSERT_EQ(heom::rho_capacity(cfg), N * N);
+    auto b = heom::estimate_budget(cfg, /*M=*/100);
+    ASSERT_EQ(b.rho_elems, N * N);
+    ASSERT_EQ(b.rho_tensor, static_cast<size_t>(100) * N * N * sizeof(heom::complex_t));
     PASS();
 }
 
@@ -1489,8 +1554,8 @@ static void test_plan_total_matches_budget() {
 static void test_plan_filter_off_buffer_count() {
     TEST("plan: filter off → no FilterBuf entries");
     auto plan = heom::plan_gpu_buffers(
-        /*M=*/100, /*N=*/7, /*K=*/1, /*n_bath=*/7, /*L=*/1,
-        /*use_filtering=*/false);
+        /*M=*/100, /*N=*/7, /*D=*/14, /*n_bath=*/7, /*L=*/1,
+        /*use_filtering=*/false, /*batch=*/1, /*rho_elems=*/49);
     int filter_count = 0;
     for (const auto& s : plan) {
         if (s.bucket == heom::GPUBufferSpec::Bucket::FilterBuf) ++filter_count;
@@ -1504,8 +1569,8 @@ static void test_plan_filter_off_buffer_count() {
 static void test_plan_filter_on_buffer_count() {
     TEST("plan: filter on → 3 FilterBuf entries");
     auto plan = heom::plan_gpu_buffers(
-        /*M=*/100, /*N=*/7, /*K=*/1, /*n_bath=*/7, /*L=*/1,
-        /*use_filtering=*/true);
+        /*M=*/100, /*N=*/7, /*D=*/14, /*n_bath=*/7, /*L=*/1,
+        /*use_filtering=*/true, /*batch=*/1, /*rho_elems=*/49);
     int filter_count = 0;
     for (const auto& s : plan) {
         if (s.bucket == heom::GPUBufferSpec::Bucket::FilterBuf) ++filter_count;
@@ -1519,14 +1584,14 @@ static void test_plan_filter_on_buffer_count() {
 static void test_plan_canonical_names_present() {
     TEST("plan: canonical buffer names all present");
     auto plan = heom::plan_gpu_buffers(
-        /*M=*/100, /*N=*/7, /*K=*/1, /*n_bath=*/7, /*L=*/1,
-        /*use_filtering=*/true);
+        /*M=*/100, /*N=*/7, /*D=*/14, /*n_bath=*/7, /*L=*/1,
+        /*use_filtering=*/true, /*batch=*/1, /*rho_elems=*/49);
     const std::vector<std::string> required = {
-        "d_rho", "d_workspace",
-        "d_hamiltonian", "d_c_bath", "d_markov_residue",
+        "d_rho", "d_workspace", "d_dist_partials",
+        "d_hamiltonian", "d_c_bath", "d_cbar_bath", "d_markov_residue",
         "d_plus_map", "d_minus_map", "d_level_indices",
         "d_coeff_plus", "d_coeff_minus",
-        "d_total_decay", "d_d_coupling",
+        "d_total_decay", "d_d_coupling", "d_mode_off",
         "d_ado_norms", "d_active_flags", "d_level_counts"
     };
     for (const auto& name : required) {
@@ -1542,19 +1607,198 @@ static void test_plan_canonical_names_present() {
     PASS();
 }
 
+// A timestamped (solver-chosen) name never replaces another run's file; a
+// fixed name is the user's explicit target and is replaced.
+static void test_create_output_file_policy() {
+    TEST("output: timestamped name is exclusive, fixed name overwrites");
+    const std::string path = heom_test::tmp_dir() + "/create_output_file.h5";
+    std::remove(path.c_str());
+    ASSERT_NOTHROW(H5Fclose(heom::hdf5::create_output_file(path, /*use_timestamp=*/true)));
+    ASSERT_THROWS(heom::hdf5::create_output_file(path, true));
+    ASSERT_NOTHROW(H5Fclose(heom::hdf5::create_output_file(path, /*use_timestamp=*/false)));
+    PASS();
+}
+
 static void test_derivative_total_elements_overflow_throws() {
-    TEST("cuda launch: M*N*N overflow is rejected before kernel launch");
-    ASSERT_THROWS(heom::checked_total_elements(/*M=*/300000000, /*N=*/100));
-    ASSERT_NOTHROW(heom::checked_total_elements(/*M=*/1000, /*N=*/8));
+    TEST("cuda launch: M*Nb overflow is rejected before kernel launch");
+    ASSERT_THROWS(heom::checked_rho_elements(/*M=*/300000000, /*Nb=*/100 * 100));
+    ASSERT_NOTHROW(heom::checked_rho_elements(/*M=*/1000, /*Nb=*/8 * 8));
+    ASSERT_THROWS(heom::checked_rho_elements(/*M=*/1, /*Nb=*/0));
+    // The last HEOM_BLOCK_SIZE − 1 values below INT_MAX would overflow the
+    // rounded-up grid and the last block's thread index.
+    constexpr int kMax = std::numeric_limits<int>::max();
+    ASSERT_NOTHROW(heom::checked_rho_elements(1, kMax - (HEOM_BLOCK_SIZE - 1)));
+    ASSERT_THROWS(heom::checked_rho_elements(1, kMax - (HEOM_BLOCK_SIZE - 2)));
+    ASSERT_THROWS(heom::checked_rho_elements(1, kMax));
+    PASS();
+}
+
+static void test_mode_layout_is_a_bijection() {
+    TEST("mode layout (ragged off={0,2,6,8}): idx enumerates [0, M*D) once, site_of/pole_of invert slot");
+    // Three baths with P = {2, 4, 2} slots: a Drude+1 pole, a Drude+1 pole
+    // +one vibrational pair, a Drude+1 pole. Nothing uniform about it.
+    const int off[] = {0, 2, 6, 8};
+    const heom::ModeLayout ml{3, 8, off};
+    const int M = 3;
+    ASSERT_EQ(ml.channels(), 8);
+    ASSERT_EQ(ml.count(0), 2); ASSERT_EQ(ml.count(1), 4); ASSERT_EQ(ml.count(2), 2);
+    std::vector<int> seen(static_cast<size_t>(M) * ml.channels(), 0);
+    for (int a = 0; a < M; ++a)
+        for (int n = 0; n < ml.n_bath; ++n)
+            for (int k = 0; k < ml.count(n); ++k) {
+                const int s = ml.slot(n, k);
+                ASSERT_EQ(ml.site_of(s), n);
+                ASSERT_EQ(ml.pole_of(s), k);
+                ASSERT_EQ(ml.idx(a, n, k), a * ml.channels() + s);
+                ++seen[static_cast<size_t>(ml.idx(a, n, k))];
+            }
+    for (int v : seen) ASSERT_EQ(v, 1);        // no hole, no collision: 0..23 once
+    ASSERT_EQ(ml.slot(1, 2), 4);
+    ASSERT_EQ(ml.site_of(7), 2); ASSERT_EQ(ml.pole_of(7), 1);
+    // PhysicalParameters owns the table and exposes the same view.
+    PhysicalParameters p{};
+    p.n_states = 3;
+    p.set_mode_counts({2, 4, 2});
+    ASSERT_EQ((int)p.mode_off.size(), 4);
+    for (int n = 0; n < 4; ++n) ASSERT_EQ(p.mode_off[n], off[n]);
+    ASSERT_EQ(p.n_ladders(), 8);
+    ASSERT_EQ(p.mode_idx(2, 1), ml.slot(2, 1));
+    ASSERT_EQ(p.mode_layout().channels(), ml.channels());
+    PASS();
+}
+
+// Ragged layout through the hierarchy: D = 8 = Σ P_n with P = {2,4,2}, L=3
+// ⇒ M = C(8+3, 3) = 165 (only D enters M, not how it is split).
+// Every ± neighbor must be the exact inverse of the other: walk +1 on slot s
+// from α, then −1 on the same slot, and land back on α.
+static void test_hierarchy_ragged_layout_roundtrip() {
+    TEST("hierarchy ragged P={2,4,2}, L=3: M=165, plus/minus maps invert each other");
+    PhysicalParameters p{};
+    p.n_states = 3; p.n_sites = 3; p.basis = BasisType::EXCITED_ONLY;
+    p.set_mode_counts({2, 4, 2});
+    HierarchyTruncation ht(p, /*L_cutoff=*/3, /*log=*/nullptr);
+    auto indices = ht.generate_hierarchy_indices();
+    const int M = static_cast<int>(indices.size());
+    ASSERT_EQ(M, 165);
+    ASSERT_EQ(indices[0].get_size(), 8);
+    auto [plus_map, minus_map] = ht.build_neighbor_maps(indices);
+    ASSERT_EQ((int)plus_map.size(), M * 8);
+    const heom::ModeLayout ml = p.mode_layout();
+    int n_plus = 0;
+    for (int a = 0; a < M; ++a)
+        for (int n = 0; n < ml.n_bath; ++n)
+            for (int k = 0; k < ml.count(n); ++k) {
+                const int i = ml.idx(a, n, k);
+                const int up = plus_map[i];
+                if (up >= 0) {
+                    ++n_plus;
+                    ASSERT_EQ(minus_map[ml.idx(up, n, k)], a);
+                    ASSERT_EQ(indices[up][ml.slot(n, k)], indices[a][ml.slot(n, k)] + 1);
+                }
+                const int dn = minus_map[i];
+                if (dn >= 0) {
+                    ASSERT_EQ(plus_map[ml.idx(dn, n, k)], a);
+                }
+                // A slot with α_{nk} > 0 always has a −1 neighbor; Σα < L always a +1.
+                ASSERT_EQ(dn >= 0, indices[a][ml.slot(n, k)] > 0);
+                ASSERT_EQ(up >= 0, indices[a].sum() < 3);
+            }
+    // Every ADO at level < 3 has exactly D raise edges: Σ_{lev<3} count·8.
+    // C(8+2,2) = 45 ADOs below the top level ⇒ 360 raise edges.
+    ASSERT_EQ(n_plus, 45 * 8);
+    PASS();
+}
+
+static void test_manifold_layout_single_source() {
+    TEST("manifold layout: from() agrees with compute_hilbert_dim, DoubleExcitedIndex "
+         "and the hand-written bounds for every basis");
+    using heom::ManifoldLayout;
+    const int n = 4;
+    // Literal bounds for n_states=4, NOT derived through the API under test.
+    struct Want { BasisType b; std::array<int, 4> bound; };
+    const Want want[] = {
+        {BasisType::EXCITED_ONLY,   {0, 0, 4, 4}},    // e only
+        {BasisType::WITH_GROUND,    {0, 1, 5, 5}},    // g, e
+        {BasisType::DOUBLE_EXCITED, {0, 1, 5, 11}},   // g, e, f (6 pairs)
+    };
+    for (const Want& w : want) {
+        const int N = compute_hilbert_dim(n, w.b);
+        const auto lay = ManifoldLayout::from(w.b, n, N);
+        for (size_t i = 0; i < 4; ++i) ASSERT_EQ(lay.bound[i], w.bound[i]);
+        ASSERT_EQ(lay.N(), N);
+        ASSERT_THROWS(ManifoldLayout::from(w.b, n, N + 1));   // wrong N
+    }
+    // DoubleExcitedIndex is now a view of the layout; the numbers it used to
+    // hard-code must come out unchanged.
+    const DoubleExcitedIndex didx(n);
+    ASSERT_EQ(didx.ground_index(), 0);
+    ASSERT_EQ(didx.single_index(1), 1);
+    ASSERT_EQ(didx.single_index(4), 4);
+    ASSERT_EQ(didx.double_index(1, 2), 5);
+    ASSERT_EQ(didx.double_index(3, 4), 10);
+    ASSERT_EQ(didx.total_dim(), 11);
+    ASSERT_EQ(didx.n_double(), 6);
+    // Empty levels: EXCITED_ONLY has no g, WITH_GROUND has no f.
+    ASSERT_THROWS(ManifoldLayout::from(BasisType::EXCITED_ONLY, n, 4).block(0, 0));
+    ASSERT_THROWS(ManifoldLayout::from(BasisType::WITH_GROUND, n, 5).block(2, 1));
+    ASSERT_NOTHROW(ManifoldLayout::from(BasisType::EXCITED_ONLY, n, 4).block(1, 1));
+    // The ONE copy of the block rule.
+    ASSERT_NOTHROW(heom::ManifoldBlock::full(8).validate(8, "t"));
+    ASSERT_NOTHROW((heom::ManifoldBlock{4, 4, 1, 3}).validate(8, "t"));   // disjoint
+    ASSERT_THROWS((heom::ManifoldBlock{}).validate(8, "t"));              // empty
+    ASSERT_THROWS((heom::ManifoldBlock{0, 9, 0, 8}).validate(8, "t"));    // range
+    ASSERT_THROWS((heom::ManifoldBlock{0, 4, 2, 4}).validate(8, "t"));    // overlap
+    PASS();
+}
+
+static void test_derivative_map_elements_overflow_throws() {
+    TEST("cuda launch: M*D overflow is rejected independently of M*N*N");
+    // 9e6 ADOs x D=280 (14 pigments x 20 modes) = 2.5e9 > 2^31, while M*N*N
+    // with N=14 is only 1.8e9: the second ceiling can bite when the first does not.
+    ASSERT_THROWS(heom::checked_map_elements(/*M=*/9000000, /*D=*/280));
+    ASSERT_NOTHROW(heom::checked_rho_elements(/*M=*/9000000, /*Nb=*/14 * 14));
+    ASSERT_NOTHROW(heom::checked_map_elements(/*M=*/1000, /*D=*/21));
+    ASSERT_THROWS(heom::checked_map_elements(/*M=*/1, /*D=*/0));
     PASS();
 }
 
 static void test_derivative_shared_memory_limit_throws() {
     TEST("cuda launch: derivative shared memory over device limit is rejected");
-    ASSERT_THROWS(heom::checked_derivative_smem_bytes(
-        /*N=*/106, /*n_bath=*/14, /*max_smem_bytes=*/49152));
+    // sH stages the REAL part of H only: N²·sizeof(real_t) + n_bath·N.
+    const size_t lhcii_need = heom::derivative_smem_bytes(/*N=*/106, /*n_bath=*/14);
+    ASSERT_EQ(lhcii_need, 106u * 106u * sizeof(heom::real_t) + 14u * 106u);
     ASSERT_NOTHROW(heom::checked_derivative_smem_bytes(
         /*N=*/8, /*n_bath=*/7, /*max_smem_bytes=*/49152));
+    // N=200 (160 KB even in FP32) beats every consumer opt-in ceiling.
+    ASSERT_THROWS(heom::checked_derivative_smem_bytes(
+        /*N=*/200, /*n_bath=*/14, /*max_smem_bytes=*/101376));
+    // LHC-II ESA N=106: 46428 B mixed (under the 48 KiB default) / 91372 B
+    // FP64 (needs the opt-in path; fits the 99 KiB consumer ceiling). The
+    // launcher must gate on Optin and cudaFuncSetAttribute above the default.
+    ASSERT_NOTHROW(heom::checked_derivative_smem_bytes(
+        /*N=*/106, /*n_bath=*/14, lhcii_need));
+    ASSERT_NOTHROW(heom::checked_derivative_smem_bytes(
+        /*N=*/106, /*n_bath=*/14, /*max_smem_bytes=*/101376));
+    // lhc2-smem: per-block staging. Whole matrix = diagonal block = the
+    // historical N² footprint. LHC-II ESA f×e (91×14, row_off 15, col_off 1):
+    // a 256-thread block touches at most (13+255)/14+1 = 20 rows i, so
+    // (20·91 + 14²)·real_t + 14·(20 + 14) int8 (d_coupling columns).
+    ASSERT_EQ(heom::derivative_smem_bytes(heom::ManifoldBlock::full(106), 106, 14),
+              lhcii_need);
+    ASSERT_EQ(heom::derivative_smem_rows(91, 14, 256), 20);
+    ASSERT_EQ(heom::derivative_smem_rows(21, 7, 256), 21);   // FMO ESA: all rows
+    ASSERT_EQ(heom::derivative_smem_bytes(heom::ManifoldBlock{15, 91, 1, 14}, 106, 14, 256),
+              (20u * 91u + 14u * 14u) * sizeof(heom::real_t) + 14u * (20u + 14u));
+    ASSERT_EQ(heom::derivative_smem_bytes(heom::ManifoldBlock{15, 91, 15, 91}, 106, 14, 256),
+              91u * 91u * sizeof(heom::real_t) + 14u * 91u);
+    ASSERT_NOTHROW(heom::checked_derivative_smem_bytes(
+        heom::ManifoldBlock{15, 91, 1, 14}, /*N=*/106, /*n_bath=*/14, /*max_smem_bytes=*/49152));
+    // Step 6: small systems (FMO ESA N=1+7+21=29, 7 baths) stage the whole
+    // H + d_coupling for every block; LHC-II (N=106) does not.
+    ASSERT_TRUE(heom::derivative_stage_whole(29, 7));
+    ASSERT_TRUE(!heom::derivative_stage_whole(106, 14));
+    ASSERT_EQ(heom::derivative_smem_bytes(heom::ManifoldBlock{8, 21, 1, 7}, 29, 7, 256),
+              heom::derivative_smem_bytes(29, 7));
     PASS();
 }
 
@@ -1565,6 +1809,7 @@ static void test_derivative_context_requires_total_decay() {
     ctx.drho_out = reinterpret_cast<cuDoubleComplex*>(0x1);
     ctx.hamiltonian = reinterpret_cast<const cuDoubleComplex*>(0x1);
     ctx.c_bath = reinterpret_cast<const cuDoubleComplex*>(0x1);
+    ctx.cbar_bath = reinterpret_cast<const cuDoubleComplex*>(0x1);
     ctx.coeff_plus = reinterpret_cast<const double*>(0x1);
     ctx.coeff_minus = reinterpret_cast<const double*>(0x1);
     ctx.neighbor_map_plus = reinterpret_cast<const int*>(0x1);
@@ -1572,12 +1817,13 @@ static void test_derivative_context_requires_total_decay() {
     ctx.level_indices = reinterpret_cast<const int8_t*>(0x1);
     ctx.total_decay = nullptr;
     ctx.d_coupling = reinterpret_cast<const int8_t*>(0x1);
+    ctx.mode_off = reinterpret_cast<const int*>(0x1);
     ctx.M = 1;
     ctx.N = 1;
-    ctx.K = 0;
+    ctx.D = 1;
     ctx.n_bath = 1;
-    ctx.row_off = 0; ctx.n_row = 1;   // valid block, so the throw below can
-    ctx.col_off = 0; ctx.n_col = 1;   // only be about total_decay
+    ctx.block = heom::ManifoldBlock::full(1);   // valid block, so the throw
+                                                // below can only be total_decay
     ASSERT_THROWS(heom::validate_derivative_context(ctx));
     PASS();
 }
@@ -1594,19 +1840,21 @@ static void test_derivative_context_manifold_block_rules() {
     base.drho_out = reinterpret_cast<cuDoubleComplex*>(0x1);
     base.hamiltonian = reinterpret_cast<const cuDoubleComplex*>(0x1);
     base.c_bath = reinterpret_cast<const cuDoubleComplex*>(0x1);
+    base.cbar_bath = reinterpret_cast<const cuDoubleComplex*>(0x1);
     base.coeff_plus = reinterpret_cast<const heom::real_t*>(0x1);
     base.coeff_minus = reinterpret_cast<const heom::real_t*>(0x1);
     base.markov_residue = reinterpret_cast<const heom::real_t*>(0x1);
     base.neighbor_map_plus = reinterpret_cast<const int*>(0x1);
     base.neighbor_map_minus = reinterpret_cast<const int*>(0x1);
     base.level_indices = reinterpret_cast<const int8_t*>(0x1);
-    base.total_decay = reinterpret_cast<const double*>(0x1);
+    base.total_decay = reinterpret_cast<const cuDoubleComplex*>(0x1);
     base.d_coupling = reinterpret_cast<const int8_t*>(0x1);
-    base.M = 1; base.N = 8; base.K = 0; base.n_bath = 1;
+    base.mode_off = reinterpret_cast<const int*>(0x1);
+    base.M = 1; base.N = 8; base.D = 1; base.n_bath = 1;
 
     auto with_block = [&](int ro, int nr, int co, int nc) {
         HEOMContext c = base;
-        c.row_off = ro; c.n_row = nr; c.col_off = co; c.n_col = nc;
+        c.block = heom::ManifoldBlock{ro, nr, co, nc};
         return c;
     };
 
@@ -1745,18 +1993,13 @@ static void test_in_memory_config_construction() {
     cfg.physics.temperature      = cfg.physics.temperature_K * BOLTZMANN;
     set_homog_bath(cfg.physics, 35.0 * CM_TO_AU, 1.0 / (100.0 * FS_TO_AU));
 
-    cfg.physics.n_bath_modes_total       = 0;
     cfg.physics.n_extra_poles = 0;
     compute_matsubara_drude(cfg.physics);
 
-    // Guard the dual-field invariant. Without static
-    // disorder, compute_matsubara_drude() must not bump n_extra_poles
-    // (that's the user-input snapshot); n_bath_modes_total is the runtime array
-    // length. A future commit that re-merges the two fields, or makes
-    // compute_matsubara_drude mutate n_extra_poles as a side effect, will
-    // immediately fail one of these two assertions.
+    // compute_matsubara_drude() must not bump n_extra_poles (that's the
+    // user-input snapshot); the layout it pins is one Drude slot per bath.
     ASSERT_EQ(cfg.physics.n_extra_poles, 0);
-    ASSERT_EQ(cfg.physics.n_bath_modes_total, cfg.physics.n_extra_poles);
+    ASSERT_EQ(cfg.physics.n_ladders(), cfg.physics.n_states);
 
     cfg.L_cutoff         = 1;
     cfg.filter.enabled   = false;   // filtering OFF: knobs left at defaults
@@ -1806,7 +2049,7 @@ static void test_load_yaml_preserves_source_snapshot() {
 
 // Write an arbitrary yaml string to a temp file and return the path.
 static std::string write_raw_yaml(const std::string& text,
-                                  const std::string& path = "/tmp/test_heom_physhash.yaml") {
+                                  const std::string& path = heom_test::tmp_dir() + "/test_heom_physhash.yaml") {
     std::ofstream f(path);
     f << text;
     f.close();
@@ -1838,8 +2081,6 @@ static const char* kPhysicsHashVectorYaml =
     "filter:\n"
     "  enabled: true\n"
     "  tolerance: 1.0e-7\n"
-    "  start_step: 10\n"
-    "  warmup_factor: 0.001\n"
     "absorption:\n"
     "  integrator: rk4\n"
     "  dt: 1.0\n"
@@ -1850,47 +2091,280 @@ static const char* kPhysicsHashVectorYaml =
     "    save_path: \"/tmp/\"\n"
     "    filename: \"auto\"\n"
     "    use_timestamp: false\n"
+    "fluorescence:\n"
+    "  integrator: rk4\n"
+    "  dt: 1.0\n"
+    "  n_steps: 200\n"
+    "  output_interval: 1\n"
+    "  batch: true\n"
+    "  output:\n"
+    "    save_path: \"/tmp/\"\n"
+    "  equilibration:\n"
+    "    t_max: 5000.0\n"
+    "    check_interval: 50.0\n"
+    "    tolerance: 1.0e-6\n"
     "static_disorder:\n"
     "  draws_file: \"nodes.h5\"\n";
 
 // Cross-language golden: the SAME string in the Python golden must hash to this.
-// Recomputed for the task-scoped schema (see tools test_config_hash.py::_GOLDEN).
-static const char* kPhysicsHashVectorExpected = "7e9a4ebcf3c349b7";
+// Task-scoped (absorption) value = what the solver writes into an absorption
+// file; core value = load_yaml before any resolve_<task>_config (system+bath+
+// filter only). See heom-tools/tests/common/test_config_hash.py::_GOLDEN / _GOLDEN_CORE.
+static const char* kPhysicsHashVectorExpected     = "bef65eb0a9c0f82b";
+static const char* kPhysicsHashVectorExpectedCore = "93fab135bac4ec03";
+// Fluorescence scope (the vector with filter off): pins the nested
+// `equilibration` map's canonical form.
+static const char* kPhysicsHashVectorExpectedFl   = "b36d1b90e6bca5c1";
+
+// load_yaml + resolve_absorption_config: the hash the absorption task ships.
+static std::string absorption_hash(const std::string& yaml, const std::string& path) {
+    auto cfg = Config::load_yaml(write_raw_yaml(yaml, path));
+    HEOMConfig::resolve_absorption_config(cfg);
+    return cfg.config_hash;
+}
 
 static void test_config_hash_physics_golden() {
     TEST("config_hash: physics golden vector (cross-language pin)");
     auto cfg = Config::load_yaml(write_raw_yaml(kPhysicsHashVectorYaml));
+    ASSERT_EQ(cfg.config_hash, std::string(kPhysicsHashVectorExpectedCore));
+    HEOMConfig::resolve_absorption_config(cfg);
     ASSERT_EQ(cfg.config_hash, std::string(kPhysicsHashVectorExpected));
+    ASSERT_NE(cfg.config_hash, std::string(kPhysicsHashVectorExpectedCore));
+    // Fluorescence rejects the ADO filter: the same vector with it switched off.
+    std::string fl_yaml = kPhysicsHashVectorYaml;
+    const std::string on = "  enabled: true\n  tolerance: 1.0e-7\n";
+    fl_yaml.replace(fl_yaml.find(on), on.size(), "  enabled: false\n");
+    auto fl = Config::load_yaml(write_raw_yaml(fl_yaml));
+    HEOMConfig::resolve_fluorescence_config(fl);
+    ASSERT_EQ(fl.config_hash, std::string(kPhysicsHashVectorExpectedFl));
     PASS();
 }
 
 static void test_config_hash_ignores_comments_and_format() {
-    TEST("config_hash: stable across comments / whitespace / key order / output+static_disorder");
+    TEST("config_hash: stable across comments / whitespace / key order / output+static_disorder / print+batch knobs");
     const std::string base = kPhysicsHashVectorYaml;
-    const std::string ref = Config::load_yaml(
-        write_raw_yaml(base, "/tmp/test_ph_ref.yaml")).config_hash;
+    const std::string ref = absorption_hash(base, heom_test::tmp_dir() + "/test_ph_ref.yaml");
+
+    auto replaced = [&](const std::string& from, const std::string& to) {
+        std::string s = base;
+        auto pos = s.find(from);
+        if (pos == std::string::npos) throw std::logic_error("test string missing: " + from);
+        s.replace(pos, from.size(), to);
+        return s;
+    };
 
     // (1) A pure comment edit + blank line: config_hash must NOT change (this is
     // exactly the incremental-merge trap that motivated the physics hash).
     const std::string commented =
         "# a leading comment\n" + base + "\n# trailing note about r-range\n";
-    ASSERT_EQ(Config::load_yaml(
-        write_raw_yaml(commented, "/tmp/test_ph_cmt.yaml")).config_hash, ref);
+    ASSERT_EQ(absorption_hash(commented, heom_test::tmp_dir() + "/test_ph_cmt.yaml"), ref);
 
     // (2) Editing the non-physical output block must NOT change it.
-    std::string out_edited = base;
-    auto pos = out_edited.find("/tmp/");
-    out_edited.replace(pos, 5, "/other/dir/");
-    ASSERT_EQ(Config::load_yaml(
-        write_raw_yaml(out_edited, "/tmp/test_ph_out.yaml")).config_hash, ref);
+    ASSERT_EQ(absorption_hash(replaced("/tmp/", "/other/dir/"),
+                              heom_test::tmp_dir() + "/test_ph_out.yaml"), ref);
 
-    // (3) A real physical edit (temperature) MUST change it.
-    std::string phys_edited = base;
-    auto tp = phys_edited.find("temperature: 77.0");
-    phys_edited.replace(tp, std::string("temperature: 77.0").size(),
-                        "temperature: 100.0");
-    ASSERT_NE(Config::load_yaml(
-        write_raw_yaml(phys_edited, "/tmp/test_ph_phys.yaml")).config_hash, ref);
+    // (3) Print / batch knobs move bytes, not physics: must NOT change it.
+    ASSERT_EQ(absorption_hash(replaced("print_interval: 200", "print_interval: 7"),
+                              heom_test::tmp_dir() + "/test_ph_pi.yaml"), ref);
+    ASSERT_EQ(absorption_hash(replaced("integrator: rk4", "integrator: rk4\n  batch: true"),
+                              heom_test::tmp_dir() + "/test_ph_batch.yaml"), ref);
+    ASSERT_EQ(absorption_hash(replaced("tolerance: 1.0e-7",
+                                       "tolerance: 1.0e-7\n  log_per_slot: true"),
+                              heom_test::tmp_dir() + "/test_ph_lps.yaml"), ref);
+
+    // (4) Another task's block appearing or changing must NOT fork this task.
+    const std::string with_dyn = base + "dynamics:\n  dt: 0.5\n  n_steps: 10\n";
+    ASSERT_EQ(absorption_hash(with_dyn, heom_test::tmp_dir() + "/test_ph_dyn.yaml"), ref);
+
+    // (5) A real physical edit (temperature) MUST change it; so must this
+    // task's own time grid and the filter tolerance.
+    ASSERT_NE(absorption_hash(replaced("temperature: 77.0", "temperature: 100.0"),
+                              heom_test::tmp_dir() + "/test_ph_phys.yaml"), ref);
+    ASSERT_NE(absorption_hash(replaced("n_steps: 200", "n_steps: 400"),
+                              heom_test::tmp_dir() + "/test_ph_nsteps.yaml"), ref);
+    ASSERT_NE(absorption_hash(replaced("tolerance: 1.0e-7", "tolerance: 1.0e-5"),
+                              heom_test::tmp_dir() + "/test_ph_tol.yaml"), ref);
+    PASS();
+}
+
+// The config boundary. One valid yaml carrying a dynamics and
+// a 2des block; each case edits one line and must fail at parse with a
+// message naming the key. Every one of these used to run with exit 0: NaN
+// passes `x <= 0` range checks, `as<T>(default)` returned the default on a
+// decode failure, unknown keys were dropped, missing 2DES axes became 0, and
+// the steps past the last record were never checked.
+static const char* kBoundaryYaml =
+    "system:\n"
+    "  n_states: 2\n"
+    "  temperature: 77.0\n"
+    "  hamiltonian:\n"
+    "    - [12100.0, -50.0]\n"
+    "    - [-50.0, 12300.0]\n"
+    "  w0: 12000.0\n"
+    "  dipoles:\n"
+    "    - [1.0, 0.0, 0.0]\n"
+    "    - [0.0, 1.0, 0.0]\n"
+    "  strengths: [1.0, 1.0]\n"
+    "bath:\n"
+    "  spectral_density: Drude-Lorentz\n"
+    "  eta: 35.0\n"
+    "  gamma_inverse: 100.0\n"
+    "  expansion_method: pade\n"
+    "  n_extra_poles: 1\n"
+    "  L_cutoff: 1\n"
+    "filter:\n"
+    "  enabled: true\n"
+    "  tolerance: 1.0e-7\n"
+    "  ulist: 0.0\n"
+    "dynamics:\n"
+    "  integrator: rk4\n"
+    "  dt: 2.0\n"
+    "  n_steps: 100\n"
+    "  output_interval: 10\n"
+    "  sink:\n"
+    "    enabled: true\n"
+    "    target_site: 1\n"
+    "    rate: 0.001\n"
+    "  initial_state:\n"
+    "    type: site_excitation\n"
+    "    excited_site: 1\n"
+    "  output:\n"
+    "    save_path: out/\n"
+    "2des:\n"
+    "  integrator: rk4\n"
+    "  dt: 10.0\n"
+    "  tau_max: 20.0\n"
+    "  dtau: 10.0\n"
+    "  t_max: 20.0\n"
+    "  dt_detect: 10.0\n"
+    "  tw: [\"0:10:20\"]\n"
+    "  output:\n"
+    "    save_path: out/\n";
+
+static void test_config_boundary_rejects_silent_inputs() {
+    TEST("config boundary: NaN/Inf, bad decode, unknown key, missing axis, tail steps");
+    auto message_of = [](const std::string& text) {
+        try {
+            auto cfg = Config::load_yaml(write_raw_yaml(text, heom_test::tmp("test_boundary.yaml")));
+            auto dyn = cfg;
+            HEOMConfig::resolve_dynamics_config(dyn);
+            HEOMConfig::resolve_2des_config(cfg);
+        } catch (const std::exception& e) {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+    const std::string base = kBoundaryYaml;
+    const std::string ok = message_of(base);
+    if (!ok.empty()) {
+        std::cout << "FAIL\n    base yaml must load, got: " << ok << "\n";
+        return;
+    }
+    struct Case { const char* from; const char* to; const char* expect; };
+    const Case cases[] = {
+        {"tolerance: 1.0e-7", "tolerance: .nan", "filter.tolerance"},
+        {"tolerance: 1.0e-7", "tolerance: .inf", "must be finite"},
+        {"ulist: 0.0", "ulist: .nan", "filter.ulist must be finite"},
+        {"ulist: 0.0", "ulist: 0.0\n  warmup_factor: 0.1", "filter.warmup_factor was removed"},
+        {"enabled: true\n  tolerance", "enabled: false\n  start_step: 10\n  tolerance",
+         "filter.start_step was removed"},
+        {"[12100.0, -50.0]", "[.nan, -50.0]", "system.hamiltonian[0][0] must be finite"},
+        {"w0: 12000.0", "w0: .inf", "system.w0 must be finite"},
+        {"0:10:20", "0:10:nan", "must be finite"},
+        {"enabled: true\n    target_site", "enabled: ture\n    target_site",
+         "dynamics.sink.enabled: cannot read 'ture'"},
+        {"output_interval: 10", "output_interval: 10.0",
+         "dynamics.output_interval: cannot read '10.0'"},
+        {"enabled: true\n    target_site", "enable: true\n    target_site",
+         "dynamics.sink: unknown key 'enable'"},
+        {"  dtau: 10.0\n", "  dtau: 10.0\n  pathway: [SE]\n", "2des: unknown key 'pathway'"},
+        {"save_path: out/\n2des", "save_path: out/\n    use_timestmp: false\n2des",
+         "dynamics.output: unknown key 'use_timestmp'"},
+        {"excited_site: 1\n", "excited_site: 1\n    exciton_index: 1\n",
+         "dynamics.initial_state: unknown key 'exciton_index'"},
+        {"filter:\n", "dynamic:\n  dt: 1.0\nfilter:\n", "config: unknown key 'dynamic'"},
+        {"spectral_density: Drude-Lorentz", "spectral_density: Debye", "bath.spectral_density"},
+        {"  tau_max: 20.0\n", "", "2des.tau_max is required"},
+        {"n_steps: 100", "n_steps: 79", "must be a multiple of output_interval"},
+        {"  dtau: 10.0\n", "  dtau: 10.0\n  batch: 5\n", "2des.batch: 5 is not a walk width"},
+        {"  dtau: 10.0\n", "  dtau: 10.0\n  batch: 0\n", "2des.batch: 0 is not a walk width"},
+        {"  dtau: 10.0\n", "  dtau: 10.0\n  batch: ture\n", "2des.batch: cannot read 'ture'"},
+    };
+    for (const Case& c : cases) {
+        std::string s = base;
+        const auto pos = s.find(c.from);
+        if (pos == std::string::npos) throw std::logic_error(std::string("missing: ") + c.from);
+        s.replace(pos, std::strlen(c.from), c.to);
+        const std::string m = message_of(s);
+        if (m.find(c.expect) == std::string::npos || m.find("bad conversion") != std::string::npos) {
+            std::cout << "FAIL\n    edit '" << c.to << "': expected '" << c.expect
+                      << "', got '" << (m.empty() ? "<no throw>" : m) << "'\n";
+            return;
+        }
+    }
+    PASS();
+}
+
+// 2des.batch: true|false keep their meaning (21 / 1); 21|7|1 pick the walk width;
+// auto → kTwoDESBatchAuto (0). Missing ⇒ 1. Execution knob: not in config_hash.
+static void test_2des_batch_width_parses() {
+    TEST("config: 2des.batch true|false|21|7|1|auto -> walk width, not hashed");
+    auto load = [](const std::string& extra) {
+        std::string s = kBoundaryYaml;
+        const std::string at = "  dtau: 10.0\n";
+        s.replace(s.find(at), at.size(), at + extra);
+        auto cfg = Config::load_yaml(write_raw_yaml(s, heom_test::tmp("test_batch_width.yaml")));
+        HEOMConfig::resolve_2des_config(cfg);
+        return cfg;
+    };
+    const auto base = load("");
+    ASSERT_EQ(base.twodes->batch, 1);
+    const std::pair<const char*, int> cases[] = {
+        {"true", 21}, {"false", 1}, {"21", 21}, {"7", 7}, {"1", 1},
+        {"auto", HEOMConfig::kTwoDESBatchAuto}};
+    for (const auto& [v, w] : cases) {
+        const auto cfg = load(std::string("  batch: ") + v + "\n");
+        ASSERT_EQ(cfg.twodes->batch, w);
+        ASSERT_EQ(cfg.config_hash, base.config_hash);
+    }
+    PASS();
+}
+
+// Pure selection: 21→7→1 under the same usable=free*0.95 rule.
+static void test_pick_batch_width() {
+    TEST("pick_batch_width: ample→21, mid→7, tight→1, none→throw, free0→21");
+    using heom::spectra::pick_batch_width;
+    // need 21/7/1 = 900/300/100 MiB (bytes)
+    const std::array<size_t, 3> needs = {
+        900ull * 1048576, 300ull * 1048576, 100ull * 1048576};
+    std::string reason;
+    // Ample: usable >= 900 → 21. free=1000/0.95 ≈ 1053 MiB
+    const size_t free21 = static_cast<size_t>(900.0 * 1048576 / 0.95) + 1048576;
+    ASSERT_EQ(pick_batch_width(needs, free21, reason), 21);
+    ASSERT_TRUE(reason.find("B=21") != std::string::npos);
+    ASSERT_TRUE(reason.find("21: 900 MiB") != std::string::npos);
+    // Mid: usable in [300, 900) → 7
+    const size_t free7 = static_cast<size_t>(300.0 * 1048576 / 0.95) + 1048576;
+    ASSERT_EQ(pick_batch_width(needs, free7, reason), 7);
+    ASSERT_TRUE(reason.find("B=7") != std::string::npos);
+    // Tight: usable in [100, 300) → 1
+    const size_t free1 = static_cast<size_t>(100.0 * 1048576 / 0.95) + 1048576;
+    ASSERT_EQ(pick_batch_width(needs, free1, reason), 1);
+    ASSERT_TRUE(reason.find("B=1") != std::string::npos);
+    // None: usable < 100
+    bool threw = false;
+    try {
+        pick_batch_width(needs, 50ull * 1048576, reason);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        ASSERT_TRUE(std::string(e.what()).find("21: 900 MiB") != std::string::npos);
+        ASSERT_TRUE(std::string(e.what()).find("7: 300 MiB") != std::string::npos);
+        ASSERT_TRUE(std::string(e.what()).find("1: 100 MiB") != std::string::npos);
+    }
+    ASSERT_TRUE(threw);
+    // Unknown free → 21
+    ASSERT_EQ(pick_batch_width(needs, 0, reason), 21);
+    ASSERT_TRUE(reason.find("unknown") != std::string::npos);
     PASS();
 }
 
@@ -2038,7 +2512,7 @@ static void test_dipole_double_excited_block() {
 // Transition dipoles/strengths are now a system property (parsed at load_yaml),
 // so the strength-validation tests can throw straight out of Config::load_yaml.
 static std::string write_temp_absorption_yaml(const std::string& strengths = "[4.5, 4.5]") {
-    std::string path = "/tmp/test_heom_absorption_config.yaml";
+    std::string path = heom_test::tmp_dir() + "/test_heom_absorption_config.yaml";
     std::ofstream f(path);
     f << "system:\n"
       << "  n_states: 2\n"
@@ -2068,7 +2542,7 @@ static std::string write_temp_absorption_yaml(const std::string& strengths = "[4
       << "  output_interval: 1\n"
       << "  print_interval: 50\n"
       << "  output:\n"
-      << "    save_path: \"/tmp/\"\n"
+      << "    save_path: \"" << heom_test::tmp_dir() << "/\"\n"
       << "    filename: \"absorption_smoke\"\n"
       << "    use_timestamp: false\n";
     f.close();
@@ -2108,6 +2582,154 @@ static void test_linear_response_rejects_non_ground_basis() {
         BasisType::EXCITED_ONLY, dipole, /*N=*/2));
     ASSERT_NOTHROW(validate_linear_response_inputs(
         BasisType::WITH_GROUND, dipole, /*N=*/2));
+    PASS();
+}
+
+// Fluorescence yaml: the absorption dimer plus a fluorescence block whose
+// equilibration sub-block is spliced in verbatim ("" ⇒ omitted).
+static std::string write_fluorescence_yaml(const std::string& equilibration,
+                                           bool dipoles = true,
+                                           const std::string& extra = "") {
+    std::string path = heom_test::tmp_dir() + "/test_heom_fluorescence_config.yaml";
+    std::ofstream f(path);
+    f << "system:\n"
+      << "  n_states: 2\n"
+      << "  temperature: 77.0\n"
+      << "  hamiltonian:\n"
+      << "    - [12100.0, -50.0]\n"
+      << "    - [ -50.0, 12300.0]\n"
+      << "  w0: 12000.0\n";
+    if (dipoles)
+        f << "  dipoles:\n"
+          << "    - [1.0, 0.0, 0.0]\n"
+          << "    - [0.0, 1.0, 0.0]\n"
+          << "  strengths: [1.0, 1.0]\n";
+    f << "bath:\n"
+      << "  eta: 35.0\n"
+      << "  gamma_inverse: 100.0\n"
+      << "  expansion_method: matsubara\n"
+      << "  n_extra_poles: 1\n"
+      << "  L_cutoff: 3\n"
+      << "filter:\n"
+      << "  enabled: false\n"
+      << "fluorescence:\n"
+      << "  integrator: rk4\n"
+      << "  dt: 1.0\n"
+      << "  n_steps: 100\n"
+      << "  output_interval: 1\n"
+      << extra
+      << equilibration
+      << "  output:\n"
+      << "    save_path: \"" << heom_test::tmp_dir() << "/\"\n"
+      << "    filename: \"auto\"\n";
+    f.close();
+    return path;
+}
+
+static std::string fluorescence_resolve_error(const std::string& path) {
+    try {
+        auto cfg = Config::load_yaml(path);
+        HEOMConfig::resolve_fluorescence_config(cfg);
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+static void test_fluorescence_config_resolves() {
+    TEST("fluorescence config: resolves (task, basis, equilibration, batch, auto name)");
+    auto cfg = Config::load_yaml(write_fluorescence_yaml(
+        "  equilibration:\n    t_max: 5000\n    check_interval: 20\n    tolerance: 1.0e-7\n",
+        true, "  batch: true\n"));
+    HEOMConfig::resolve_fluorescence_config(cfg);
+    ASSERT_TRUE(cfg.task == Config::Task::Fluorescence);
+    ASSERT_TRUE(cfg.physics.basis == BasisType::WITH_GROUND);
+    ASSERT_EQ(cfg.physics.n_sites, 3);
+    ASSERT_EQ(cfg.equilibration.t_max_fs, 5000.0);
+    ASSERT_EQ(cfg.equilibration.check_interval_fs, 20.0);
+    ASSERT_EQ(cfg.equilibration.tolerance, 1e-7);
+    ASSERT_TRUE(cfg.linear_batch);
+    ASSERT_TRUE(cfg.output.filename.find("_fluorescence_matsubara") != std::string::npos);
+    ASSERT_EQ(heom::rho_capacity(cfg), 4);            // (e,e) = n_e²
+    PASS();
+}
+
+static void test_fluorescence_config_defaults() {
+    TEST("fluorescence config: check_interval / tolerance defaults, batch off");
+    auto cfg = Config::load_yaml(write_fluorescence_yaml("  equilibration:\n    t_max: 5000\n"));
+    HEOMConfig::resolve_fluorescence_config(cfg);
+    ASSERT_EQ(cfg.equilibration.check_interval_fs, 50.0);
+    ASSERT_EQ(cfg.equilibration.tolerance, 1e-6);
+    ASSERT_TRUE(!cfg.linear_batch);
+    PASS();
+}
+
+static void test_fluorescence_config_rejects() {
+    TEST("fluorescence config (G7): missing / illegal equilibration, no dipoles");
+    struct Case { std::string eq; bool dipoles; const char* needle; };
+    const std::vector<Case> cases = {
+        {"", true, "equilibration"},
+        {"  equilibration:\n    check_interval: 50\n", true, "t_max"},
+        {"  equilibration:\n    t_max: 0\n", true, "t_max"},
+        {"  equilibration:\n    t_max: 5000\n    check_interval: 2.5\n", true, "integer multiple"},
+        {"  equilibration:\n    t_max: 60\n    check_interval: 50\n", true, "2·check_interval"},
+        {"  equilibration:\n    t_max: 5000\n    tolerance: 0\n", true, "tolerance"},
+        {"  equilibration:\n    t_max: 5000\n    tolerance: 1.0\n", true, "tolerance"},
+        {"  equilibration:\n    t_max: 5000\n    tol: 1.0e-6\n", true, "unknown key 'tol'"},
+        {"  equilibration:\n    t_max: 5000\n", false, "dipoles"},
+    };
+    {   // The ADO filter pins δ at a system-specific floor.
+        const std::string path = write_fluorescence_yaml("  equilibration:\n    t_max: 5000\n");
+        std::ifstream in(path);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        const std::string off = "  enabled: false\n";
+        text.replace(text.find(off), off.size(), "  enabled: true\n  tolerance: 1.0e-7\n");
+        std::ofstream(path) << text;
+        const std::string what = fluorescence_resolve_error(path);
+        if (what.find("filter.enabled = false") == std::string::npos) {
+            std::cout << "FAIL\n    expected the filter rejection, got '" << what << "'\n";
+            return;
+        }
+    }
+    for (const auto& c : cases) {
+        const std::string what = fluorescence_resolve_error(write_fluorescence_yaml(c.eq, c.dipoles));
+        if (what.find(c.needle) == std::string::npos) {
+            std::cout << "FAIL\n    expected an error containing '" << c.needle
+                      << "', got '" << what << "'\n";
+            return;
+        }
+    }
+    // IF-RK4's fixed point is biased, so fluorescence rejects it.
+    const std::string path = write_fluorescence_yaml("  equilibration:\n    t_max: 5000\n");
+    std::string text;
+    {
+        std::ifstream in(path);
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string rk4 = "integrator: rk4";
+    text.replace(text.find(rk4), rk4.size(), "integrator: if-rk4");
+    std::ofstream(path) << text;
+    const std::string what = fluorescence_resolve_error(path);
+    if (what.find("if-rk4") == std::string::npos || what.find("O(dt^5)") == std::string::npos) {
+        std::cout << "FAIL\n    expected the if-rk4 rejection, got '" << what << "'\n";
+        return;
+    }
+    PASS();
+}
+
+static void test_fluorescence_config_hash_scope() {
+    TEST("fluorescence config: equilibration is physics, batch is not");
+    auto hash = [](const std::string& eq, const std::string& extra) {
+        auto cfg = Config::load_yaml(write_fluorescence_yaml(eq, true, extra));
+        HEOMConfig::resolve_fluorescence_config(cfg);
+        return cfg.config_hash;
+    };
+    const std::string eq6 = "  equilibration:\n    t_max: 5000\n    tolerance: 1.0e-6\n";
+    const std::string eq7 = "  equilibration:\n    t_max: 5000\n    tolerance: 1.0e-7\n";
+    const std::string base = hash(eq6, "");
+    ASSERT_NE(hash(eq7, ""), base);
+    ASSERT_EQ(hash(eq6, "  batch: true\n"), base);
     PASS();
 }
 
@@ -2215,8 +2837,8 @@ static void test_console_printers_restore_stream_state() {
     const Eigen::MatrixXcd eigenvectors = Eigen::MatrixXcd::Identity(2, 2);
     const Eigen::MatrixXcd rho = Eigen::MatrixXcd::Identity(2, 2) * 0.5;
 
-    heom::console::print_eigenspectrum(eigenvalues, 0, 2, 12000.0);
-    heom::console::print_exciton_composition(eigenvectors, 0, 2);
+    heom::console::print_eigenspectrum(eigenvalues, 0, 2, 0, 12000.0);
+    heom::console::print_exciton_composition(eigenvectors, 0, 0, 2);
     heom::console::print_density_matrix_summary(rho, 2);
 
     const bool flags_ok = std::cout.flags() == flags;
@@ -2249,6 +2871,348 @@ static void test_format_computation_time_tiers() {
     ASSERT_EQ(format_computation_time(90061.0),      std::string("1d 1h 1m 1s"));
     ASSERT_EQ(format_computation_time(2.0 * 86400.0 + 3.0 * 3600.0 + 4.0 * 60.0 + 5.0),
               std::string("2d 3h 4m 5s"));
+    PASS();
+}
+
+// ============================================================================
+// Underdamped Brownian-oscillator vibrational modes + per-site K_n
+// (ragged vibration-mode layouts; gates G4/G6/G7).
+// ============================================================================
+
+// Single pigment, Padé K, Drude(η=35, 1/γ=100 fs) + the given modes.
+static PhysicalParameters make_bo_params(int K, double T_K, std::vector<VibMode> modes,
+                                         BathExpansion e = BathExpansion::PADE) {
+    PhysicalParameters p = make_pade_params(K, T_K, 35.0, 100.0);
+    p.expansion = e;
+    p.bath_sites[0].modes = std::move(modes);
+    return p;
+}
+
+static bool cnear(std::complex<double> a, std::complex<double> b, double rel) {
+    return std::abs(a - b) <= rel * std::max(std::abs(a), std::abs(b));
+}
+
+// Reproduce the Brownian-oscillator pole setup (wval / gval /
+// gval_I) for one BO at 77 K. Fortran stores C_R and iC_I separately:
+//   c_k = gval_k + i·gval_I_k,  c̄_k = gval_k − i·gval_I_k,
+// with Fortran's FWHM Γ, γ_b = Γ/2 (= our γ, the C(t) decay rate), ω_b = ω₁,
+// pk = 2λΓω₀², pk1 = pk/(8γ_bω_b). Its Matsubara-slot term
+// −2Tν·Σ pk/((ω_b²+γ_b²−ν²)² + 4ω_b²ν²) is the Padé add term with χ=1.
+static void test_bo_pair_matches_fortran_setup_freqs2() {
+    TEST("BO pair (ν±, c±, c̄±) matches heqtt-mbo.f90 setup_freqs2 to 1e-12");
+    // Γ = 30 cm⁻¹ FWHM ⇒ γ = 15 cm⁻¹ ⇒ 1/γ = 354 fs.
+    const double T_K = 77.0, om_cm = 340.0, S = 0.02, ginv = 354.0;
+    auto p = make_bo_params(1, T_K, {make_vib_mode(om_cm, S, ginv)});
+    ASSERT_NOTHROW(compute_bath_correlation(p));
+    ASSERT_EQ(p.n_ladders(), 4);                       // Drude + Padé₁ + BO+ + BO−
+    ASSERT_EQ((int)p.mode_kind[0], 0); ASSERT_EQ((int)p.mode_kind[1], 1);
+    ASSERT_EQ((int)p.mode_kind[2], 2); ASSERT_EQ((int)p.mode_kind[3], 3);
+
+    const std::complex<double> I(0.0, 1.0);
+    const double beta = 1.0 / p.temperature;
+    const double w0 = om_cm * CM_TO_AU, gamma_b = 1.0 / (ginv * FS_TO_AU), lam = S * w0;
+    const double G = 2.0 * gamma_b, omega_b = std::sqrt(w0 * w0 - gamma_b * gamma_b);
+    const double pk = 2.0 * lam * G * w0 * w0, pk1 = pk / 8.0 / gamma_b / omega_b;
+    auto coth = [](std::complex<double> z) {
+        return (std::exp(z) + std::exp(-z)) / (std::exp(z) - std::exp(-z));
+    };
+    const std::complex<double> w_p = gamma_b + I * omega_b, w_m = gamma_b - I * omega_b;
+    const std::complex<double> g_p = pk1 * coth(0.5 * beta * (omega_b - I * gamma_b));
+    const std::complex<double> g_m = pk1 * coth(0.5 * beta * (omega_b + I * gamma_b));
+    const std::complex<double> gI_p = -I * pk1, gI_m = I * pk1;
+
+    const double tol = 1e-12;
+    if (!cnear(p.nu_bath[2], w_p, tol) || !cnear(p.nu_bath[3], w_m, tol)) {
+        std::cout << "FAIL\n    ν± mismatch\n"; return;
+    }
+    if (!cnear(p.c_bath[2], g_p + I * gI_p, tol) || !cnear(p.c_bath[3], g_m + I * gI_m, tol)) {
+        std::cout << "FAIL\n    c± mismatch: " << p.c_bath[2] << " vs " << g_p + I * gI_p
+                  << ", " << p.c_bath[3] << " vs " << g_m + I * gI_m << "\n"; return;
+    }
+    if (!cnear(p.cbar_bath[2], g_p - I * gI_p, tol) || !cnear(p.cbar_bath[3], g_m - I * gI_m, tol)) {
+        std::cout << "FAIL\n    c̄± mismatch (pairing reversed?)\n"; return;
+    }
+    // The pair must be closed under conjugation the way the kernel needs it.
+    ASSERT_EQ(p.cbar_bath[2], std::conj(p.c_bath[3]));
+    ASSERT_EQ(p.cbar_bath[3], std::conj(p.c_bath[2]));
+    // Textbook form: c+ = P(κ+1), c− = P(κ*−1) with P = λω₀²/(2ω₁).
+    const double P = lam * w0 * w0 / (2.0 * omega_b);
+    const std::complex<double> kappa = coth(0.5 * beta * (omega_b - I * gamma_b));
+    if (!cnear(p.c_bath[2], P * (kappa + 1.0), tol) ||
+        !cnear(p.c_bath[3], P * (std::conj(kappa) - 1.0), tol)) {
+        std::cout << "FAIL\n    textbook P(κ±1) mismatch\n"; return;
+    }
+
+    // Padé slot: Drude term + Fortran's Matsubara-style BO term, both × χ_1.
+    std::vector<double> zeta, chi; boson_pade_NmN(1, zeta, chi);
+    const double nu1 = zeta[1] * p.temperature;
+    const BathSite& s = p.bath_sites[0];
+    const double drude = 2.0 * s.eta_au * s.gamma_au * nu1 * p.temperature
+                       / (nu1 * nu1 - s.gamma_au * s.gamma_au);
+    const double d = omega_b * omega_b + gamma_b * gamma_b - nu1 * nu1;
+    const double bo = -2.0 * p.temperature * nu1 * pk / (d * d + 4.0 * omega_b * omega_b * nu1 * nu1);
+    ASSERT_NEAR(p.c_bath[1].real(), chi[1] * (drude + bo), tol * std::abs(p.c_bath[1]));
+    ASSERT_EQ(p.c_bath[1].imag(), 0.0);
+    ASSERT_NEAR(p.nu_bath[1].real(), nu1, 1e-15);
+
+    // Markov area gains T·2λΓ/ω₀² = T·4λγ/ω₀²; residue = area − Σ Re(c/ν) over all 4 slots.
+    double retained = 0.0;
+    for (int k = 0; k < 4; ++k) retained += (p.c_bath[k] / p.nu_bath[k]).real();
+    const double area = p.temperature * (s.eta_au / s.gamma_au + 2.0 * lam * G / (w0 * w0));
+    ASSERT_NEAR(p.markov_residue[0], area - retained, 1e-12 * std::abs(area));
+    PASS();
+}
+
+// Without modes the builder must be byte-identical to the Drude-only one (
+// the coefficient level): same Drude/Padé tokens, add-term is exactly 0.0.
+static void test_bo_no_modes_is_bit_identical() {
+    TEST("no vibrational modes ⇒ c, ν, c̄, markov bit-identical to plain Padé");
+    auto a = make_pade_params(2, 77.0, 35.0, 100.0);
+    compute_bath_correlation(a);
+    auto b = make_bo_params(2, 77.0, {});
+    compute_bath_correlation(b);
+    ASSERT_EQ(a.n_ladders(), b.n_ladders());
+    for (int k = 0; k < a.n_ladders(); ++k) {
+        ASSERT_EQ(a.c_bath[k], b.c_bath[k]);
+        ASSERT_EQ(a.nu_bath[k], b.nu_bath[k]);
+        ASSERT_EQ(a.cbar_bath[k], b.cbar_bath[k]);
+    }
+    ASSERT_EQ(a.markov_residue[0], b.markov_residue[0]);
+    PASS();
+}
+
+// G6 fail-loud, physics side (set_bo_pair / check_distinct_poles).
+static void test_bo_fail_loud() {
+    TEST("BO: γ≥ω₀ / near-critical / S=0 / duplicate mode all throw");
+    // γ ≥ ω₀: ω₀ = 30 cm⁻¹ ⇒ 1/γ ≤ 5308.8/30 = 177 fs is overdamped; 50 fs is.
+    {
+        auto p = make_bo_params(1, 77.0, {make_vib_mode(30.0, 0.02, 50.0)});
+        bool ok = false;
+        try { compute_bath_correlation(p); }
+        catch (const std::exception& e) {
+            const std::string m = e.what();
+            ok = m.find("underdamped") != std::string::npos && m.find("cm⁻¹") != std::string::npos;
+        }
+        if (!ok) { std::cout << "FAIL\n    overdamped mode did not throw with γ in cm⁻¹\n"; return; }
+    }
+    // Near-critical: pick γ so that ω₁/ω₀ = 5e-4.
+    {
+        const double w0 = 340.0 * CM_TO_AU;
+        const double r = 5e-4;
+        const double g = w0 * std::sqrt(1.0 - r * r);   // ω₁ = sqrt(ω₀² − γ²) = r·ω₀
+        VibMode v = make_vib_mode(340.0, 0.02, 1.0 / (g * FS_TO_AU));
+        auto p = make_bo_params(1, 77.0, {v});
+        ASSERT_THROWS(compute_bath_correlation(p));
+    }
+    // S = 0 → λ = 0 → rejected before any zero-|c| ladder reaches the kernel.
+    {
+        auto p = make_bo_params(1, 77.0, {make_vib_mode(340.0, 0.0, 177.0)});
+        ASSERT_THROWS(compute_bath_correlation(p));
+    }
+    // Same mode twice → duplicate ν → throw (c̄ pairing would be ambiguous).
+    {
+        auto p = make_bo_params(1, 77.0, {make_vib_mode(340.0, 0.02, 177.0),
+                                          make_vib_mode(340.0, 0.02, 177.0)});
+        ASSERT_THROWS(compute_bath_correlation(p));
+    }
+    // Two DISTINCT modes are fine and give D = 1 + 1 + 4.
+    {
+        auto p = make_bo_params(1, 77.0, {make_vib_mode(340.0, 0.02, 177.0),
+                                          make_vib_mode(742.0, 0.01, 177.0)});
+        ASSERT_NOTHROW(compute_bath_correlation(p));
+        ASSERT_EQ(p.n_ladders(), 6);
+        ASSERT_EQ((int)p.mode_kind[4], 2); ASSERT_EQ((int)p.mode_kind[5], 3);
+    }
+    PASS();
+}
+
+// G7 (i)+(ii) at the coefficient level: per-site K_n gives a ragged mode_off,
+// and every site's (ν, c) is bit-identical to a uniform run with that site's K.
+static void test_per_site_K_ragged_bit_identical() {
+    TEST("per-site K_n: mode_off ragged, (ν,c) per site == uniform-K run, bitwise");
+    auto mixed = make_pade_params(1, 77.0, 35.0, 100.0);
+    mixed.n_states = 3; mixed.n_sites = 3;
+    set_homog_bath(mixed, 35.0 * CM_TO_AU, 1.0 / (100.0 * FS_TO_AU));
+    mixed.bath_sites[1].n_extra_poles = 2;
+    compute_bath_correlation(mixed);
+    ASSERT_EQ((int)mixed.mode_off.size(), 4);
+    ASSERT_EQ(mixed.mode_off[0], 0); ASSERT_EQ(mixed.mode_off[1], 2);
+    ASSERT_EQ(mixed.mode_off[2], 5); ASSERT_EQ(mixed.mode_off[3], 7);
+    ASSERT_EQ((int)mixed.mode_kind[3], 1); ASSERT_EQ((int)mixed.mode_kind[4], 1);
+
+    auto k1 = make_pade_params(1, 77.0, 35.0, 100.0); compute_bath_correlation(k1);
+    auto k2 = make_pade_params(2, 77.0, 35.0, 100.0); compute_bath_correlation(k2);
+    for (int k = 0; k < 2; ++k) {
+        ASSERT_EQ(mixed.c_bath[mixed.mode_idx(0, k)],  k1.c_bath[k]);
+        ASSERT_EQ(mixed.nu_bath[mixed.mode_idx(0, k)], k1.nu_bath[k]);
+        ASSERT_EQ(mixed.c_bath[mixed.mode_idx(2, k)],  k1.c_bath[k]);
+        ASSERT_EQ(mixed.nu_bath[mixed.mode_idx(2, k)], k1.nu_bath[k]);
+    }
+    for (int k = 0; k < 3; ++k) {
+        ASSERT_EQ(mixed.c_bath[mixed.mode_idx(1, k)],  k2.c_bath[k]);
+        ASSERT_EQ(mixed.nu_bath[mixed.mode_idx(1, k)], k2.nu_bath[k]);
+    }
+    ASSERT_EQ(mixed.markov_residue[0], k1.markov_residue[0]);
+    ASSERT_EQ(mixed.markov_residue[1], k2.markov_residue[0]);
+    ASSERT_EQ(mixed.markov_residue[2], k1.markov_residue[0]);
+    PASS();
+}
+
+// G6 parser side + the `sites:` override keys nobody had exercised (eta,
+// gamma_inverse, and the two per-site additions n_extra_poles / vibrational_modes).
+static void test_sites_overrides_parse() {
+    TEST("bath.sites: eta / gamma_inverse / n_extra_poles / vibrational_modes overrides");
+    const auto path = write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n"
+        "    1:\n      eta: 120.0\n      gamma_inverse: 60.0\n"
+        "    2:\n      n_extra_poles: 2\n"
+        "      vibrational_modes:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 177.0}\n");
+    Config cfg;
+    ASSERT_NOTHROW(cfg = Config::load_yaml(path));
+    const auto& ph = cfg.physics;
+    ASSERT_EQ(ph.bath_sites[0].eta_cm, 120.0);
+    ASSERT_EQ(ph.bath_sites[0].gamma_inverse_fs, 60.0);
+    ASSERT_EQ(ph.bath_sites[0].n_extra_poles, 1);      // inherited default
+    ASSERT_EQ((int)ph.bath_sites[0].modes.size(), 0);
+    ASSERT_EQ(ph.bath_sites[1].eta_cm, 35.0);          // inherited default
+    ASSERT_EQ(ph.bath_sites[1].n_extra_poles, 2);
+    ASSERT_EQ((int)ph.bath_sites[1].modes.size(), 1);
+    ASSERT_EQ(ph.bath_sites[1].modes[0].gamma_inverse_fs, 177.0);
+    ASSERT_NEAR(ph.bath_sites[1].modes[0].lambda_au, 0.02 * 340.0 * CM_TO_AU, 1e-18);
+    // Layout: site 1 → 2 slots, site 2 → 1 + 2 + 2 = 5 slots.
+    ASSERT_EQ(ph.mode_off[1], 2); ASSERT_EQ(ph.mode_off[2], 7); ASSERT_EQ(ph.n_ladders(), 7);
+    // Site 1's Drude pole uses the overridden (η, γ).
+    ASSERT_NEAR(ph.nu_bath[0].real(), 1.0 / (60.0 * FS_TO_AU), 1e-18);
+    ASSERT_NEAR(ph.c_bath[0].imag(), -0.5 * 120.0 * CM_TO_AU / (60.0 * FS_TO_AU), 1e-18);
+    PASS();
+}
+
+// YAML H is bare. H_eff diagonal is yaml + η/2 + Σ Sω₀ − w0. Off-diagonals
+// stay put. A no-mode site must not pick up the other site's Sω₀. This is the
+// lock print_summary used to skip: deleting the vib term used to leave parser
+// tests and Drude regression green.
+static void test_hamiltonian_includes_mode_reorg() {
+    TEST("H_nn += η/2 + Sω₀ (per site); coupling unchanged");
+    Config cfg;
+    ASSERT_NOTHROW(cfg = Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n"
+        "    1:\n      eta: 120.0\n"
+        "    2:\n      vibrational_modes:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 177.0}\n")));
+    const auto& H = cfg.physics.hamiltonian_site;
+    const double lam0 = 0.5 * 120.0;                         // Drude only
+    const double lam1 = 0.5 * 35.0 + 0.02 * 340.0;           // 17.5 + 6.8
+    ASSERT_NEAR(H(0, 0).real() / CM_TO_AU, 12100.0 + lam0 - 12000.0, 1e-9);
+    ASSERT_NEAR(H(1, 1).real() / CM_TO_AU, 12300.0 + lam1 - 12000.0, 1e-9);
+    ASSERT_NEAR(H(0, 1).real() / CM_TO_AU, -50.0, 1e-9);
+    ASSERT_NEAR(H(1, 0).real() / CM_TO_AU, -50.0, 1e-9);
+    // reorg_cm is the same λ_n; subtracting it (and re-adding w0) recovers the
+    // yaml's bare H_S — what fluorescence uses for its Boltzmann start.
+    const auto& reorg = cfg.physics.reorg_cm;
+    ASSERT_EQ((int)reorg.size(), 2);
+    ASSERT_EQ(reorg[0], lam0);
+    ASSERT_EQ(reorg[1], lam1);
+    ASSERT_NEAR(H(0, 0).real() / CM_TO_AU - reorg[0] + cfg.physics.w0_cm, 12100.0, 1e-9);
+    ASSERT_NEAR(H(1, 1).real() / CM_TO_AU - reorg[1] + cfg.physics.w0_cm, 12300.0, 1e-9);
+
+    Config bare;
+    ASSERT_NOTHROW(bare = Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n")));
+    const auto& Hb = bare.physics.hamiltonian_site;
+    const double lam_d = 0.5 * 35.0;
+    ASSERT_NEAR(Hb(0, 0).real() / CM_TO_AU, 12100.0 + lam_d - 12000.0, 1e-9);
+    ASSERT_NEAR(Hb(1, 1).real() / CM_TO_AU, 12300.0 + lam_d - 12000.0, 1e-9);
+    PASS();
+}
+
+static std::string capture_print_summary(const Config& cfg) {
+    std::ostringstream sink;
+    std::streambuf* const old = std::cout.rdbuf(sink.rdbuf());
+    cfg.print_summary();
+    std::cout.rdbuf(old);
+    return sink.str();
+}
+
+// The log used to print "lambda_reorg (= eta/2)" and list modes without Sω₀,
+// so a missing H shift was invisible. Pin the total and the per-mode term.
+static void test_print_summary_reports_mode_reorg() {
+    TEST("print_summary: λ_tot = η/2+ΣSω₀, per-mode λ=Sω₀, no '(= eta/2)' lie");
+    Config hetero;
+    ASSERT_NOTHROW(hetero = Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n"
+        "    2:\n      vibrational_modes:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 177.0}\n")));
+    const std::string het = capture_print_summary(hetero);
+    if (het.find("lambda_reorg (= eta/2)") != std::string::npos) {
+        std::cout << "FAIL\n    print_summary still claims lambda_reorg (= eta/2)\n";
+        return;
+    }
+    if (het.find("Sω₀=6.8") == std::string::npos &&
+        het.find("Sw0=6.8") == std::string::npos) {
+        std::cout << "FAIL\n    mode line missing λ=Sω₀=6.8\n";
+        return;
+    }
+    if (het.find("24.3") == std::string::npos) {
+        std::cout << "FAIL\n    site-2 λ_tot=24.3 (17.5+6.8) not printed\n";
+        return;
+    }
+
+    Config homo;
+    ASSERT_NOTHROW(homo = Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  vibrational_modes:\n"
+        "    - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 177.0}\n")));
+    const std::string hom = capture_print_summary(homo);
+    if (hom.find("lambda_reorg (= eta/2)") != std::string::npos) {
+        std::cout << "FAIL\n    homogeneous print still claims (= eta/2)\n";
+        return;
+    }
+    if (hom.find("24.3") == std::string::npos) {
+        std::cout << "FAIL\n    homogeneous λ_tot=24.3 not printed\n";
+        return;
+    }
+    if (hom.find("6.8") == std::string::npos) {
+        std::cout << "FAIL\n    homogeneous vib 6.8 not printed\n";
+        return;
+    }
+    PASS();
+}
+
+static void test_sites_overrides_reject_bad_keys() {
+    TEST("bath.sites: typo'd vibrational_modes / gamma_cm / missing field / S≤0 throw");
+    ASSERT_THROWS(Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n    1:\n      vibrational_mode:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 177.0}\n")));
+    ASSERT_THROWS(Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n    1:\n      vibrational_modes:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.02, gamma_cm: 30.0}\n")));
+    ASSERT_THROWS(Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n    1:\n      vibrational_modes:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.02}\n")));
+    ASSERT_THROWS(Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n    1:\n      vibrational_modes:\n"
+        "        - {omega_cm: 340.0, huang_rhys: 0.0, gamma_inverse: 177.0}\n")));
+    ASSERT_THROWS(Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  sites:\n    1:\n      n_extra_poles: 51\n")));
+    // Global default list applies to every site; a per-site list replaces it.
+    Config cfg;
+    ASSERT_NOTHROW(cfg = Config::load_yaml(write_corr_yaml(
+        "  expansion_method: pade\n  n_extra_poles: 1\n"
+        "  vibrational_modes:\n"
+        "    - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 177.0}\n"
+        "  sites:\n    2:\n      vibrational_modes: []\n")));
+    ASSERT_EQ((int)cfg.physics.bath_sites[0].modes.size(), 1);
+    ASSERT_EQ((int)cfg.physics.bath_sites[1].modes.size(), 0);
+    ASSERT_EQ(cfg.physics.n_ladders(), 4 + 2);
     PASS();
 }
 
@@ -2319,6 +3283,10 @@ int main() {
     test_pade_yaml_invalid_value_throws();
     test_expansion_method_missing_throws();
     test_n_matsubara_field_rejected();
+    test_required_key_errors_name_the_path();
+    test_config_boundary_rejects_silent_inputs();
+    test_2des_batch_width_parses();
+    test_pick_batch_width();
     test_n_extra_poles_range_checked();
     test_auto_filename_marks_matsubara();
 
@@ -2346,6 +3314,8 @@ int main() {
 
     std::cout << "\n[Memory Budget]\n";
     test_budget_bucket_consistency();
+    test_budget_optional_extras();
+    test_budget_resident_system_tables();
     test_budget_manual_excited_only();
     test_budget_filter_off_zero_buffers();
     test_budget_filter_on_includes_buffers();
@@ -2360,10 +3330,24 @@ int main() {
 
     std::cout << "\n[GPU Alloc Plan]\n";
     test_plan_total_matches_budget();
+    test_rho_capacity_dynamics_is_full_matrix();
     test_plan_filter_off_buffer_count();
     test_plan_filter_on_buffer_count();
     test_plan_canonical_names_present();
     test_derivative_total_elements_overflow_throws();
+    test_create_output_file_policy();
+    test_derivative_map_elements_overflow_throws();
+    test_mode_layout_is_a_bijection();
+    test_hierarchy_ragged_layout_roundtrip();
+    test_bo_pair_matches_fortran_setup_freqs2();
+    test_bo_no_modes_is_bit_identical();
+    test_bo_fail_loud();
+    test_per_site_K_ragged_bit_identical();
+    test_sites_overrides_parse();
+    test_sites_overrides_reject_bad_keys();
+    test_hamiltonian_includes_mode_reorg();
+    test_print_summary_reports_mode_reorg();
+    test_manifold_layout_single_source();
     test_derivative_shared_memory_limit_throws();
     test_derivative_context_requires_total_decay();
     test_derivative_context_manifold_block_rules();
@@ -2383,6 +3367,10 @@ int main() {
     test_dipole_excited_only_throws();
     test_dipole_double_excited_block();
     test_absorption_yaml_loads_clean();
+    test_fluorescence_config_resolves();
+    test_fluorescence_config_defaults();
+    test_fluorescence_config_rejects();
+    test_fluorescence_config_hash_scope();
     test_dipoles_all_zero_strengths_throw();
     test_dipoles_negative_strength_throws();
     test_linear_response_rejects_non_ground_basis();
@@ -2394,6 +3382,5 @@ int main() {
     test_console_printers_restore_stream_state();
     test_format_computation_time_tiers();
 
-    std::cout << "\n=== Results: " << tests_passed << "/" << tests_run << " passed ===\n\n";
-    return (tests_passed == tests_run) ? 0 : 1;
+    return heom_test_summary("test_core");
 }

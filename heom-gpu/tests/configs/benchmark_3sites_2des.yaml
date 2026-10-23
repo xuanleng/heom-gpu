@@ -26,8 +26,6 @@ bath:
 filter:
   enabled: true
   tolerance: 1.0e-6
-  start_step: 8
-  warmup_factor: 1.0e-1
   ulist: 0.9          # U-list whole-step launch: 0=off, (0,1]=on & gate τ
 
 2des:

@@ -31,7 +31,7 @@ filter:
   tolerance: 1.0e-7
 
 2des:
-  batch: true          # 1.27s→0.26s here; see config/3sites_2des.yaml for why
+  batch: true          # 1.27s→0.26s here; see benchmark_3sites_2des_blocking.yaml for why
                        # small systems win so much and what the filter-union
                        # caveat is. Safe for this config: its two consumers
                        # (test_integration smoke, test_benchmark_infra

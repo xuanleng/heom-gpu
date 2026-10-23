@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <utility>
 #include <algorithm>
+#include <initializer_list>
+#include <type_traits>
 #include <vector>
 
 namespace HEOMConfig {
@@ -25,6 +27,74 @@ static std::string read_text_file(const std::string& path) {
     std::ostringstream buffer;
     buffer << in.rdbuf();
     return buffer.str();
+}
+
+// ---------------------------------------------------------------------------
+// Scalar keys — one policy. Every value goes through decode(): a value of the
+// wrong type fails with the yaml path ("bath.eta: cannot read 'abc' as a
+// number"), never with yaml-cpp's "bad conversion" and a node nobody can
+// locate. A number must also be finite: NaN passes every `x <= 0` range check
+// downstream, and filter.tolerance = NaN silently dropped the whole hierarchy.
+// require() fails on a missing key; get_or() returns the default for a missing
+// key only. yaml-cpp's own `as<T>(default)` is not used anywhere: it returns
+// the default on a decode failure too, so `enabled: ture` meant `false`.
+// ---------------------------------------------------------------------------
+template <class T> static const char* yaml_type_name();
+template <> const char* yaml_type_name<int>()         { return "an integer"; }
+template <> const char* yaml_type_name<double>()      { return "a number"; }
+template <> const char* yaml_type_name<bool>()        { return "true/false"; }
+template <> const char* yaml_type_name<std::string>() { return "a string"; }
+
+template <class T>
+static T decode(const YAML::Node& n, const std::string& path) {
+    T v;
+    try {
+        v = n.as<T>();
+    } catch (const YAML::Exception&) {
+        throw std::runtime_error(path + ": cannot read '" + n.Scalar() + "' as "
+                                 + yaml_type_name<T>());
+    }
+    if constexpr (std::is_floating_point_v<T>) {
+        if (!std::isfinite(v))
+            throw std::runtime_error(path + " must be finite (got '" + n.Scalar() + "')");
+    }
+    return v;
+}
+
+template <class T>
+static T require(const YAML::Node& parent, const char* key, const std::string& path) {
+    const YAML::Node n = parent ? parent[key] : YAML::Node();
+    if (!n) throw std::runtime_error(path + " is required");
+    return decode<T>(n, path);
+}
+
+template <class T>
+static T get_or(const YAML::Node& parent, const char* key, const std::string& path,
+                T fallback) {
+    const YAML::Node n = parent ? parent[key] : YAML::Node();
+    return n ? decode<T>(n, path) : fallback;
+}
+
+// Every key of a block must be one its parser reads. Called after the block's
+// dedicated checks, so a removed or moved key gets its own message first. A typo ('sink.enable', '2des.pathway') used to be
+// dropped and the run went on with the default — a different problem from the
+// one the user wrote down.
+static void check_keys(const YAML::Node& blk, const std::string& where,
+                       std::initializer_list<const char*> known) {
+    if (!blk) return;
+    if (!blk.IsMap()) throw std::runtime_error(where + " must be a map");
+    for (const auto& kv : blk) {
+        const std::string key = kv.first.as<std::string>();
+        auto same = [&](const char* k) { return key == k; };
+        if (std::any_of(known.begin(), known.end(), same)) continue;
+        std::string list;
+        for (const char* k : known) list += (list.empty() ? "" : ", ") + std::string(k);
+        throw std::runtime_error(where + ": unknown key '" + key + "' (known: " + list + ")");
+    }
+}
+
+static std::string at(const std::string& path, size_t i) {
+    return path + "[" + std::to_string(i) + "]";
 }
 
 // Canonical serialisation of a parsed YAML node: maps emit their keys in sorted
@@ -68,17 +138,30 @@ static void canonical_yaml(const YAML::Node& n, std::string& out) {
     }
 }
 
-// "Same physics?" fingerprint: canonicalise the parsed config with the
-// non-physical `output` sub-blocks and disorder-owned `static_disorder` block
-// dropped, then FNV-1a. Stable across comment/whitespace/key-order edits;
-// changes only when a physically-meaningful input changes. Used for the MC
-// merge key so an incremental batch run after a harmless yaml edit still merges.
-// `output` now lives inside each task block, so strip it there.
-static std::string physics_hash(const YAML::Node& yaml) {
-    YAML::Node phys = YAML::Clone(yaml);
-    phys.remove("static_disorder");
-    for (const char* task : {"dynamics", "absorption", "2des"}) {
-        if (phys[task] && phys[task].IsMap()) phys[task].remove("output");
+// "Same physics?" fingerprint. Keeps exactly what changes the numbers this
+// task produces — `system`, `bath`, `filter` (minus its `log_per_slot` print
+// knob) and the ONE task block being run (minus `output`, `print_interval`,
+// `batch`) — canonicalises it and FNV-1a's the result. Everything else is
+// dropped by construction: the other two task blocks (editing `dynamics.dt`
+// must not fork an absorption MC group), the disorder-owned `static_disorder`
+// block (tracked by disorder_identity), and print/batch/output knobs (they
+// move bytes around, not physics). Stable across comment/whitespace/key-order
+// edits. `task == nullptr` (load_yaml, task not yet known) hashes the shared
+// core only; resolve_<task>_config() replaces it with the task-scoped hash.
+// Mirrored byte-for-byte by heom-tools/heom_tools/common/config_hash.py; the two
+// are pinned together by a shared golden vector in both test suites.
+static std::string physics_hash(const YAML::Node& yaml, const char* task) {
+    YAML::Node phys;
+    for (const char* key : {"system", "bath", "filter"}) {
+        if (yaml[key]) phys[key] = YAML::Clone(yaml[key]);
+    }
+    if (phys["filter"] && phys["filter"].IsMap()) phys["filter"].remove("log_per_slot");
+    if (task && yaml[task]) {
+        YAML::Node blk = YAML::Clone(yaml[task]);
+        if (blk.IsMap()) {
+            for (const char* knob : {"output", "print_interval", "batch"}) blk.remove(knob);
+        }
+        phys[task] = blk;
     }
     std::string canon;
     canonical_yaml(phys, canon);
@@ -198,11 +281,12 @@ static void parse_dipoles(const YAML::Node& sys, Config& cfg) {
     double strength_sum = 0.0;
     for (int i = 0; i < n_states; ++i) {
         auto d = dipoles_yaml[i];
+        const std::string where = at("system.dipoles", i);
         if (!d.IsSequence() || d.size() != 3)
-            throw std::runtime_error("system.dipoles[" + std::to_string(i) +
-                                     "] must be a 3-vector [dx, dy, dz]");
+            throw std::runtime_error(where + " must be a 3-vector [dx, dy, dz]");
         std::array<double, 3> v = {
-            d[0].as<double>(), d[1].as<double>(), d[2].as<double>()
+            decode<double>(d[0], at(where, 0)), decode<double>(d[1], at(where, 1)),
+            decode<double>(d[2], at(where, 2))
         };
         const double norm = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
         if (norm < 1e-12)
@@ -216,7 +300,7 @@ static void parse_dipoles(const YAML::Node& sys, Config& cfg) {
             v[0] /= norm; v[1] /= norm; v[2] /= norm;
         }
         cfg.physics.dipoles[i]   = v;
-        cfg.physics.strengths[i] = strengths_yaml[i].as<double>();
+        cfg.physics.strengths[i] = decode<double>(strengths_yaml[i], at("system.strengths", i));
         if (cfg.physics.strengths[i] < 0.0)
             throw std::runtime_error("system.strengths[" + std::to_string(i) +
                                      "] must be >= 0");
@@ -234,24 +318,20 @@ static void parse_dipoles(const YAML::Node& sys, Config& cfg) {
 // captured here.
 static void parse_system(const YAML::Node& sys, Config& cfg,
                          Eigen::MatrixXcd& H_site_cm_out) {
-    if (!sys["n_states"])
-        throw std::runtime_error("Missing required field: system.n_states");
-    cfg.physics.n_states = sys["n_states"].as<int>();
+    cfg.physics.n_states = require<int>(sys, "n_states", "system.n_states");
 
     // basis is task-driven: production yamls omit it and each task picks one
     // (resolve_<task>_config -> apply_basis; 2des builds two). An explicit
     // system.basis: is still honored as the initial/default basis (handy for
     // tests and direct SystemContext use); a task resolver may override it.
-    cfg.physics.basis = BasisType::EXCITED_ONLY;
-    if (sys["basis"]) {
-        std::string basis_str = sys["basis"].as<std::string>();
-        if (basis_str == "excited_only")        cfg.physics.basis = BasisType::EXCITED_ONLY;
-        else if (basis_str == "with_ground")    cfg.physics.basis = BasisType::WITH_GROUND;
-        else if (basis_str == "double_excited") cfg.physics.basis = BasisType::DOUBLE_EXCITED;
-        else throw std::runtime_error("Invalid basis type: " + basis_str);
-    }
+    const std::string basis_str =
+        get_or<std::string>(sys, "basis", "system.basis", "excited_only");
+    if (basis_str == "excited_only")        cfg.physics.basis = BasisType::EXCITED_ONLY;
+    else if (basis_str == "with_ground")    cfg.physics.basis = BasisType::WITH_GROUND;
+    else if (basis_str == "double_excited") cfg.physics.basis = BasisType::DOUBLE_EXCITED;
+    else throw std::runtime_error("Invalid basis type: " + basis_str);
 
-    cfg.physics.temperature_K = sys["temperature"].as<double>();
+    cfg.physics.temperature_K = require<double>(sys, "temperature", "system.temperature");
     cfg.physics.temperature = cfg.physics.temperature_K * BOLTZMANN;
 
     int n_states = cfg.physics.n_states;
@@ -266,23 +346,36 @@ static void parse_system(const YAML::Node& sys, Config& cfg,
         if (!row.IsSequence() || row.size() != static_cast<size_t>(n_states))
             throw std::runtime_error("Hamiltonian row " + std::to_string(i) + " size mismatch");
         for (int j = 0; j < n_states; ++j)
-            H_excited_cm(i, j) = row[j].as<double>();
+            H_excited_cm(i, j) = decode<double>(row[j], at(at("system.hamiltonian", i), j));
     }
 
     // w0 captured here, but applied later in build_effective_hamiltonian so it
     // references the reorg-shifted (H_eff) diagonal, not the bare H_S.
-    cfg.physics.w0_cm = sys["w0"] ? sys["w0"].as<double>() : 0.0;
+    cfg.physics.w0_cm = get_or<double>(sys, "w0", "system.w0", 0.0);
 
     // Optional transition dipoles (system property; spectroscopy tasks require them).
     parse_dipoles(sys, cfg);
+    check_keys(sys, "system", {"n_states", "basis", "temperature", "hamiltonian", "w0",
+                               "dipoles", "strengths"});
 
     H_site_cm_out = std::move(H_excited_cm);  // bare site-basis (cm^-1); finalized later
 }
 
+// λ_n = η_n/2 + Σ_m S_m ω₀m  (cm⁻¹). Reorganization of the WHOLE J_n, used
+// both to shift H_S and to print. One formula; print_summary cannot drift.
+static double site_reorg_cm(const BathSite& s) {
+    double vib = 0.0;
+    for (const VibMode& v : s.modes) vib += v.huang_rhys * v.omega_cm;
+    return 0.5 * s.eta_cm + vib;
+}
+
 // Builds the effective system Hamiltonian and commits it to cfg.physics.hamiltonian.
 //
-//   H_eff = H_S + H_reorg ,   H_reorg = Σ_n λ_n |n⟩⟨n| ,   λ_n = η_n / 2
+//   H_eff = H_S + H_reorg ,   H_reorg = Σ_n λ_n |n⟩⟨n| ,   λ_n = η_n/2 + Σ_m S_m ω₀m
 //
+// λ_n is the reorganization energy of the WHOLE J_n(ω) = (1/π)∫J_n/ω: the Drude
+// half-eta plus one S*omega_0 per underdamped vibrational mode. Without modes
+// the second sum is exactly 0.0 (bit-identical energies).
 // H_reorg is diagonal in the site basis, so λ_n is just added to site n's energy
 // BEFORE the w0 shift (w0 now references the reorg-shifted physical energy).
 // expand_hamiltonian then propagates λ correctly into every basis with no special
@@ -293,8 +386,11 @@ static void parse_system(const YAML::Node& sys, Config& cfg,
 // and DO change dynamics and spectra. MUST run after parse_bath (needs per-site η).
 static void build_effective_hamiltonian(Config& cfg, Eigen::MatrixXcd& H_site_cm) {
     const int n_states = cfg.physics.n_states;
-    for (int n = 0; n < n_states; ++n)
-        H_site_cm(n, n) += 0.5 * cfg.physics.bath_sites[n].eta_cm;  // + λ_n  (reorg)
+    cfg.physics.reorg_cm.resize(n_states);
+    for (int n = 0; n < n_states; ++n) {
+        cfg.physics.reorg_cm[n] = site_reorg_cm(cfg.physics.bath_sites[n]);
+        H_site_cm(n, n) += cfg.physics.reorg_cm[n];
+    }
     for (int i = 0; i < n_states; ++i)
         H_site_cm(i, i) -= cfg.physics.w0_cm;                       // − w0   (vs H_eff)
     // Store the finalized site-basis H (a.u.) but DON'T expand yet — the basis
@@ -303,14 +399,62 @@ static void build_effective_hamiltonian(Config& cfg, Eigen::MatrixXcd& H_site_cm
 }
 
 // Build / override one BathSite from raw (cm/fs) inputs, recomputing a.u.
-static void set_bath_site(BathSite& s, double eta_cm, double gamma_inverse_fs) {
+static void set_bath_site(BathSite& s, double eta_cm, double gamma_inverse_fs,
+                          int n_extra_poles) {
     if (gamma_inverse_fs <= 0.0)
         throw std::runtime_error("bath.gamma_inverse must be > 0 (got " +
                                  std::to_string(gamma_inverse_fs) + ")");
+    if (n_extra_poles < 0 || n_extra_poles > 50)
+        throw std::runtime_error("bath.n_extra_poles must be in [0, 50] (got " +
+                                 std::to_string(n_extra_poles) + ")");
     s.eta_cm            = eta_cm;
     s.eta_au            = eta_cm * CM_TO_AU;
     s.gamma_inverse_fs  = gamma_inverse_fs;
     s.gamma_au          = 1.0 / (gamma_inverse_fs * FS_TO_AU);
+    s.n_extra_poles     = n_extra_poles;
+}
+
+// One `vibrational_modes:` list entry → VibMode (units only; the physical
+// gates γ < ω₀, ω₁/ω₀ ≥ 1e-3, S > 0 live in physics_utils::set_bo_pair so a
+// PhysicalParameters built without the parser is checked the same way).
+// gamma_inverse is 1/γ in fs with γ the C(t) decay rate — the same meaning as
+// the Drude key. The mode's Lorentzian FWHM is 2γ.
+static VibMode parse_vib_mode(const YAML::Node& node, const std::string& where) {
+    if (!node.IsMap())
+        throw std::runtime_error(where + ": each vibrational mode must be a map "
+                                 "{omega_cm, huang_rhys, gamma_inverse}");
+    for (const auto& f : node) {
+        const std::string key = f.first.as<std::string>();
+        if (key != "omega_cm" && key != "huang_rhys" && key != "gamma_inverse")
+            throw std::runtime_error(where + ": unknown vibrational mode field '" + key
+                + "'. Legal keys: omega_cm / huang_rhys / gamma_inverse (C(t) decay "
+                  "time 1/γ in fs; FWHM_cm = 2γ_cm = 2·5308.8 / gamma_inverse).");
+    }
+    VibMode v;
+    v.omega_cm         = require<double>(node, "omega_cm",      where + ".omega_cm");
+    v.huang_rhys       = require<double>(node, "huang_rhys",    where + ".huang_rhys");
+    v.gamma_inverse_fs = require<double>(node, "gamma_inverse", where + ".gamma_inverse");
+    if (v.omega_cm <= 0.0)
+        throw std::runtime_error(where + ": omega_cm must be > 0");
+    if (v.huang_rhys <= 0.0)
+        throw std::runtime_error(where + ": huang_rhys must be > 0 (got "
+                                 + std::to_string(v.huang_rhys) + ")");
+    if (v.gamma_inverse_fs <= 0.0)
+        throw std::runtime_error(where + ": gamma_inverse must be > 0 (got "
+                                 + std::to_string(v.gamma_inverse_fs) + ")");
+    v.omega_au  = v.omega_cm * CM_TO_AU;
+    v.lambda_au = v.huang_rhys * v.omega_au;
+    v.gamma_au  = 1.0 / (v.gamma_inverse_fs * FS_TO_AU);
+    return v;
+}
+
+static std::vector<VibMode> parse_vib_modes(const YAML::Node& list, const std::string& where) {
+    if (!list.IsSequence())
+        throw std::runtime_error(where + ": vibrational_modes must be a list");
+    std::vector<VibMode> out;
+    for (size_t i = 0; i < list.size(); ++i)
+        out.push_back(parse_vib_mode(list[i], where + "[" + std::to_string(i) + "]"));
+    return out;
 }
 
 static void parse_bath(const YAML::Node& bath, Config& cfg) {
@@ -325,7 +469,8 @@ static void parse_bath(const YAML::Node& bath, Config& cfg) {
             "declare which numerical bath-correlation scheme it intends. See "
             "config/fmo.yaml for an example.");
     }
-    std::string method = bath["expansion_method"].as<std::string>();
+    const std::string method = require<std::string>(bath, "expansion_method",
+                                                    "bath.expansion_method");
     if (method == "pade") {
         cfg.physics.expansion = BathExpansion::PADE;
     } else if (method == "matsubara") {
@@ -336,10 +481,7 @@ static void parse_bath(const YAML::Node& bath, Config& cfg) {
             + method + "').");
     }
 
-    if (!bath["n_extra_poles"]) {
-        throw std::runtime_error("bath.n_extra_poles is required");
-    }
-    cfg.physics.n_extra_poles = bath["n_extra_poles"].as<int>();
+    cfg.physics.n_extra_poles = require<int>(bath, "n_extra_poles", "bath.n_extra_poles");
     if (cfg.physics.n_extra_poles < 0 || cfg.physics.n_extra_poles > 50) {
         throw std::runtime_error("bath.n_extra_poles must be in [0, 50]");
     }
@@ -352,12 +494,16 @@ static void parse_bath(const YAML::Node& bath, Config& cfg) {
             "bath.L_cutoff is required (occupation cutoff, "
             "Σα := Σ_{n,k} α_{n,k} ≤ L_cutoff). Note: this key moved from the "
             "removed 'truncation:' block into 'bath:'.");
-    cfg.L_cutoff = bath["L_cutoff"].as<int>();
-    // Snapshot; compute_bath_correlation will reset n_bath_modes_total to its
-    // final value (== n_extra_poles; there is no extra slot). Set here so a
-    // build that skips compute (none currently) still has a sane runtime mode
-    // count.
-    cfg.physics.n_bath_modes_total = cfg.physics.n_extra_poles;
+    cfg.L_cutoff = require<int>(bath, "L_cutoff", "bath.L_cutoff");
+
+    // The Drude-Lorentz form is the only overdamped J(ω) implemented; the key
+    // is optional, but a different value would be a model this code ignores.
+    const std::string jw = get_or<std::string>(bath, "spectral_density",
+                                               "bath.spectral_density", "Drude-Lorentz");
+    if (jw != "Drude-Lorentz")
+        throw std::runtime_error(
+            "bath.spectral_density: only 'Drude-Lorentz' is implemented (got '" + jw +
+            "'); underdamped modes go in bath.vibrational_modes");
 
     // static_disorder_fwhm is no longer supported — reject on presence (any value).
     if (bath["static_disorder_fwhm"])
@@ -367,45 +513,59 @@ static void parse_bath(const YAML::Node& bath, Config& cfg) {
             "via Monte Carlo on the Hamiltonian diagonal. Delete this key.");
 
     // --- Default per-site physics (applied to every site without an override) ---
-    const double def_eta   = bath["eta"].as<double>();
-    const double def_ginv  = bath["gamma_inverse"].as<double>();
+    const double def_eta   = require<double>(bath, "eta",           "bath.eta");
+    const double def_ginv  = require<double>(bath, "gamma_inverse", "bath.gamma_inverse");
+    const std::vector<VibMode> def_modes = bath["vibrational_modes"]
+        ? parse_vib_modes(bath["vibrational_modes"], "bath.vibrational_modes")
+        : std::vector<VibMode>{};
 
     const int n_bath = cfg.physics.n_states;
     cfg.physics.bath_sites.assign(n_bath, BathSite{});
-    for (auto& s : cfg.physics.bath_sites)
-        set_bath_site(s, def_eta, def_ginv);
+    for (auto& s : cfg.physics.bath_sites) {
+        set_bath_site(s, def_eta, def_ginv, cfg.physics.n_extra_poles);
+        s.modes = def_modes;
+    }
 
     // --- Optional per-site overrides: sites: { <1-based idx>: {fields...} } ---
+    // A key that is absent inherits the bath-level default; a present
+    // vibrational_modes list REPLACES the default list (it does not append).
     if (bath["sites"]) {
         const YAML::Node& sites = bath["sites"];
         if (!sites.IsMap())
             throw std::runtime_error("bath.sites must be a map keyed by 1-based "
                                      "pigment index, e.g. `3: { eta: 35.0 }`.");
         for (const auto& kv : sites) {
-            const int idx1 = kv.first.as<int>();
+            const int idx1 = decode<int>(kv.first, "bath.sites key");
             if (idx1 < 1 || idx1 > n_bath)
                 throw std::runtime_error(
                     "bath.sites key " + std::to_string(idx1) +
                     " out of range [1, " + std::to_string(n_bath) + "].");
             const YAML::Node& ov = kv.second;
-            // Only per-site physics fields allowed; the numerical knobs are global.
+            const std::string where = "bath.sites[" + std::to_string(idx1) + "]";
             for (const auto& f : ov) {
                 const std::string key = f.first.as<std::string>();
-                if (key != "eta" && key != "gamma_inverse")
+                if (key != "eta" && key != "gamma_inverse" && key != "n_extra_poles"
+                    && key != "vibrational_modes")
                     throw std::runtime_error(
-                        "bath.sites[" + std::to_string(idx1) + "] has unknown "
-                        "field '" + key + "'. Only eta / gamma_inverse "
-                        "may be overridden per site "
-                        "(expansion_method / n_extra_poles are global).");
+                        where + " has unknown field '" + key + "'. Only eta / "
+                        "gamma_inverse / n_extra_poles / vibrational_modes may be "
+                        "overridden per site (expansion_method / L_cutoff are global).");
             }
             BathSite& s = cfg.physics.bath_sites[idx1 - 1];
-            const double eta  = ov["eta"] ? ov["eta"].as<double>() : s.eta_cm;
-            const double ginv = ov["gamma_inverse"]
-                                    ? ov["gamma_inverse"].as<double>()
-                                    : s.gamma_inverse_fs;
-            set_bath_site(s, eta, ginv);
+            const double eta  = get_or<double>(ov, "eta", where + ".eta", s.eta_cm);
+            const double ginv = get_or<double>(ov, "gamma_inverse", where + ".gamma_inverse",
+                                               s.gamma_inverse_fs);
+            const int K_n = get_or<int>(ov, "n_extra_poles", where + ".n_extra_poles",
+                                        s.n_extra_poles);
+            set_bath_site(s, eta, ginv, K_n);
+            if (ov["vibrational_modes"])
+                s.modes = parse_vib_modes(ov["vibrational_modes"],
+                                          where + ".vibrational_modes");
         }
     }
+    check_keys(bath, "bath", {"expansion_method", "n_extra_poles", "L_cutoff",
+                              "spectral_density", "eta", "gamma_inverse",
+                              "vibrational_modes", "sites"});
 
     compute_bath_correlation(cfg.physics);
 }
@@ -427,7 +587,8 @@ static void parse_sink(const YAML::Node& dyn, Config& cfg) {
     }
 
     auto sink = dyn["sink"];
-    sink_cfg.enabled = sink["enabled"].as<bool>(false);
+    check_keys(sink, "dynamics.sink", {"enabled", "target_site", "rate"});
+    sink_cfg.enabled = get_or<bool>(sink, "enabled", "dynamics.sink.enabled", false);
 
     if (!sink_cfg.enabled) {
         sink_cfg.gamma = 0.0;
@@ -436,14 +597,12 @@ static void parse_sink(const YAML::Node& dyn, Config& cfg) {
         return;
     }
 
-    int user_site = sink["target_site"].as<int>();
+    int user_site = require<int>(sink, "target_site", "dynamics.sink.target_site");
     if (user_site < 1 || user_site > cfg.physics.n_states)
         throw std::runtime_error("target_site (" + std::to_string(user_site) +
                                  ") out of range [1, " + std::to_string(cfg.physics.n_states) + "]");
-    sink_cfg.site = (cfg.physics.basis == BasisType::EXCITED_ONLY)
-        ? user_site - 1
-        : user_site;
-    sink_cfg.gamma_fs = sink["rate"].as<double>();
+    sink_cfg.site = pigment_to_hilbert(user_site, cfg.physics.basis);
+    sink_cfg.gamma_fs = require<double>(sink, "rate", "dynamics.sink.rate");
     if (sink_cfg.gamma_fs <= 0.0) {
         throw std::runtime_error("sink.rate must be > 0 when sink.enabled is true (got "
                                  + std::to_string(sink_cfg.gamma_fs) + ")");
@@ -453,8 +612,8 @@ static void parse_sink(const YAML::Node& dyn, Config& cfg) {
 
 // Parse the `filter:` block. `enabled` is the explicit on/off switch: when
 // false, every knob is left at its default (no "set four things to 0"
-// ceremony). When true, tolerance/start_step/warmup_factor/ulist are validated
-// inline (fail loud at parse). The ulist sub-feature still uses 0 = off.
+// ceremony). When true, tolerance/ulist are validated inline (fail loud at
+// parse). The ulist sub-feature still uses 0 = off.
 static void parse_filter(const YAML::Node& f, Config& cfg) {
     if (!f)
         throw std::runtime_error(
@@ -465,25 +624,28 @@ static void parse_filter(const YAML::Node& f, Config& cfg) {
             "filter.enabled is required (true/false). It is the single on/off "
             "switch for ADO filtering; when false the other filter knobs are "
             "ignored.");
-    cfg.filter.enabled = f["enabled"].as<bool>();
+    // Removed keys, rejected on presence even with the filter off: a config
+    // that asks for a warmup must not run without one unnoticed.
+    for (const char* key : {"start_step", "warmup_factor"})
+        if (f[key])
+            throw std::runtime_error(
+                std::string("filter.") + key + " was removed: the filter has one "
+                "threshold for the whole run. Delete the key; to recover the "
+                "accuracy a warmup gave, lower filter.tolerance (about 10x for "
+                "population dynamics). Configs written for heom-gpu <= 2.0.0 keep "
+                "their warmup there. See "
+                "the filter warmup-removal study notes.");
+    check_keys(f, "filter", {"enabled", "tolerance", "ulist", "log_per_slot"});
+    cfg.filter.enabled = require<bool>(f, "enabled", "filter.enabled");
     if (!cfg.filter.enabled) return;   // off ⇒ ignore all knobs, keep defaults
 
-    if (!f["tolerance"])
-        throw std::runtime_error(
-            "filter.tolerance is required when filter.enabled is true "
-            "(ADO max-norm threshold, e.g. 1e-6)");
-    cfg.filter.tolerance     = f["tolerance"].as<double>();
-    cfg.filter.start_step    = f["start_step"].as<int>(10);
-    cfg.filter.warmup_factor = f["warmup_factor"].as<double>(0.1);
-    cfg.filter.ulist_tau     = f["ulist"].as<double>(0.0);
-    cfg.filter.log_per_slot  = f["log_per_slot"].as<bool>(false);
+    cfg.filter.tolerance     = require<double>(f, "tolerance",
+        "filter.tolerance (ADO max-norm threshold, e.g. 1e-6; needed when filter.enabled)");
+    cfg.filter.ulist_tau     = get_or<double>(f, "ulist", "filter.ulist", 0.0);
+    cfg.filter.log_per_slot  = get_or<bool>(f, "log_per_slot", "filter.log_per_slot", false);
 
     if (cfg.filter.tolerance <= 0.0)
         throw std::runtime_error("filter.tolerance must be > 0 when enabled");
-    if (cfg.filter.start_step <= 0)
-        throw std::runtime_error("filter.start_step must be > 0 when enabled");
-    if (cfg.filter.warmup_factor <= 0.0 || cfg.filter.warmup_factor > 1.0)
-        throw std::runtime_error("filter.warmup_factor must be in (0, 1] when enabled");
     if (cfg.filter.ulist_tau < 0.0 || cfg.filter.ulist_tau > 1.0)
         throw std::runtime_error("filter.ulist must be in [0, 1] (0 = off)");
 }
@@ -497,23 +659,20 @@ static void parse_filter(const YAML::Node& f, Config& cfg) {
 static void parse_site_excitation(const YAML::Node& node,
                                   const Config& cfg,
                                   InitialState& init) {
+    check_keys(node, "dynamics.initial_state", {"type", "excited_site"});
     // User input is 1-based PHYSICAL pigment index (consistent with sink.target_site).
-    // Mapping to internal 0-based Hilbert index depends on basis:
-    //   EXCITED_ONLY            : pigment k → Hilbert k-1
-    //   WITH_GROUND / DOUBLE_*  : ground at index 0, pigment k → Hilbert k
-    int user_site = node["excited_site"].as<int>();
+    int user_site = require<int>(node, "excited_site", "dynamics.initial_state.excited_site");
     if (user_site < 1 || user_site > cfg.physics.n_states)
         throw std::runtime_error("excited_site (" + std::to_string(user_site) +
             ") out of range [1, " + std::to_string(cfg.physics.n_states) + "]");
-    init.excited_site = (cfg.physics.basis == BasisType::EXCITED_ONLY)
-        ? user_site - 1
-        : user_site;
+    init.excited_site = pigment_to_hilbert(user_site, cfg.physics.basis);
 }
 
 static void parse_exciton_excitation(const YAML::Node& node,
                                      const Config& cfg,
                                      InitialState& init) {
-    int user_idx = node["exciton_index"].as<int>();
+    check_keys(node, "dynamics.initial_state", {"type", "exciton_index"});
+    int user_idx = require<int>(node, "exciton_index", "dynamics.initial_state.exciton_index");
     if (cfg.physics.basis == BasisType::DOUBLE_EXCITED) {
         throw std::runtime_error(
             "exciton_excitation is not supported for basis=double_excited; "
@@ -523,14 +682,15 @@ static void parse_exciton_excitation(const YAML::Node& node,
         throw std::runtime_error("exciton_index (" + std::to_string(user_idx) +
             ") out of single-exciton range [1, " +
             std::to_string(cfg.physics.n_states) + "]");
-    init.exciton_index = (cfg.physics.basis == BasisType::EXCITED_ONLY)
-        ? user_idx - 1
-        : user_idx;  // WITH_GROUND: skip ground at eigenvector/Hilbert index 0.
+    init.exciton_index = pigment_to_hilbert(user_idx, cfg.physics.basis);
 }
 
 static void parse_coherent(const YAML::Node& node,
                            const Config& cfg,
                            InitialState& init) {
+    check_keys(node, "dynamics.initial_state",
+               {"type", "coherent_coefficients", "coherent_format"});
+    const std::string where = "dynamics.initial_state.coherent_coefficients";
     auto coeffs = node["coherent_coefficients"];
     if (!coeffs.IsSequence())
         throw std::runtime_error("coherent_coefficients must be a list");
@@ -542,7 +702,8 @@ static void parse_coherent(const YAML::Node& node,
     // otherwise auto-detect by checking if first element is a sequence.
     bool complex_format;
     if (node["coherent_format"]) {
-        std::string fmt = node["coherent_format"].as<std::string>();
+        const std::string fmt = decode<std::string>(node["coherent_format"],
+                                                    "dynamics.initial_state.coherent_format");
         if (fmt == "complex")          complex_format = true;
         else if (fmt == "probability") complex_format = false;
         else throw std::runtime_error("coherent_format must be 'complex' or 'probability', got: " + fmt);
@@ -556,8 +717,8 @@ static void parse_coherent(const YAML::Node& node,
         for (size_t i = 0; i < n; ++i) {
             if (!coeffs[i].IsSequence() || coeffs[i].size() != 2)
                 throw std::runtime_error("coherent_coefficients[" + std::to_string(i) + "] must be [re, im]");
-            double re = coeffs[i][0].as<double>();
-            double im = coeffs[i][1].as<double>();
+            const double re = decode<double>(coeffs[i][0], at(at(where, i), 0));
+            const double im = decode<double>(coeffs[i][1], at(at(where, i), 1));
             init.coherent_coeffs[i] = std::complex<double>(re, im);
             norm_sq += re * re + im * im;
         }
@@ -570,7 +731,7 @@ static void parse_coherent(const YAML::Node& node,
         // Legacy format: [p1, p2, ...] — real probabilities, convert to amplitudes
         double sum_p = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            double p = coeffs[i].as<double>();
+            const double p = decode<double>(coeffs[i], at(where, i));
             if (p < 0.0) throw std::runtime_error("coherent_coefficients must be non-negative");
             sum_p += p;
             init.coherent_coeffs[i] = std::complex<double>(p, 0.0);
@@ -590,6 +751,7 @@ static void parse_coherent(const YAML::Node& node,
 static void parse_custom_matrix(const YAML::Node& node,
                                 const Config& cfg,
                                 InitialState& init) {
+    check_keys(node, "dynamics.initial_state", {"type", "matrix_elements"});
     int N = cfg.physics.n_sites;
     init.custom_matrix = Eigen::MatrixXcd::Zero(N, N);
 
@@ -599,11 +761,12 @@ static void parse_custom_matrix(const YAML::Node& node,
 
     for (size_t idx = 0; idx < elems.size(); ++idx) {
         auto e = elems[idx];
+        const std::string where = at("dynamics.initial_state.matrix_elements", idx);
         if (!e.IsSequence() || e.size() < 2)
             throw std::runtime_error("matrix_elements[" + std::to_string(idx) + "] format error");
 
-        int i = e[0].as<int>() - 1;
-        int j = e[1].as<int>() - 1;
+        int i = decode<int>(e[0], at(where, 0)) - 1;
+        int j = decode<int>(e[1], at(where, 1)) - 1;
 
         if (i < 0 || i >= N || j < 0 || j >= N)
             throw std::runtime_error("matrix_elements[" + std::to_string(idx) + "] index out of range");
@@ -612,9 +775,10 @@ static void parse_custom_matrix(const YAML::Node& node,
 
         std::complex<double> val;
         if (e[2].IsScalar()) {
-            val = std::complex<double>(e[2].as<double>(), 0.0);
+            val = std::complex<double>(decode<double>(e[2], at(where, 2)), 0.0);
         } else if (e[2].IsSequence() && e[2].size() == 2) {
-            val = std::complex<double>(e[2][0].as<double>(), e[2][1].as<double>());
+            val = std::complex<double>(decode<double>(e[2][0], at(at(where, 2), 0)),
+                                       decode<double>(e[2][1], at(at(where, 2), 1)));
         } else {
             throw std::runtime_error("matrix_elements[" + std::to_string(idx) + "] value format error");
         }
@@ -633,7 +797,7 @@ static void parse_custom_matrix(const YAML::Node& node,
 static void parse_initial_state(const YAML::Node& node,
                                 const Config& cfg,
                                 InitialState& init) {
-    std::string type_str = node["type"].as<std::string>();
+    std::string type_str = require<std::string>(node, "type", "dynamics.initial_state.type");
 
     if (type_str == "site_excitation") {
         init.type = InitialState::Type::SITE_EXCITATION;
@@ -657,7 +821,7 @@ static void parse_initial_state(const YAML::Node& node,
 //
 // Direction normalisation contract:
 //   - ‖d‖ < 1e-12   -> hard error (zero-dipole pigment is meaningless input;
-//                      a separate check handles a *runtime-time* zero direction in
+//                      A runtime-time zero direction in
 //                      compute_linear_response, not a per-pigment zero in YAML)
 //   - |‖d‖ - 1| > 1e-6 -> warn + auto-normalise (user wrote a non-unit vector;
 //                         strengths are meant to carry the magnitude)
@@ -668,19 +832,24 @@ static void parse_initial_state(const YAML::Node& node,
 // checked later in resolve_2des_config (dt is not known here).
 static void expand_tw_entry(const std::string& s, std::vector<double>& out) {
     auto bad = [&](const char* why) {
-        throw std::runtime_error("spectroscopy.tw entry \"" + s + "\": " + why);
+        throw std::runtime_error("2des.tw entry \"" + s + "\": " + why);
     };
     std::vector<std::string> tok;
     std::string cur;
     std::stringstream ss(s);
     while (std::getline(ss, cur, ':')) tok.push_back(cur);
+    auto num = [&](const std::string& t) {
+        const double v = std::stod(t);
+        if (!std::isfinite(v)) bad("values must be finite");
+        return v;
+    };
     try {
         if (tok.size() == 1) {
-            out.push_back(std::stod(tok[0]));
+            out.push_back(num(tok[0]));
         } else if (tok.size() == 3) {
-            const double start = std::stod(tok[0]);
-            const double step  = std::stod(tok[1]);
-            const double stop  = std::stod(tok[2]);
+            const double start = num(tok[0]);
+            const double step  = num(tok[1]);
+            const double stop  = num(tok[2]);
             if (step <= 0.0)   bad("step must be > 0");
             if (stop < start)  bad("stop must be >= start");
             const double n = (stop - start) / step;
@@ -701,9 +870,18 @@ static void expand_tw_entry(const std::string& s, std::vector<double>& out) {
 static std::vector<double> expand_tw_schedule(const YAML::Node& tw) {
     std::vector<double> out;
     if (tw.IsSequence())
-        for (const auto& it : tw) expand_tw_entry(it.as<std::string>(), out);
+        for (size_t i = 0; i < tw.size(); ++i)
+            expand_tw_entry(decode<std::string>(tw[i], at("2des.tw", i)), out);
     else
-        expand_tw_entry(tw.as<std::string>(), out);
+        expand_tw_entry(decode<std::string>(tw, "2des.tw"), out);
+    return out;
+}
+
+static std::vector<std::string> string_list(const YAML::Node& list, const std::string& path) {
+    if (!list.IsSequence()) throw std::runtime_error(path + " must be a list");
+    std::vector<std::string> out;
+    for (size_t i = 0; i < list.size(); ++i)
+        out.push_back(decode<std::string>(list[i], at(path, i)));
     return out;
 }
 
@@ -711,42 +889,66 @@ static std::vector<double> expand_tw_schedule(const YAML::Node& tw) {
 // Dipoles/strengths are NOT here (they are system.dipoles, parsed by
 // parse_dipoles). resolve_2des_config validates spacing/divisibility and fills
 // defaults for pathways/signals/tw afterwards.
+// The four axis parameters are required: a missing tau_max used to default to
+// 0 and the run "succeeded" with a one-point axis.
 static void parse_2des_axes(const YAML::Node& node, TwoDESConfig& spec) {
-    auto rd = [&](const char* k, double& dst) {
-        if (node[k]) dst = node[k].as<double>();
-    };
-    rd("tau_max", spec.tau_max);  rd("dtau", spec.dtau);
-    rd("t_max",   spec.t_max);    rd("dt_detect", spec.dt_detect);
+    spec.tau_max   = require<double>(node, "tau_max",   "2des.tau_max");
+    spec.dtau      = require<double>(node, "dtau",      "2des.dtau");
+    spec.t_max     = require<double>(node, "t_max",     "2des.t_max");
+    spec.dt_detect = require<double>(node, "dt_detect", "2des.dt_detect");
     if (node["tw"]) spec.tw_fs = expand_tw_schedule(node["tw"]);
-    if (node["pathways"])
-        for (const auto& p : node["pathways"]) spec.pathways.push_back(p.as<std::string>());
-    if (node["signals"])
-        for (const auto& s : node["signals"])  spec.signals.push_back(s.as<std::string>());
+    if (node["pathways"]) spec.pathways = string_list(node["pathways"], "2des.pathways");
+    if (node["signals"])  spec.signals  = string_list(node["signals"],  "2des.signals");
     // 'isotropic' is the only supported orientation model. The old 'none'
     // (single lab=mol, μx+μy+μz) was a non-physical debug shortcut — removed;
     // smoke-test with a small tau/t grid instead.
-    if (node["orientation"]) {
-        const auto o = node["orientation"].as<std::string>();
-        if (o != "isotropic")
-            throw std::runtime_error(
-                "2des.orientation: only 'isotropic' is supported (got '" + o +
-                "'); the 'none' shortcut was removed — use a small grid to smoke-test");
+    const auto o = get_or<std::string>(node, "orientation", "2des.orientation", "isotropic");
+    if (o != "isotropic")
+        throw std::runtime_error(
+            "2des.orientation: only 'isotropic' is supported (got '" + o +
+            "'); the 'none' shortcut was removed — use a small grid to smoke-test");
+    // Removed key: the B=1 path is always the reuse walk now,
+    // and a key that used to pick the walk but no longer does must not be
+    // silently accepted — the user would believe it still means something.
+    if (node["orient_reuse"])
+        throw std::runtime_error(
+            "2des.orient_reuse was removed: the B=1 walk is always the 3->9->21 "
+            "reuse walk (the flat 21-tree is gone). Delete the key; use "
+            "2des.batch: true for the B=21 lockstep walk");
+    // Walk width: true/false keep their meaning (21 / 1);
+    // auto → kTwoDESBatchAuto (resolved in compute_2des). Not in config_hash;
+    // write_2des records the resolved width from TwoDESResult.
+    if (const YAML::Node b = node["batch"]) {
+        if (b.IsScalar() && b.Scalar() == "auto") {
+            spec.batch = kTwoDESBatchAuto;
+        } else {
+            int w = 0;
+            try { w = b.as<int>(); }
+            catch (const YAML::Exception&) {
+                w = decode<bool>(b, "2des.batch") ? 21 : 1;
+            }
+            if (w != 1 && w != 7 && w != 21)
+                throw std::runtime_error(
+                    "2des.batch: " + b.Scalar() +
+                    " is not a walk width (want true|false|21|7|1|auto)");
+            spec.batch = w;
+        }
     }
-    if (node["orient_reuse"]) spec.orient_reuse = node["orient_reuse"].as<bool>();
-    if (node["batch"]) spec.batch = node["batch"].as<bool>();
 }
 
 // Parse one `output.<task>` subblock (save_path / filename / use_timestamp /
 // verbose_memory) into an OutputConfig.
-static OutputConfig parse_output_block(const YAML::Node& blk) {
+static OutputConfig parse_output_block(const YAML::Node& blk, const char* task) {
+    const std::string where = std::string(task) + ".output";
     OutputConfig oc;
-    oc.save_path = blk["save_path"].as<std::string>();
+    oc.save_path = require<std::string>(blk, "save_path", where + ".save_path");
     if (!oc.save_path.empty() && oc.save_path.back() != '/')
         oc.save_path += '/';
-    oc.filename = blk["filename"].as<std::string>("auto");
-    oc.use_timestamp = blk["use_timestamp"].as<bool>(true);
+    oc.filename = get_or<std::string>(blk, "filename", where + ".filename", "auto");
+    oc.use_timestamp = get_or<bool>(blk, "use_timestamp", where + ".use_timestamp", true);
     // Optional, default false (compact budget print).
-    oc.verbose_memory = blk["verbose_memory"].as<bool>(false);
+    oc.verbose_memory = get_or<bool>(blk, "verbose_memory", where + ".verbose_memory", false);
+    check_keys(blk, where, {"save_path", "filename", "use_timestamp", "verbose_memory"});
     return oc;
 }
 
@@ -759,7 +961,7 @@ static void parse_task_output(const YAML::Node& task_blk, const char* task,
         throw std::runtime_error(
             std::string("'") + task + "' task requires an 'output:' sub-block "
             "inside the '" + task + ":' section (save_path is required)");
-    cfg.output = parse_output_block(task_blk["output"]);
+    cfg.output = parse_output_block(task_blk["output"], task);
 }
 
 // Parse the REQUIRED per-task `integrator` key. "rk4" = plain historical path
@@ -773,7 +975,8 @@ static void parse_integrator(const YAML::Node& blk, const char* task,
         throw std::runtime_error(std::string("'") + task +
             "' task requires " + task +
             ".integrator (explicit choice, no default): 'rk4' or 'if-rk4'");
-    const std::string v = blk["integrator"].as<std::string>();
+    const std::string v = require<std::string>(blk, "integrator",
+                                               std::string(task) + ".integrator");
     if (v == "rk4") {
         cfg.time.integrator = Integrator::Rk4;
     } else if (v == "if-rk4") {
@@ -787,18 +990,17 @@ static void parse_integrator(const YAML::Node& blk, const char* task,
 // Parse the per-task time grid for a STEPPED task (dynamics / absorption): dt,
 // n_steps, output_interval are required; print_interval defaults to 0 (off).
 // Validated inline so a bad grid fails at parse, not deep in the solver.
+// n_steps must be a whole number of records: the steps after the last record
+// were propagated, never written, and never checked for divergence, so the
+// run could report success on a state nobody looked at.
 static void parse_stepped_time(const YAML::Node& blk, const char* task,
                                Config& cfg) {
-    for (const char* k : {"dt", "n_steps", "output_interval"}) {
-        if (!blk[k])
-            throw std::runtime_error(
-                std::string("'") + task + "' task requires " + task + "." + k);
-    }
-    cfg.time.dt = blk["dt"].as<double>();
+    const std::string t(task);
+    cfg.time.dt = require<double>(blk, "dt", t + ".dt");
     cfg.time.dt_au = cfg.time.dt * FS_TO_AU;
-    cfg.time.n_steps = blk["n_steps"].as<int>();
-    cfg.time.output_interval = blk["output_interval"].as<int>();
-    cfg.time.print_interval = blk["print_interval"].as<int>(0);
+    cfg.time.n_steps = require<int>(blk, "n_steps", t + ".n_steps");
+    cfg.time.output_interval = require<int>(blk, "output_interval", t + ".output_interval");
+    cfg.time.print_interval = get_or<int>(blk, "print_interval", t + ".print_interval", 0);
 
     if (cfg.time.dt <= 0.0)
         throw std::runtime_error(std::string("'") + task + "'.dt must be > 0");
@@ -808,23 +1010,22 @@ static void parse_stepped_time(const YAML::Node& blk, const char* task,
         cfg.time.output_interval > cfg.time.n_steps)
         throw std::runtime_error(std::string("'") + task +
             "'.output_interval must be in [1, n_steps]");
+    if (cfg.time.n_steps % cfg.time.output_interval != 0)
+        throw std::runtime_error(std::string("'") + task + "'.n_steps (" +
+            std::to_string(cfg.time.n_steps) + ") must be a multiple of output_interval (" +
+            std::to_string(cfg.time.output_interval) + ")");
     if (cfg.time.print_interval < 0)
         throw std::runtime_error(std::string("'") + task +
             "'.print_interval must be >= 0 (0 disables printing)");
-    if (cfg.filter.enabled && cfg.filter.start_step > cfg.time.n_steps)
-        throw std::runtime_error(std::string("'") + task +
-            "': filter.start_step must be <= n_steps");
     parse_integrator(blk, task, cfg);
 }
 
 // Parse the 2DES time grid: only dt / print_interval are meaningful (the driver
 // derives step counts from the τ/t grid). n_steps / output_interval stay 0.
 static void parse_2des_time(const YAML::Node& blk, Config& cfg) {
-    if (!blk["dt"])
-        throw std::runtime_error("'2des' task requires 2des.dt");
-    cfg.time.dt = blk["dt"].as<double>();
+    cfg.time.dt = require<double>(blk, "dt", "2des.dt");
     cfg.time.dt_au = cfg.time.dt * FS_TO_AU;
-    cfg.time.print_interval = blk["print_interval"].as<int>(0);
+    cfg.time.print_interval = get_or<int>(blk, "print_interval", "2des.print_interval", 0);
     cfg.time.n_steps = 0;
     cfg.time.output_interval = 0;
     if (cfg.time.dt <= 0.0)
@@ -841,10 +1042,10 @@ static void parse_2des_time(const YAML::Node& blk, Config& cfg) {
 // (single-shot `heom_solver <task> <cfg>` vs MC `--rank N` / mc-disorder-run).
 static void parse_static_disorder(const YAML::Node& node, Config& cfg) {
     if (!node) return;                       // block absent ⇒ single-shot only
-    const YAML::Node df = node["draws_file"];
-    if (!df) return;                         // block present but no file ⇒ inert
-    const std::string raw = df.as<std::string>();
-    if (raw.empty()) return;
+    check_keys(node, "static_disorder", {"draws_file"});
+    const std::string raw = get_or<std::string>(node, "draws_file",
+                                                "static_disorder.draws_file", "");
+    if (raw.empty()) return;                 // block present but no file ⇒ inert
     std::filesystem::path p(raw);
     cfg.disorder_draws_file = p.is_absolute()
         ? raw
@@ -906,8 +1107,7 @@ std::string resolve_dynamics_auto_filename(const Config& cfg) {
             hilbert_to_pigment(init.excited_site, cfg.physics.basis));
     } else {
         excitation = "exciton" + std::to_string(
-            single_exciton_user_index_1based(init.exciton_index,
-                                             cfg.physics.basis));
+            hilbert_to_pigment(init.exciton_index, cfg.physics.basis));
     }
 
     // Auto-name uses site 0 as the representative (Default for homogeneous runs;
@@ -940,7 +1140,9 @@ Config Config::load_yaml(const std::string& yaml_path) {
         YAML::Node yaml = YAML::Load(cfg.config_yaml);
         // Physics identity, NOT a raw-text hash: stable across comment/format
         // edits (see Config::config_hash). config_yaml keeps the exact input.
-        cfg.config_hash = physics_hash(yaml);
+        // Task not known yet ⇒ shared core (system/bath/filter) only;
+        // resolve_<task>_config() replaces it with the task-scoped hash.
+        cfg.config_hash = physics_hash(yaml, nullptr);
 
         Eigen::MatrixXcd H_site_cm;                 // bare site-basis H_S (cm^-1)
         parse_system(yaml["system"], cfg, H_site_cm);
@@ -957,6 +1159,8 @@ Config Config::load_yaml(const std::string& yaml_path) {
 
         parse_filter(yaml["filter"], cfg);
         parse_static_disorder(yaml["static_disorder"], cfg);
+        check_keys(yaml, "config", {"system", "bath", "filter", "static_disorder",
+                                    "dynamics", "absorption", "fluorescence", "2des"});
 
         // Task blocks (dynamics / absorption / 2des) are NOT parsed here: a
         // single yaml can serve all three, and load_yaml does not know which
@@ -1010,6 +1214,8 @@ void Config::validate() const {
         for (const auto& s : physics.bath_sites) {
             if (s.eta_au <= 0) throw std::runtime_error("bath eta must be > 0 (per site)");
             if (s.gamma_au <= 0) throw std::runtime_error("bath gamma must be > 0 (per site)");
+            if (s.n_extra_poles < 0 || s.n_extra_poles > 50)
+                throw std::runtime_error("n_extra_poles must be in [0, 50] (per site)");
         }
     }
     // Defensive backstop matching parse_bath's range gate (same field, so no
@@ -1034,15 +1240,6 @@ void Config::validate() const {
 // Shared formatting helpers (used by both error messages and print_summary).
 // ---------------------------------------------------------------------------
 
-static const char* basis_to_string(BasisType b) {
-    switch (b) {
-        case BasisType::EXCITED_ONLY:    return "excited_only";
-        case BasisType::WITH_GROUND:     return "with_ground";
-        case BasisType::DOUBLE_EXCITED:  return "double_excited";
-        default: return "unknown";
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Task-level config resolvers. Called from
 // src/main.cpp's task-table dispatch BEFORE SystemContext sys(cfg). The
@@ -1062,16 +1259,21 @@ void apply_basis(Config& cfg, BasisType basis) {
 // carry all three task blocks; load_yaml parsed only the shared blocks, so each
 // resolver pulls exactly its own block here (one task, one parse — no per-task
 // map). Throws if the block is absent.
-static YAML::Node task_block(const Config& cfg, const char* task) {
-    YAML::Node blk = YAML::Load(cfg.config_yaml)[task];
+// Also the one place the task-scoped config_hash is set: every resolver comes
+// through here, so no resolver can forget it.
+static YAML::Node task_block(Config& cfg, const char* task) {
+    YAML::Node yaml = YAML::Load(cfg.config_yaml);
+    YAML::Node blk = yaml[task];
     if (!blk || !blk.IsMap())
         throw std::invalid_argument(
             std::string("'") + task + "' task requires a '" + task +
             ":' section in " + cfg.yaml_path);
+    cfg.config_hash = physics_hash(yaml, task);
     return blk;
 }
 
 void resolve_dynamics_config(Config& cfg) {
+    cfg.task = Config::Task::Dynamics;
     YAML::Node blk = task_block(cfg, "dynamics");
     parse_stepped_time(blk, "dynamics", cfg);
     parse_task_output(blk, "dynamics", cfg);
@@ -1085,6 +1287,8 @@ void resolve_dynamics_config(Config& cfg) {
             "inside the 'dynamics:' section");
     InitialState init{};
     parse_initial_state(blk["initial_state"], cfg, init);
+    check_keys(blk, "dynamics", {"integrator", "dt", "n_steps", "output_interval",
+                                 "print_interval", "output", "sink", "initial_state"});
     cfg.initial = std::move(init);
 
     if (cfg.output.filename == "auto")
@@ -1092,13 +1296,15 @@ void resolve_dynamics_config(Config& cfg) {
 }
 
 void resolve_absorption_config(Config& cfg) {
+    cfg.task = Config::Task::Absorption;
     YAML::Node blk = task_block(cfg, "absorption");
     parse_stepped_time(blk, "absorption", cfg);
     parse_task_output(blk, "absorption", cfg);
     // Batch the ≤3 non-zero polarization directions into one propagation.
     // Default false ⇒ historical serial 3-direction loop, bit-identical.
-    if (blk["batch"])
-        cfg.absorption_batch = blk["batch"].as<bool>();
+    cfg.linear_batch = get_or<bool>(blk, "batch", "absorption.batch", false);
+    check_keys(blk, "absorption", {"integrator", "dt", "n_steps", "output_interval",
+                                   "print_interval", "output", "batch"});
     if (cfg.physics.dipoles.empty())
         throw std::invalid_argument(
             "'absorption' task requires system.dipoles / system.strengths");
@@ -1111,7 +1317,74 @@ void resolve_absorption_config(Config& cfg) {
             + bath_method_suffix(cfg);
 }
 
+// fluorescence.equilibration: every bad value is reported with its key, value
+// and legal range; the intervals must fit the dt grid (equilibrate re-checks).
+static EquilibrationConfig parse_equilibration(const YAML::Node& blk, double dt) {
+    const std::string p = "fluorescence.equilibration";
+    if (!blk || !blk.IsMap())
+        throw std::invalid_argument(
+            "'fluorescence' task requires an 'equilibration:' sub-block (t_max, "
+            "check_interval, tolerance)");
+    EquilibrationConfig eq;
+    eq.t_max_fs          = require<double>(blk, "t_max", p + ".t_max");
+    eq.check_interval_fs = get_or<double>(blk, "check_interval", p + ".check_interval", 50.0);
+    eq.tolerance         = get_or<double>(blk, "tolerance", p + ".tolerance", 1e-6);
+    check_keys(blk, p, {"t_max", "check_interval", "tolerance"});
+
+    auto bad = [&](const char* key, double v, const std::string& rule) {
+        std::ostringstream os;
+        os << p << "." << key << " = " << v << ": " << rule;
+        throw std::invalid_argument(os.str());
+    };
+    if (!(eq.t_max_fs > 0.0)) bad("t_max", eq.t_max_fs, "must be > 0 fs");
+    if (!(eq.check_interval_fs > 0.0)) bad("check_interval", eq.check_interval_fs, "must be > 0 fs");
+    const double n = eq.check_interval_fs / dt;
+    if (std::abs(n - std::round(n)) > 1e-9 * n)
+        bad("check_interval", eq.check_interval_fs,
+            "must be an integer multiple of fluorescence.dt = " + std::to_string(dt) + " fs");
+    if (eq.t_max_fs < 2.0 * eq.check_interval_fs)
+        bad("t_max", eq.t_max_fs, "must be ≥ 2·check_interval (two checks give the first ratio)");
+    if (!(eq.tolerance > 0.0 && eq.tolerance < 1.0)) bad("tolerance", eq.tolerance, "must be in (0, 1)");
+    return eq;
+}
+
+void resolve_fluorescence_config(Config& cfg) {
+    cfg.task = Config::Task::Fluorescence;
+    YAML::Node blk = task_block(cfg, "fluorescence");
+    parse_stepped_time(blk, "fluorescence", cfg);
+    // IF-RK4's fixed point is not the steady state: the bias grows as dt^5
+    // (monomer 3.5e-2 at dt = 2 fs), exactly where IF-RK4 would pay off.
+    if (cfg.time.integrator == Integrator::IfRk4)
+        throw std::invalid_argument(
+            "fluorescence.integrator = 'if-rk4' is rejected: its fixed point is biased "
+            "against the steady state by O(dt^5) (3.5e-2 at dt = 2 fs on one pigment). "
+            "Use 'rk4'.");
+    // The filter pins δ at a floor whose ratio to filter.tolerance is system-specific
+    // (FMO ~6x, LHC-II ~100x), so the equilibration criterion cannot be trusted.
+    if (cfg.filter.enabled)
+        throw std::invalid_argument(
+            "'fluorescence' task requires filter.enabled = false: the ADO filter pins the "
+            "equilibration distance δ at a floor 0.2-100x filter.tolerance depending on the "
+            "system (LHC-II: ~1e-4 at filter.tolerance 1e-6), so equilibration cannot "
+            "converge reliably.");
+    parse_task_output(blk, "fluorescence", cfg);
+    cfg.linear_batch = get_or<bool>(blk, "batch", "fluorescence.batch", false);
+    cfg.equilibration = parse_equilibration(blk["equilibration"], cfg.time.dt);
+    check_keys(blk, "fluorescence", {"integrator", "dt", "n_steps", "output_interval",
+                                     "print_interval", "output", "batch", "equilibration"});
+    if (cfg.physics.dipoles.empty())
+        throw std::invalid_argument(
+            "'fluorescence' task requires system.dipoles / system.strengths");
+    // Emission ends in the (e,g) coherence, measured against |g><g|.
+    apply_basis(cfg, BasisType::WITH_GROUND);
+
+    if (cfg.output.filename == "auto")
+        cfg.output.filename = extract_system_name(cfg.yaml_path) + "_fluorescence"
+            + bath_method_suffix(cfg);
+}
+
 void resolve_2des_config(Config& cfg) {
+    cfg.task = Config::Task::TwoDES;
     YAML::Node blk = task_block(cfg, "2des");
     parse_2des_time(blk, cfg);            // dt + print_interval (no n_steps grid)
     parse_task_output(blk, "2des", cfg);
@@ -1121,6 +1394,9 @@ void resolve_2des_config(Config& cfg) {
 
     TwoDESConfig spec{};
     parse_2des_axes(blk, spec);
+    check_keys(blk, "2des", {"integrator", "dt", "print_interval", "output", "tau_max",
+                             "dtau", "t_max", "dt_detect", "tw", "pathways", "signals",
+                             "orientation", "batch"});
 
     // ESA enters the |f><e| (double-excited) manifold, so main builds the
     // double_excited context; the 2des driver builds a second with_ground
@@ -1241,37 +1517,77 @@ void Config::print_summary() const {
     std::cout << "\n[Bath Parameters]\n";
     print_kv("Expansion method:",
              physics.expansion == BathExpansion::PADE ? "pade [K-1/K] PSD" : "matsubara");
-    // Directly print the immutable user input. n_extra_poles is the
-    // mode count as entered (== n_bath_modes_total); no reverse-engineering of
-    // a mutated field.
-    print_kv("Extra bath poles (K):", std::to_string(physics.n_extra_poles));
+    // Directly print the immutable user input (the per-site default).
+    print_kv("Extra bath poles (K):", std::to_string(physics.n_extra_poles) + " (default)");
+    {
+        std::ostringstream per;
+        for (int n = 0; n < physics.n_bath(); ++n)
+            per << (n ? "," : "") << physics.mode_layout().count(n);
+        print_kv("Ladders D:", std::to_string(physics.n_ladders())
+                 + "  (per site: " + per.str() + ")");
+    }
 
     // Homogeneous run → one compact block (mirrors legacy output). Heterogeneous
     // → a per-site table. Homogeneity is "all sites equal site 0".
     const auto& sites = physics.bath_sites;
-    auto same = [](const BathSite& a, const BathSite& b) {
-        return a.eta_cm == b.eta_cm && a.gamma_inverse_fs == b.gamma_inverse_fs;
+    auto same_mode = [](const VibMode& a, const VibMode& b) {
+        return a.omega_cm == b.omega_cm && a.huang_rhys == b.huang_rhys
+            && a.gamma_inverse_fs == b.gamma_inverse_fs;
+    };
+    auto same = [&](const BathSite& a, const BathSite& b) {
+        if (a.eta_cm != b.eta_cm || a.gamma_inverse_fs != b.gamma_inverse_fs
+            || a.n_extra_poles != b.n_extra_poles || a.modes.size() != b.modes.size())
+            return false;
+        for (size_t m = 0; m < a.modes.size(); ++m)
+            if (!same_mode(a.modes[m], b.modes[m])) return false;
+        return true;
     };
     bool homogeneous = true;
     for (const auto& s : sites) if (!same(s, sites[0])) { homogeneous = false; break; }
 
+    // γ is the C(t) envelope decay rate (as for Drude); the mode's Lorentzian
+    // FWHM is 2γ. Both printed so the log reads against either convention.
+    auto fmt_g = [](double v) {   // shortest faithful form: 0.02, 1e-06, 0.5
+        std::ostringstream s;
+        s << std::setprecision(6) << v;
+        return s.str();
+    };
+    auto print_modes = [&](const BathSite& s, const char* indent) {
+        for (const VibMode& v : s.modes) {
+            const double gamma_cm = v.gamma_au / CM_TO_AU;
+            const double lam_m = v.huang_rhys * v.omega_cm;
+            std::cout << indent << "mode: ω₀=" << fmt_d(v.omega_cm, 0) << " cm⁻¹  S="
+                      << fmt_g(v.huang_rhys) << "  λ=Sω₀=" << fmt_d(lam_m)
+                      << " cm⁻¹  γ=" << fmt_d(gamma_cm) << " cm⁻¹ (C(t) decay 1/γ="
+                      << fmt_d(v.gamma_inverse_fs, 0) << " fs, FWHM 2γ="
+                      << fmt_d(2.0 * gamma_cm) << " cm⁻¹)\n";
+        }
+    };
+
     if (homogeneous) {
         const BathSite& s = sites[0];
+        const double vib = site_reorg_cm(s) - 0.5 * s.eta_cm;
         print_kv("Drude coupling eta (J):", fmt_d(s.eta_cm) + " cm^-1 (all sites)");
-        print_kv("  -> lambda_reorg (= eta/2):", fmt_d(s.eta_cm * 0.5) + " cm^-1");
+        print_kv("  -> lambda_reorg:",
+                 fmt_d(site_reorg_cm(s)) + " cm^-1  (η/2=" + fmt_d(0.5 * s.eta_cm)
+                 + " + ΣSω₀=" + fmt_d(vib) + ")");
         print_kv("Relaxation time (1/γ):", fmt_d(s.gamma_inverse_fs) + " fs");
         print_kv("Markov residue (a.u.):", fmt_sci(physics.markov_residue[0], 3));
+        print_modes(s, "  ");
     } else {
         std::cout << "  Per-site bath (1-based pigment):\n";
-        std::cout << "    site   eta(cm^-1)   1/gamma(fs)   markov(a.u.)\n";
+        std::cout << "    site   eta(cm^-1)   1/gamma(fs)   K    lambda   markov(a.u.)\n";
         for (int n = 0; n < static_cast<int>(sites.size()); ++n) {
             const BathSite& s = sites[n];
             std::ostringstream row;
             row << "    " << std::setw(4) << (n + 1)
                 << std::setw(13) << fmt_d(s.eta_cm)
                 << std::setw(14) << fmt_d(s.gamma_inverse_fs)
+                << std::setw(4)  << s.n_extra_poles
+                << std::setw(10) << fmt_d(site_reorg_cm(s))
                 << std::setw(15) << fmt_sci(physics.markov_residue[n], 3);
             std::cout << row.str() << "\n";
+            print_modes(s, "         ");
         }
     }
 
@@ -1279,10 +1595,8 @@ void Config::print_summary() const {
         // Sink dump moved here from parse_sink (constructor cleanup).
         std::cout << "\n[Sink/Trap]\n";
         // Echo the user-facing 1-based pigment index, mirroring the YAML field.
-        const int pigment_1b = (physics.basis == BasisType::EXCITED_ONLY)
-                             ? physics.sink.site + 1
-                             : physics.sink.site;
-        print_kv("Target pigment (1-based):", std::to_string(pigment_1b));
+        print_kv("Target pigment (1-based):",
+                 std::to_string(hilbert_to_pigment(physics.sink.site, physics.basis)));
         print_kv("Rate gamma_sink:", fmt_d(physics.sink.gamma_fs, 4) + " fs^-1");
         print_kv("tau_sink:", fmt_d(1.0 / physics.sink.gamma_fs) + " fs");
     } else {
@@ -1295,8 +1609,6 @@ void Config::print_summary() const {
     if (filter.enabled) {
         print_kv("ADO filtering:", "enabled");
         print_kv("  tolerance:", fmt_sci(filter.tolerance));
-        print_kv("  warmup start_step:", std::to_string(filter.start_step));
-        print_kv("  warmup factor:", fmt_d(filter.warmup_factor, 3));
         print_kv("  ulist gate:",
                  filter.ulist_tau > 0.0 ? fmt_d(filter.ulist_tau, 3) : "off");
     } else {

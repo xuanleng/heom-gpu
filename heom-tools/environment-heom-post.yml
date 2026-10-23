@@ -2,7 +2,7 @@
 #
 # Create:   conda env create -f heom-tools/environment-heom-post.yml
 # Activate: conda activate heom-post
-# Install:  pip install -e "heom-tools[rqmc]"
+# Install:  pip install -e heom-tools
 
 name: heom-post
 channels:

@@ -14,6 +14,10 @@ from heom_tools.common.spectrum import ExperimentSpectrum
 _SPECTRUM_FIG_WIDTH_IN = 9.0
 _SPECTRUM_FIG_HEIGHT_IN = 5.5
 _EXP_OVERLAY_EDGE_COLORS = ("r", "darkviolet", "darkgoldenrod", "teal", "brown", "deeppink")
+_STICK_LABEL = {
+    "absorption": r"stick ($|\mu|^2_{\mathrm{eg}}/3$, no norm)",
+    "fluorescence": r"stick ($p_k\,|\mu|^2_{\mathrm{eg}}/3$, no norm)",
+}
 
 
 def _tab10_cmap(plt_mod):
@@ -53,12 +57,13 @@ def _draw_spectrum_axes(
         )
         ax.plot(omega, per[:, k], lw=1.5, color=cmap(k % 10), label=label, zorder=z_line)
 
+    kind = result.spec.spectrum_type
     ax.plot(
         omega,
         total,
         lw=2.5,
         color="C0",
-        label="HEOM absorption (total)",
+        label=f"HEOM {kind} (total)",
         zorder=z_total,
     )
 
@@ -84,7 +89,7 @@ def _draw_spectrum_axes(
             width=width,
             alpha=0.45,
             color="C2",
-            label=r"stick ($|\mu|^2_{\mathrm{eg}}/3$, no norm)",
+            label=_STICK_LABEL.get(kind, _STICK_LABEL["absorption"]),
             zorder=1,
         )
         for st in result.sticks:
@@ -115,7 +120,7 @@ def _draw_spectrum_axes(
 
     ax.set_xlabel(r"$\omega$ (cm$^{-1}$)")
     ax.set_ylabel("Intensity (norm)" if normalize else "Intensity")
-    ax.set_title(f"linear absorption | N={result.spec.N - 1} pigments")
+    ax.set_title(f"linear {kind} | N={result.spec.N - 1} pigments")
     ax.legend(loc="upper right", fontsize=8, ncol=ncol)
     ax.grid(alpha=0.3)
     ymin, ymax = ax.get_ylim()

@@ -145,13 +145,13 @@ def format_overlap_report(conflicts: List[OverlapConflict]) -> str:
 
 
 def update_config_yaml_tw(yaml_text: str, tw_values: Sequence[float]) -> str:
-    """Set spectroscopy.tw to the merged waiting-time list."""
+    """Set 2des.tw (the solver's task block) to the merged waiting-time list."""
     doc = yaml.safe_load(yaml_text) or {}
     if not isinstance(doc, dict):
         raise ValueError("config_yaml root must be a mapping")
-    spec = doc.setdefault("spectroscopy", {})
+    spec = doc.setdefault("2des", {})
     if not isinstance(spec, dict):
-        raise ValueError("config_yaml spectroscopy must be a mapping")
+        raise ValueError("config_yaml 2des must be a mapping")
     tw_out = [float(v) for v in tw_values]
     if all(abs(v - round(v)) < 1e-6 for v in tw_out):
         spec["tw"] = [str(int(round(v))) for v in tw_out]
@@ -230,7 +230,7 @@ def merge_solver_2des(
                 par.create_dataset("config_yaml", data=np.bytes_(new_yaml.encode("utf-8")))
                 # Physics identity of the merged config (new tw list) — same
                 # scheme the solver uses, so it stays consistent with config_yaml.
-                f.attrs["config_hash"] = physics_hash(new_yaml)
+                f.attrs["config_hash"] = physics_hash(new_yaml, task="2des")
 
             sources = [
                 {"path": os.path.basename(p), "tw_fs": load_fingerprint(p).tw.tolist()}

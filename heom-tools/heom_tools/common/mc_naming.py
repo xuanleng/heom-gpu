@@ -28,12 +28,13 @@ __all__ = [
     "shard_group_glob",
     "merged_name",
     "coverage_1based",
+    "queue_file_name",
 ]
 
 # Strict shard name: captures the group identity (base + key). TS/interval/rank
 # are matched but discarded — they do not enter the group key.
-# TS is YYYYMMDD_HHMM (legacy / single-shot) or YYYYMMDD_HHMMSS (standalone
-# launcher, second resolution for same-minute re-runs).
+# TS is YYYYMMDD_HHMMSS (current solver and launchers) or YYYYMMDD_HHMM (files
+# from older builds).
 SHARD_RE = re.compile(
     r"^(?P<base>.+)_(?P<key>[0-9a-f]{16})_\d{8}_\d{4,6}_r\d+-\d+_rank\d+\.h5$")
 
@@ -71,6 +72,14 @@ def merged_name(group_key: str, lo: int, hi: int) -> str:
     r1-200, …) side by side instead of overwriting the previous convergence
     point."""
     return f"{group_key}_r{lo}-{hi}.h5"
+
+
+def queue_file_name(run_id: str, r_begin: int, r_end: int) -> str:
+    """The flock counter of one worker batch, under save_path. Must match the
+    solver's ``heom::mc::queue_file_name`` (``mc_driver.hpp``): the batch
+    identity (run-id + 1-based interval) is in the name, so a counter left by
+    another batch is never read."""
+    return f"mc.{run_id}_r{r_begin}-{r_end}.queue"
 
 
 def coverage_1based(r_done) -> tuple[int, int]:

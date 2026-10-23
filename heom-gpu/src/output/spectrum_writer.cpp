@@ -67,41 +67,72 @@ void write_dipoles_to_parameters(hid_t params, const PhysicalParameters& phys)
     heom::hdf5::write_dataset_1d(params, "strengths", phys.strengths.data(), n_states);
 }
 
-}  // anonymous namespace
+// Exception path: best-effort status="aborted", then close. Never throws —
+// the caller is already propagating the real error.
+void abort_file(hid_t file) {
+    try {
+        heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Aborted);
+    } catch (...) {}
+    H5Fclose(file);
+}
 
-std::string write_spectrum(const HEOMConfig::Config& cfg,
-                           const SystemContext& sys,
-                           const heom::spectra::LinearResponseResult& out,
-                           double total_seconds)
+// rho_eq and the equilibration history, under /results.
+void write_equilibrium(hid_t results, const HEOMConfig::Config& cfg,
+                       const heom::spectra::FluorescenceResult& r)
 {
+    const int N = static_cast<int>(r.rho_eq.rows());
+    std::vector<std::complex<double>> flat(static_cast<size_t>(N) * N);
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j) flat[static_cast<size_t>(i) * N + j] = r.rho_eq(i, j);
+    write_dataset_complex_nd(results, "rho_eq", flat.data(),
+                             {static_cast<hsize_t>(N), static_cast<hsize_t>(N)});
+
+    const auto& h = r.equilibration;
+    const int n = static_cast<int>(h.time_fs.size());
+    hid_t g = heom::hdf5::create_group(results, "equilibration");
+    heom::hdf5::write_dataset_1d(g, "time_fs",  h.time_fs.data(),  n);
+    heom::hdf5::write_dataset_1d(g, "delta",    h.delta.data(),    n);
+    heom::hdf5::write_dataset_1d(g, "ratio",    h.ratio.data(),    n);
+    heom::hdf5::write_dataset_1d(g, "estimate", h.estimate.data(), n);
+    heom::hdf5::write_scalar_attr(g, "t_eq_fs",           h.t_eq_fs);
+    heom::hdf5::write_scalar_attr(g, "tolerance",         cfg.equilibration.tolerance);
+    heom::hdf5::write_scalar_attr(g, "check_interval_fs", cfg.equilibration.check_interval_fs);
+    heom::hdf5::write_scalar_attr(g, "t_max_fs",          cfg.equilibration.t_max_fs);
+    HDF5_CHECK_ERR(H5Gclose(g));
+}
+
+// Absorption and fluorescence share everything but the task name and what
+// the equilibrium adds to /results.
+std::string write_linear(const HEOMConfig::Config& cfg,
+                         const SystemContext& sys,
+                         const heom::spectra::LinearResponseResult& out,
+                         double total_seconds,
+                         const heom::spectra::FluorescenceResult* fl)
+{
+    const char* task = fl ? "fluorescence" : "absorption";
     if (cfg.physics.dipoles.empty()) {
         throw std::invalid_argument(
-            "write_spectrum: cfg.physics.dipoles is empty (was the absorption "
-            "task entry resolve_absorption_config() called?)");
+            "write_spectrum: cfg.physics.dipoles is empty (was the task entry "
+            "resolve_<task>_config() called?)");
     }
     validate_spectrum_result_shape(sys.N(), output_record_count(cfg.time), out);
 
     const std::string path = heom::hdf5::resolve_output_path(
         cfg.output.save_path, cfg.output.filename, cfg.output.use_timestamp);
 
-    hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-    if (file < 0) {
-        throw std::runtime_error("Cannot create HDF5 file: " + path);
-    }
+    const hid_t file = heom::hdf5::create_output_file(path, cfg.output.use_timestamp);
 
     try {
         // ---- shared group layout (see hdf5_metadata.hpp) ----
-        heom::hdf5::write_root_identity(file, cfg, "absorption");
-        // Total x/y/z wall-clock under the SAME root attribute the dynamics
-        // writer uses, so plotting can compare runtime across tasks/params.
-        heom::hdf5::write_scalar_attr(file, "simulation_time_seconds", total_seconds);
+        heom::hdf5::write_root_identity(file, cfg, task);
+        heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Running);
 
         const auto filtering = spectrum_filtering_metadata(cfg);
         hid_t params = heom::hdf5::write_parameters_group(file, sys,
                                                           filtering.use_filtering,
                                                           filtering.filter_threshold);
-        // /parameters extras specific to the absorption task
-        heom::hdf5::write_string_attr(params, "spectrum_type", "absorption");
+        // /parameters extras specific to the linear-spectrum tasks
+        heom::hdf5::write_string_attr(params, "spectrum_type", task);
         write_dipoles_to_parameters(params, cfg.physics);
         HDF5_CHECK_ERR(H5Gclose(params));
 
@@ -117,12 +148,16 @@ std::string write_spectrum(const HEOMConfig::Config& cfg,
 
         write_dataset_complex_4d(results, "rho_xyz", out.rho_xyz.data(),
                                  3, out.n_outputs, out.N, out.N);
+        if (fl && fl->rho_eq.size() > 0) write_equilibrium(results, cfg, *fl);
 
         HDF5_CHECK_ERR(H5Gclose(results));
 
-        H5Fflush(file, H5F_SCOPE_GLOBAL);
+        // Total x/y/z wall-clock under the SAME root attribute the dynamics
+        // writer uses, so plotting can compare runtime across tasks/params.
+        heom::hdf5::write_scalar_attr(file, "simulation_time_seconds", total_seconds);
+        heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Complete);
     } catch (...) {
-        H5Fclose(file);
+        abort_file(file);
         throw;
     }
 
@@ -130,6 +165,24 @@ std::string write_spectrum(const HEOMConfig::Config& cfg,
 
     std::cout << "Spectrum file created: " << path << "\n";
     return path;
+}
+
+}  // anonymous namespace
+
+std::string write_spectrum(const HEOMConfig::Config& cfg,
+                           const SystemContext& sys,
+                           const heom::spectra::LinearResponseResult& out,
+                           double total_seconds)
+{
+    return write_linear(cfg, sys, out, total_seconds, nullptr);
+}
+
+std::string write_fluorescence(const HEOMConfig::Config& cfg,
+                               const SystemContext& sys,
+                               const heom::spectra::FluorescenceResult& r,
+                               double total_seconds)
+{
+    return write_linear(cfg, sys, r.linear, total_seconds, &r);
 }
 
 std::string write_2des(const HEOMConfig::Config& cfg,
@@ -143,18 +196,16 @@ std::string write_2des(const HEOMConfig::Config& cfg,
             "called?)");
     }
     const auto& spec = *cfg.twodes;
+    validate_2des_result_shape(spec, out);
 
     const std::string path = heom::hdf5::resolve_output_path(
         cfg.output.save_path, cfg.output.filename, cfg.output.use_timestamp);
 
-    hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-    if (file < 0) {
-        throw std::runtime_error("Cannot create HDF5 file: " + path);
-    }
+    const hid_t file = heom::hdf5::create_output_file(path, cfg.output.use_timestamp);
 
     try {
         heom::hdf5::write_root_identity(file, cfg, "2des");
-        heom::hdf5::write_scalar_attr(file, "simulation_time_seconds", total_seconds);
+        heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Running);
 
         const auto filtering = spectrum_filtering_metadata(cfg);
         hid_t params = heom::hdf5::write_parameters_group(file, sys,
@@ -166,6 +217,19 @@ std::string write_2des(const HEOMConfig::Config& cfg,
         heom::hdf5::write_string_attr(params, "signals",  join_csv(spec.signals));
         heom::hdf5::write_string_attr(params, "pathways", join_csv(spec.pathways));
         heom::hdf5::write_string_attr(params, "orientation", spec.orientation);
+        // Walk width actually used (1/7/21). Not in config_hash; recorded
+        // because with filtering on the width moves results at filter-error
+        // level. Prefer out.batch_width so auto resolves to a concrete value
+        // (spec.batch may still be kTwoDESBatchAuto).
+        heom::hdf5::write_scalar_attr(params, "batch_width", out.batch_width);
+        heom::hdf5::write_string_attr(
+            params, "batch_requested",
+            spec.batch == HEOMConfig::kTwoDESBatchAuto
+                ? "auto"
+                : std::to_string(spec.batch));
+        if (!out.batch_auto_reason.empty())
+            heom::hdf5::write_string_attr(params, "batch_auto_reason",
+                                          out.batch_auto_reason);
         write_dipoles_to_parameters(params, cfg.physics);
         HDF5_CHECK_ERR(H5Gclose(params));
 
@@ -192,9 +256,10 @@ std::string write_2des(const HEOMConfig::Config& cfg,
         write_dataset_complex_nd(results, "resp", out.resp.data(), dims);
 
         HDF5_CHECK_ERR(H5Gclose(results));
-        H5Fflush(file, H5F_SCOPE_GLOBAL);
+        heom::hdf5::write_scalar_attr(file, "simulation_time_seconds", total_seconds);
+        heom::hdf5::write_run_status(file, heom::hdf5::RunStatus::Complete);
     } catch (...) {
-        H5Fclose(file);
+        abort_file(file);
         throw;
     }
 

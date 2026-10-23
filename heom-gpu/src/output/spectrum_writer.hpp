@@ -2,6 +2,7 @@
 #define HEOM_OUTPUT_SPECTRUM_WRITER_HPP
 
 #include "heom_config.hpp"
+#include "spectra/fluorescence.hpp"
 #include "spectra/linear_response.hpp"
 #include "spectra/two_dim.hpp"
 
@@ -17,7 +18,7 @@ class SystemContext;   // forward decl: full header pulled in by .cpp
  * Spectroscopy HDF5 writer. Shares the same group layout as the dynamics
  * writer (see src/output/hdf5_metadata.hpp):
  *
- *   /                  attrs: task="absorption", config_hash
+ *   /                  attrs: task="absorption" | "fluorescence", config_hash
  *   /parameters/       knobs + Hamiltonian + basis + dipoles[n_states,3]
  *                      + strengths[n_states] + spectrum_type + config_yaml
  *   /derived/          eigenspectrum + bath-correlation coefficients + M_total
@@ -66,6 +67,29 @@ inline void validate_spectrum_result_shape(
     }
 }
 
+/// Same contract for 2DES: every axis vector matches its n_*, the signal and
+/// pathway axes match what the config asked for, and resp holds exactly the
+/// full [3][n_signal][n_pathway][n_tau][n_tw][n_t] block. H5Dwrite would
+/// otherwise read past a short buffer and write garbage without complaint.
+inline void validate_2des_result_shape(
+    const HEOMConfig::TwoDESConfig& spec,
+    const heom::spectra::TwoDESResult& out
+) {
+    auto need = [](bool ok, const char* what) {
+        if (!ok) throw std::invalid_argument(std::string("write_2des: ") + what);
+    };
+    need(out.n_component == 3, "n_component != 3");
+    need(out.n_signal  == static_cast<int>(spec.signals.size()),  "n_signal != signals.size()");
+    need(out.n_pathway == static_cast<int>(spec.pathways.size()), "n_pathway != pathways.size()");
+    need(out.n_tau > 0 && out.n_tw > 0 && out.n_t > 0, "empty tau/tw/t axis");
+    need(static_cast<int>(out.tau_fs.size()) == out.n_tau, "tau_fs length != n_tau");
+    need(static_cast<int>(out.tw_fs.size())  == out.n_tw,  "tw_fs length != n_tw");
+    need(static_cast<int>(out.t_fs.size())   == out.n_t,   "t_fs length != n_t");
+    const size_t expected = static_cast<size_t>(out.n_component) * out.n_signal
+                          * out.n_pathway * out.n_tau * out.n_tw * out.n_t;
+    need(out.resp.size() == expected, "resp length != n_component*n_signal*n_pathway*n_tau*n_tw*n_t");
+}
+
 /// Write `out` (and the surrounding system/bath/hierarchy/eigenspectrum
 /// metadata) to an HDF5 file. The output path is built from `cfg.output`
 /// using the same resolve-and-mkdir-p logic as HDF5Writer (timestamp
@@ -80,12 +104,24 @@ inline void validate_spectrum_result_shape(
 /// written to the file root as the `simulation_time_seconds` attribute —
 /// the same key the dynamics writer uses — so plotting tools can read one
 /// consistent attribute across tasks to compare runtime vs parameters.
+/// It and status="complete" are written after /results; an exception leaves
+/// status="aborted" (both writers).
 ///
 /// Returns the resolved output path (with .h5 extension).
 std::string write_spectrum(const HEOMConfig::Config& cfg,
                            const SystemContext& sys,
                            const heom::spectra::LinearResponseResult& out,
                            double total_seconds);
+
+/// Fluorescence: the write_spectrum layout (task / spectrum_type
+/// "fluorescence") plus, when r.rho_eq is non-empty (not an MC ensemble file):
+///   /results/rho_eq[N, N]                                  complex compound
+///   /results/equilibration/{time_fs, delta, ratio, estimate}
+///       attrs t_eq_fs, tolerance, check_interval_fs, t_max_fs
+std::string write_fluorescence(const HEOMConfig::Config& cfg,
+                               const SystemContext& sys,
+                               const heom::spectra::FluorescenceResult& r,
+                               double total_seconds);
 
 /// Write a raw 2DES result (no FFT — that's Python's job).
 /// Layout under /results:

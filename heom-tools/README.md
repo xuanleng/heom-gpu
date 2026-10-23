@@ -10,7 +10,7 @@ From the repository root:
 ```bash
 conda env create -f heom-tools/environment-heom-post.yml
 conda activate heom-post
-pip install -e "heom-tools[rqmc]"
+pip install -e heom-tools
 ```
 
 Tests: `cd heom-tools && pytest`.
@@ -21,6 +21,7 @@ Tests: `cd heom-tools && pytest`.
 |---------|---------|
 | `pop-plot`, `pop-compare` | Population dynamics: plots and comparison |
 | `las-post`, `las-plot`, `las-compare` | Linear absorption: spectrum from the solver output, plots, comparison |
+| `flu-post`, `flu-plot` | Fluorescence spectra, with a KMS check against absorption |
 | `twodes-post`, `twodes-plot`, `twodes-animate`, `twodes-compare`, `twodes-merge` | 2DES: spectra, plots, animations, comparison, merging along the waiting time |
 | `mc-disorder-gen`, `mc-disorder-run`, `mc-disorder-merge`, `mc-disorder-status` | Static disorder: draws, GPU workers, merging, error estimate |
 | `mc-probe` | Sampling-error studies of the Monte Carlo average |

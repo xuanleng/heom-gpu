@@ -1,0 +1,51 @@
+# Monomer, pure Drude (λ = 70 cm⁻¹, 1/γ = 100 fs), Padé K=1, 77 K.
+# Gates G4b / G5 (tests/test_fluorescence_gates.py): absorption and
+# fluorescence against the cumulant closed form on the file's own expansion
+# (heom_tools.common.cumulant); the test overrides L_cutoff. Seconds per run.
+
+system:
+  n_states: 1
+  temperature: 77.0
+  hamiltonian:
+    - [12000.0]
+  w0: 12000.0
+  dipoles:
+    - [1.0, 0.0, 0.0]
+  strengths: [1.0]
+
+bath:
+  spectral_density: "Drude-Lorentz"
+  eta: 140.0
+  gamma_inverse: 100.0
+  expansion_method: pade
+  n_extra_poles: 1
+  L_cutoff: 4
+
+filter:
+  enabled: false
+
+absorption:
+  integrator: rk4
+  dt: 1
+  n_steps: 500
+  output_interval: 1
+  print_interval: 0
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "fl_monomer_abs"
+    use_timestamp: false
+
+fluorescence:
+  integrator: rk4
+  dt: 1
+  n_steps: 500
+  output_interval: 1
+  print_interval: 0
+  equilibration:
+    t_max: 500
+    check_interval: 50
+    tolerance: 1.0e-10
+  output:
+    save_path: "tests/benchmark_data/"
+    filename: "fl_monomer"
+    use_timestamp: false

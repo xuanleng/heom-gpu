@@ -6,12 +6,14 @@ Two hashes over a config yaml, kept byte-for-byte compatible with
 * :func:`fnv1a64_hex` — FNV-1a 64-bit of a UTF-8 string (matches
   ``include/util/fnv.hpp``).
 * :func:`physics_hash` — the "same physics?" fingerprint the solver stores as
-  ``config_hash``: canonicalise the PARSED yaml (drop comments / whitespace /
-  key-order) with the disorder-owned ``static_disorder`` top-level block and the
-  non-physical ``output`` sub-block inside each task block (``dynamics`` /
-  ``absorption`` / ``2des``) removed, then FNV-1a. Stable across comment/format
-  edits so an incremental MC batch (or a 2des re-merge) after a harmless yaml
-  edit does not fork the group.
+  ``config_hash``: keep exactly what changes the task's numbers — ``system``,
+  ``bath``, ``filter`` (minus ``log_per_slot``) and the ONE task block being run
+  (minus ``output`` / ``print_interval`` / ``batch``) — canonicalise the PARSED
+  yaml (drop comments / whitespace / key-order) and FNV-1a it. The other task
+  blocks and ``static_disorder`` are not in it, so an incremental MC batch (or a
+  2des re-merge) after a harmless yaml edit, or an edit to another task's dt,
+  does not fork the group. ``task=None`` mirrors ``load_yaml`` before the task is
+  known (shared core only).
 
 The C++ ``canonical_yaml`` walks the PARSED node emitting scalars verbatim, maps
 with sorted keys, sequences in order. We do the SAME by composing the yaml into
@@ -23,17 +25,18 @@ from __future__ import annotations
 
 import yaml
 
-__all__ = ["fnv1a64_hex", "physics_hash"]
+__all__ = ["TASKS", "fnv1a64_hex", "physics_hash"]
 
 _FNV_OFFSET = 0xCBF29CE484222325
 _FNV_PRIME = 0x100000001B3
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 
-# Disorder-owned top-level block excluded from the physics identity, plus the
-# non-physical `output` sub-block stripped from each task block below (mirrors
-# heom_config.cpp::physics_hash).
-_DROP_TOP_LEVEL = ("static_disorder",)
-_TASK_BLOCKS = ("dynamics", "absorption", "2des")
+# Mirrors heom_config.cpp::physics_hash: shared core blocks kept for every task,
+# print knob dropped from `filter`, non-physical knobs dropped from the task block.
+_CORE_BLOCKS = ("system", "bath", "filter")
+_FILTER_DROP = ("log_per_slot",)
+_TASK_DROP = ("output", "print_interval", "batch")
+TASKS = ("dynamics", "absorption", "fluorescence", "2des")
 
 
 def fnv1a64_hex(text: str) -> str:
@@ -62,17 +65,31 @@ def _canonical(node) -> str:
     raise ValueError(f"unexpected yaml node type: {type(node).__name__}")
 
 
-def physics_hash(yaml_text: str) -> str:
-    """Physics-identity hash of a config yaml string (== solver ``config_hash``)."""
+def _without_keys(node, drop):
+    if isinstance(node, yaml.MappingNode):
+        node.value = [(k, v) for k, v in node.value if k.value not in drop]
+    return node
+
+
+def physics_hash(yaml_text: str, task: str | None = None) -> str:
+    """Physics-identity hash of a config yaml string (== solver ``config_hash``).
+
+    ``task`` is one of :data:`TASKS`; ``None`` gives the task-less core hash the
+    solver holds between ``load_yaml`` and ``resolve_<task>_config``.
+    """
+    if task is not None and task not in TASKS:
+        raise ValueError(f"task must be one of {TASKS}, got {task!r}")
     root = yaml.compose(yaml_text)
-    if root is None:
+    if not isinstance(root, yaml.MappingNode):
         return fnv1a64_hex("~")
-    if isinstance(root, yaml.MappingNode):
-        # Drop the disorder-owned top-level block.
-        root.value = [(k, v) for k, v in root.value
-                      if k.value not in _DROP_TOP_LEVEL]
-        # Drop the non-physical `output` sub-block inside each task block.
-        for k, v in root.value:
-            if k.value in _TASK_BLOCKS and isinstance(v, yaml.MappingNode):
-                v.value = [(kk, vv) for kk, vv in v.value if kk.value != "output"]
+    keep = []
+    for k, v in root.value:
+        if k.value in _CORE_BLOCKS:
+            keep.append((k, _without_keys(v, _FILTER_DROP) if k.value == "filter" else v))
+        elif task is not None and k.value == task:
+            keep.append((k, _without_keys(v, _TASK_DROP)))
+    if not keep:
+        # yaml-cpp: a node that was never assigned to is Null -> "~".
+        return fnv1a64_hex("~")
+    root.value = keep
     return fnv1a64_hex(_canonical(root))

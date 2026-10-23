@@ -28,7 +28,7 @@ def _gen(tmp, **kw):
 
 def _make_cfg(draws, run_dir):
     """Synthesise a per-run config from the benchmark with static_disorder.draws_file
-    + a private save_path (=> its own fresh mc.queue). use_timestamp off so the
+    + a private save_path. use_timestamp off so the
     single-shot filename is deterministic. Returns the config path."""
     os.makedirs(run_dir, exist_ok=True)
     with open(ABS_CFG) as fh:
@@ -57,6 +57,13 @@ def _run_absorption_mc(draws, run_dir, run_id="20260705_0000"):
     assert r.returncode == 0, f"MC absorption failed:\n{r.stderr[-800:]}"
     shards = glob.glob(os.path.join(run_dir, "*_rank1.h5"))
     assert len(shards) == 1, f"expected one rank1 shard, got {shards}"
+    # The shard was built under .partial/ and renamed out once /mc was
+    # appended; a finished worker leaves nothing behind there, and the shard
+    # that IS visible must already carry /mc.
+    leftovers = glob.glob(os.path.join(run_dir, ".partial", "*.h5"))
+    assert leftovers == [], f"half-written shards left in .partial/: {leftovers}"
+    with h5py.File(shards[0], "r") as h:
+        assert "mc" in h, "published shard has no /mc group"
     return shards[0]
 
 
@@ -116,6 +123,32 @@ def test_sigma_zero_matches_single_shot(tmp_path):
         maxabs = float(np.max(np.abs(a["/results/rho_xyz"][...]
                                      - b["/results/rho_xyz"][...])))
         assert maxabs == 0.0, f"σ=0 rank file != single-shot: maxabs={maxabs}"
+
+
+def test_queue_is_per_batch(tmp_path):
+    """Direct --rank workers in ONE save_path: a new run-id is a new batch and
+    must claim every node even though the previous batch drained its counter;
+    the same run-id and range joins the drained batch and claims none."""
+    draws = _gen(str(tmp_path), n=2, s=7, fwhm=100.0, seed=5)
+    run_dir = os.path.join(tmp_path, "run")
+    cfg = _make_cfg(draws, run_dir)
+
+    def worker(run_id):
+        r = subprocess.run([SOLVER, "absorption", cfg, "--rank", "1", "--run-id", run_id],
+                           capture_output=True, text=True, timeout=600)
+        assert r.returncode == 0, r.stderr[-800:]
+        return glob.glob(os.path.join(run_dir, f"*_{run_id}_r1-2_rank1.h5")), r.stdout
+
+    first, _ = worker("20260101_000001")
+    second, _ = worker("20260101_000002")
+    assert len(first) == 1 and len(second) == 1
+    with h5py.File(second[0]) as h:
+        assert h["/mc/count"][()] == 2
+    assert sorted(os.path.basename(q) for q in glob.glob(os.path.join(run_dir, "mc.*.queue"))) \
+        == ["mc.20260101_000001_r1-2.queue", "mc.20260101_000002_r1-2.queue"]
+
+    rejoin, out = worker("20260101_000002")
+    assert rejoin == second and "claimed 0 nodes" in out
 
 
 def test_error_estimator_wellformed(tmp_path):

@@ -133,10 +133,12 @@ public:
      * The scratch buffers reused across a 2DES tree all want this: reallocate
      * only when the requirement grows, never shrink. Contents are NOT preserved
      * when a reallocation happens — every caller overwrites the buffer before
-     * reading it.
+     * reading it — so the old block is freed BEFORE the new one is allocated:
+     * the peak is the larger size, not the sum the budget never counted.
      */
     void ensure(size_t count) {
         if (count > size_) {
+            *this = GPUMemory<T>();
             *this = GPUMemory<T>(count);
         }
     }

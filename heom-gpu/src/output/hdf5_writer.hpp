@@ -3,9 +3,9 @@
 
 #include "types.hpp"
 #include "system_info.hpp"
+#include "output/hdf5_metadata.hpp"
 #include <Eigen/Dense>
 #include <hdf5.h>
-#include <cuComplex.h>
 #include <complex>
 #include <cstdio>
 #include <stdexcept>
@@ -55,7 +55,8 @@ inline void validate_timestep_bounds(
  * @brief HDF5 dynamics-task writer (group layout: see hdf5_metadata.hpp).
  *
  * Writes:
- *   /                  attrs: task="dynamics", config_hash, simulation_time_seconds
+ *   /                  attrs: task="dynamics", config_hash, simulation_time_seconds,
+ *                      n_records_written, status (last; see RunStatus)
  *   /parameters/       knobs + Hamiltonian + initial_state + initial_density_matrix
  *                      + config_yaml
  *   /derived/          eigenspectrum + bath-correlation coefficients + M_total
@@ -90,10 +91,15 @@ public:
               bool use_filtering,
               double filter_threshold);
 
-    void write_timestep(double time_fs, const cuDoubleComplex* rho, int N);
+    /// rho: row-major N×N, one record. Host type only — the writer knows
+    /// nothing about how the trajectory stores its state.
+    void write_timestep(double time_fs, const std::complex<double>* rho, int N);
 
-    void close(double simulation_time,
-              const std::vector<FilteringRecord>* filtering_history = nullptr);
+    /// status: Complete, or Diverged when the run stopped at a divergence
+    /// check (fewer than the allocated records written). Destroying an open
+    /// writer instead marks the file Aborted.
+    void close(double simulation_time, heom::hdf5::RunStatus status,
+               const std::vector<FilteringRecord>* filtering_history = nullptr);
 
     const std::string& get_output_path() const { return output_path_; }
 

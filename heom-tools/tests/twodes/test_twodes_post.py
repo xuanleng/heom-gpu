@@ -447,7 +447,49 @@ def test_cross_check_passes_random():
     for sig in ("rephasing", "nonrephasing"):
         spec, stats = cross_check_two_d_fft(S, sig, 36, 28)
         assert stats["axis_vs_separable"] < 1e-12
-        assert np.allclose(spec, two_d_fft_axis(S, sig, 36, 28))
+        assert np.allclose(spec, two_d_fft(S, sig, 36, 28))
+
+
+def test_two_d_fft_trapezoid_endpoint_weights():
+    """τ=0 row and t=0 column at ½, corner ¼, interior 1; the input is untouched."""
+    from heom_tools.twodes.post.fft import trapezoid_endpoints
+
+    for (i, j), w in (((0, 0), 0.25), ((0, 3), 0.5), ((2, 0), 0.5), ((2, 3), 1.0)):
+        S = np.zeros((6, 6), dtype=complex)
+        S[i, j] = 1.0
+        for sig in ("rephasing", "nonrephasing"):
+            np.testing.assert_allclose(two_d_fft(S, sig, 16, 16),
+                                       w * two_d_fft_axis(S, sig, 16, 16), rtol=0, atol=1e-15)
+        assert S[i, j] == 1.0
+    S = np.ones((3, 3))
+    np.testing.assert_array_equal(trapezoid_endpoints(S).real,
+                                  [[0.25, 0.5, 0.5], [0.5, 1, 1], [0.5, 1, 1]])
+
+
+def test_2des_total_matches_continuum_lorentzian():
+    """One Lorentzian peak, rp + nr on the production 8 fs grid against the
+    closed-form absorptive map L(ω_τ)·L(ω_t). Trapezoid: O(Δ²) (6e-4 measured);
+    full weight at τ=0 / t=0 leaves stripes Γ·Δ/4 ≈ 4 % (3.7e-2 measured)."""
+    from heom_tools.twodes.post.fft import freq_axis_cm, nfft_len
+
+    fwhm, d = 100.0, 8.0
+    g = fwhm * 2 * np.pi * 2.99792458e-5
+    x = np.arange(0.0, 1200.0 + d / 2, d)
+    S = np.exp(-g * x[:, None] / 2) * np.exp(-g * x[None, :] / 2)
+    n = nfft_len(len(x), d, 10.0)
+    w = freq_axis_cm(n, d, 0.0)
+    i0 = int(np.argmin(np.abs(w)))
+    win = np.abs(w) < 1500.0
+    h2 = (fwhm / 2) ** 2
+    lor = h2 / (h2 + w[win] ** 2)
+    exact = np.outer(lor, lor)
+
+    def err(fft):
+        spec = sum(fft(S, s, n, n, dtau=d, dt=d) for s in ("rephasing", "nonrephasing")).real
+        return np.max(np.abs(spec[np.ix_(win, win)] / spec[i0, i0] - exact))
+
+    assert err(two_d_fft) < 2e-3
+    assert err(two_d_fft_axis) > 2e-2
 
 
 def test_two_d_fft_legacy_mode3_runs():

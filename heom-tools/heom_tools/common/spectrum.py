@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """Shared spectrum operators: HDF5 load, dipole rebuild, FFT, sticks, peaks.
 
-Drivers call these functions and own plotting and filenames. This module
-does not write HDF5 or draw. It may emit UserWarning, for example when a
-dipole is renormalized.
+Drivers (absorption, fluorescence) call these functions and own plotting
+and filenames. This module does not write HDF5 or draw. It may emit
+UserWarning, for example when a dipole is renormalized.
 
 Units are atomic units: AU2FS fs per au time, AU2PERCM cm^-1 per Hartree.
 find_peaks is pure NumPy.
@@ -55,6 +55,10 @@ _SPECTRUM_H5_REQUIRED_PATHS: tuple[str, ...] = (
 )
 
 
+LINEAR_TASKS: tuple[str, ...] = ("absorption", "fluorescence")
+_PLOT_TOOL = {"absorption": "las-plot / las-compare", "fluorescence": "flu-plot"}
+
+
 def is_raw_with_ground_absorption_h5(path: str) -> bool:
     """Cheap structural check for ``heom_solver absorption`` raw HDF5.
 
@@ -63,6 +67,11 @@ def is_raw_with_ground_absorption_h5(path: str) -> bool:
     validity stay with ``load_spectrum_h5``.
     """
     return absorption_h5_skip_reason(path) is None
+
+
+def is_raw_with_ground_linear_h5(path: str, task: str) -> bool:
+    """``is_raw_with_ground_absorption_h5`` for any task in ``LINEAR_TASKS``."""
+    return linear_h5_skip_reason(path, task) is None
 
 
 def _decode_h5_attr_text(value) -> str:
@@ -75,20 +84,27 @@ def _decode_h5_attr_text(value) -> str:
 
 def absorption_h5_skip_reason(path: str) -> Optional[str]:
     """Return a human-readable reason when ``path`` is not raw absorption input."""
+    return linear_h5_skip_reason(path, "absorption")
+
+
+def linear_h5_skip_reason(path: str, task: str) -> Optional[str]:
+    """Return a human-readable reason when ``path`` is not raw ``task`` input."""
+    if task not in LINEAR_TASKS:
+        raise ValueError(f"task must be one of {LINEAR_TASKS}, got {task!r}")
     try:
         with h5py.File(path, "r") as f:
             if "omega_cm" in f:
-                return "processed spectrum HDF5 (use las-plot / las-compare on this file)"
-            task = _decode_h5_attr_text(f.attrs.get("task", ""))
-            if task and task != "absorption":
+                return f"processed spectrum HDF5 (use {_PLOT_TOOL[task]} on this file)"
+            file_task = _decode_h5_attr_text(f.attrs.get("task", ""))
+            if file_task and file_task != task:
                 return (
-                    f"task={task!r} (need `heom_solver absorption` output; "
+                    f"task={file_task!r} (need `heom_solver {task}` output; "
                     "filename prefix such as dis100 is ignored)"
                 )
             missing = [p for p in _SPECTRUM_H5_REQUIRED_PATHS if p not in f]
             if missing:
                 short = [p.split("/")[-1] for p in missing]
-                return f"missing absorption datasets: {', '.join(short)}"
+                return f"missing {task} datasets: {', '.join(short)}"
             basis = heom_h5.param(f, "basis", None)
             if basis != "with_ground":
                 return f"basis={basis!r} (need with_ground)"
@@ -123,6 +139,19 @@ def has_processed_absorption_sibling(source_h5: str) -> bool:
 
 
 @dataclass
+class EquilibrationRecord:
+    """``/results/equilibration`` of a fluorescence run."""
+    time_fs: np.ndarray
+    delta: np.ndarray
+    ratio: np.ndarray
+    estimate: np.ndarray
+    t_eq_fs: float
+    tolerance: float
+    check_interval_fs: float
+    t_max_fs: float
+
+
+@dataclass
 class SpectrumData:
     """Fields unpacked from a raw absorption HDF5 file.
 
@@ -147,6 +176,11 @@ class SpectrumData:
     gamma_cm: float
     eigenvalues_absolute_cm: np.ndarray    # [N], ascending. The ground state is not necessarily index 0.
     eigenvectors: np.ndarray               # complex [N, N], columns are eigenvectors
+    # Optional. None when an older or merged file omits them.
+    reorg_cm: Optional[np.ndarray] = None            # [n_pigments], reorganization energy on the H_eff diagonal
+    markov_residue_cm: Optional[np.ndarray] = None   # [n_bath]
+    rho_eq: Optional[np.ndarray] = None              # complex [N, N], fluorescence equilibrium state
+    equilibration: Optional[EquilibrationRecord] = None
 
     @property
     def n_pigments(self) -> int:
@@ -169,17 +203,40 @@ class SpectrumData:
         return [k for k in range(self.N) if k != g]
 
 
-def load_spectrum_h5(path: str) -> SpectrumData:
-    """Load a ``heom_solver absorption`` HDF5 (new group layout).
+def _optional(f: h5py.File, path: str, dtype) -> Optional[np.ndarray]:
+    return np.asarray(f[path][...], dtype=dtype) if path in f else None
 
-    Stage 1 only supports ``basis == "with_ground"`` — other bases raise
-    ``RuntimeError`` so the |g⟩=index-0 assumption downstream never silently
-    breaks. Schema lives in ``src/output/hdf5_metadata.cpp``.
+
+def _load_equilibration(f: h5py.File) -> Optional[EquilibrationRecord]:
+    if "/results/equilibration" not in f:
+        return None
+    g = f["/results/equilibration"]
+    return EquilibrationRecord(
+        **{k: np.asarray(g[k][...], dtype=np.float64)
+           for k in ("time_fs", "delta", "ratio", "estimate")},
+        **{k: float(g.attrs[k])
+           for k in ("t_eq_fs", "tolerance", "check_interval_fs", "t_max_fs")},
+    )
+
+
+def load_spectrum_h5(path: str, task: Optional[str] = None) -> SpectrumData:
+    """Load a ``heom_solver absorption|fluorescence`` HDF5 (new group layout).
+
+    ``task`` given ⇒ the file's root ``task`` attr must match it. Stage 1 only
+    supports ``basis == "with_ground"`` — other bases raise ``RuntimeError`` so
+    the |g⟩=index-0 assumption downstream never silently breaks. Schema lives
+    in ``src/output/hdf5_metadata.cpp``.
     """
+    if task is not None and task not in LINEAR_TASKS:
+        raise ValueError(f"task must be one of {LINEAR_TASKS}, got {task!r}")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"spectrum file not found: {path}")
 
     with h5py.File(path, "r") as f:
+        heom_h5.require_complete(f)
+        file_task = _decode_h5_attr_text(f.attrs.get("task", ""))
+        if task is not None and file_task != task:
+            raise ValueError(f"{path!r}: task={file_task!r}, need {task!r}")
         missing = [p for p in _SPECTRUM_H5_REQUIRED_PATHS if p not in f]
         if missing:
             raise ValueError(
@@ -208,6 +265,10 @@ def load_spectrum_h5(path: str) -> SpectrumData:
         eta_cm          = float(heom_h5.param(f, "eta_cm",        0.0))
         gamma_cm        = float(heom_h5.param(f, "gamma_cm",      0.0))
         dt_attr         = heom_h5.param(f, "dt", None)
+        reorg_cm          = _optional(f, "/parameters/reorg_cm", np.float64)
+        markov_residue_cm = _optional(f, "/derived/markov_residue_cm", np.float64)
+        rho_eq            = _optional(f, "/results/rho_eq", np.complex128)
+        equilibration     = _load_equilibration(f)
 
     if basis != "with_ground":
         raise RuntimeError(
@@ -250,6 +311,10 @@ def load_spectrum_h5(path: str) -> SpectrumData:
         gamma_cm = gamma_cm,
         eigenvalues_absolute_cm = eig_abs,
         eigenvectors = eigenvectors,
+        reorg_cm = reorg_cm,
+        markov_residue_cm = markov_residue_cm,
+        rho_eq = rho_eq,
+        equilibration = equilibration,
     )
 
 
@@ -370,8 +435,12 @@ def fft_to_spectra_batch(ct_batch: np.ndarray,
 
     ``ct_batch``: complex ``[n_time]`` or ``[n_series, n_time]``.
     Returns ``omega_cm`` ``[N']`` and complex spectra ``[n_series, N']``.
+
+    Trapezoid rule: C(t_0) enters at half weight. The Fortran reference gave it
+    full weight, which adds Re C(0)/(2·nfft) to every ω — a flat baseline of
+    ~1 % of the peak that wrecks ln(I_F/I_A) in the tails (KMS, 2.1.1).
     """
-    ct = np.asarray(ct_batch, dtype=np.complex128)
+    ct = np.array(ct_batch, dtype=np.complex128, ndmin=1)
     if ct.ndim == 1:
         ct = ct[np.newaxis, :]
     elif ct.ndim != 2:
@@ -380,6 +449,7 @@ def fft_to_spectra_batch(ct_batch: np.ndarray,
         )
     if ct.shape[1] == 0:
         raise ValueError("fft_to_spectra_batch: empty time series")
+    ct[:, 0] *= 0.5
 
     nfft = _fft_grid_length(ct.shape[1], dt_fs, dw_cm)
     dt_au = dt_fs / AU2FS

@@ -1,4 +1,5 @@
 #include "ado_filter.cuh"
+#include "ado_norm.cuh"
 #include "cuda_common.cuh"
 #include "core/precision.hpp"
 #include <cuComplex.h>
@@ -9,124 +10,120 @@ using heom::complex_t;
 // ADO filtering by ||rho||_max. alpha 0 (the physical density matrix) stays active.
 
 /**
- * @brief Per-thread ADO norm kernel (small-N path, N*N < 64).
+ * @brief Per-thread ADO norm kernel (small-block path, Nb < 64).
  *
- * One thread scans a full N×N block. Compare |z|² and sqrt() the winner once.
- * Matches the Fortran reference maxval(abs(rho)).
+ * One thread scans one ADO's compact block: Nb = n_row·n_col contiguous
+ * elements (the block IS the ADO, there is nothing else).
+ * Compare |z|² and sqrt() the winner once. Matches the Fortran reference
+ * maxval(abs(rho)).
  *
  * U-local domain: scan_list != nullptr maps slot → α = scan_list[slot]
  * (same indirection as the derivative kernel); n_scan is then the launch count.
  * scan_list == nullptr keeps the historical full-M sweep (α = slot).
  */
+/**
+ * max(cur, x) where a NaN, once seen, is never displaced.
+ *
+ * For finite x this is exactly the old `if (x > cur) cur = x;` — same
+ * predicate, same order, so every finite-valued run stays bit-identical.
+ * For NaN x the second clause fires and cur becomes NaN; afterwards both
+ * clauses are false for any finite x (x > NaN is false, x != x is false), so
+ * the NaN survives the rest of the scan and the warp reduction.
+ *
+ * Not fmax(): CUDA fmax returns the non-NaN operand by definition — it is
+ * built to hide exactly what we need to surface. Not !(x <= cur) either: it
+ * lets a NaN cur be overwritten by the next finite x.
+ */
+__device__ __forceinline__ double nan_sticky_max(double cur, double x) {
+    return (x > cur || x != x) ? x : cur;
+}
+
 __global__ void compute_ado_norms_kernel(
     const complex_t* rho_in,
     double* norms,
     int n_scan,
-    int N,
+    int Nb,
     int M,
-    int batch,
-    int row_off,
-    int n_row,
-    int col_off,
-    int n_col,
-    const int* __restrict__ scan_list
+    const int* __restrict__ scan_list,
+    const int* __restrict__ scan_off
 )
 {
+    // Slot b = grid.y owns its own [M][Nb] block of ρ and its own [M] row of
+    // norms: every slot is filtered on its own state (per-slot active sets,
+    // 2026-10-22-batch-per-slot). scan_off != nullptr gives each slot its own
+    // segment [scan_off[b], scan_off[b+1]) of scan_list (the slot's previous
+    // launch set); nullptr ⇒ the one scan_list (or full M) for every slot.
+    // batch == 1 ⇒ b == 0, the historical single-state scan.
+    const int b = blockIdx.y;
+    const int n = scan_off ? scan_off[b + 1] - scan_off[b] : n_scan;
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (slot >= n_scan) return;
-    const int alpha = scan_list ? scan_list[slot] : slot;
+    if (slot >= n) return;
+    const int* list = (scan_list && scan_off) ? scan_list + scan_off[b] : scan_list;
+    const int alpha = list ? list[slot] : slot;
 
-    // Union norm: ‖ρ_α‖ := max over batch slots b of ‖ρ_α^(b)‖_max. One flag
-    // set gates all B states (union closure), so an ADO active in ANY slot must
-    // survive the filter. batch==1 ⇒ single slot, boff==0 ⇒ historical path.
-    const size_t N2 = static_cast<size_t>(N) * N;
     // Norm math stays FP64: max-norm has no accumulation, and the
     // hier element (float in mixed) promotes cleanly into the double compare.
+    //
+    // NaN must STICK (see nan_sticky_max). A plain `>` skips NaN elements, so
+    // an ADO that has blown up to NaN reports the max of its finite remainder
+    // (0 if fully NaN), gets marked inactive, is frozen out of the derivative,
+    // and the run finishes with a finite, wrong answer that ‖ρ₀‖_F never sees.
     double max_abs_sq = 0.0;
 
-    // One thread owns the whole sub-block, so walk it as nested row/col loops:
-    // no per-element division, and each row is a contiguous run.
-    for (int b = 0; b < batch; ++b) {
-        const complex_t* rho_alpha =
-            &rho_in[static_cast<size_t>(b) * M * N2 + static_cast<size_t>(alpha) * N2];
-        for (int r = 0; r < n_row; ++r) {
-            const complex_t* row =
-                rho_alpha + static_cast<size_t>(row_off + r) * N + col_off;
-            for (int c = 0; c < n_col; ++c) {
-                double re = heom::c_re(row[c]);
-                double im = heom::c_im(row[c]);
-                double abs_sq = re * re + im * im;
-                if (abs_sq > max_abs_sq) {
-                    max_abs_sq = abs_sq;
-                }
-            }
-        }
-    }
+    const complex_t* rho_alpha =
+        &rho_in[(static_cast<size_t>(b) * M + alpha) * Nb];
+    for (int e = 0; e < Nb; ++e)
+        max_abs_sq = nan_sticky_max(max_abs_sq, heom::ado_abs_sq(rho_alpha[e]));
 
-    norms[alpha] = sqrt(max_abs_sq);
+    norms[static_cast<size_t>(b) * M + alpha] = sqrt(max_abs_sq);
 }
 
 /**
- * @brief Warp-cooperative ADO norm kernel (primary path, N*N ≥ 64).
+ * @brief Warp-cooperative ADO norm kernel (large-block path, Nb ≥ 64).
  *
  * Layout: blockDim = (32, WARPS_PER_BLOCK), one warp per ADO. Lane l strides
- * over the ADO's N*N elements with step 32; the per-lane max is reduced across
- * the warp via __shfl_xor_sync and lane 0 writes the sqrt. At large N this
- * turns one thread's uncoalesced N²-element scan into 32 coalesced lanes, and
- * it saturates the SMs at far smaller M (important once filtering shrinks M).
- * Indexes rho_in[alpha*N*N] with int, so the ceiling is M·N² < 2^31.
+ * over the ADO's Nb contiguous elements with step 32; the per-lane max is
+ * reduced across the warp via __shfl_xor_sync and lane 0 writes the sqrt. At
+ * large Nb this turns one thread's serial scan into 32 coalesced lanes, and it
+ * saturates the SMs at far smaller M (important once filtering shrinks M).
+ * The ρ offset (b·M + alpha)·Nb is computed in size_t; only the ADO slot
+ * index is int, and n_scan ≤ M is far below that range.
  */
 __global__ void compute_ado_norms_warp_kernel(
     const complex_t* __restrict__ rho_in,
     double* __restrict__ norms,
     int n_scan,
-    int N,
+    int Nb,
     int M,
-    int batch,
-    int row_off,
-    int n_row,
-    int col_off,
-    int n_col,
-    const int* __restrict__ scan_list)
+    const int* __restrict__ scan_list,
+    const int* __restrict__ scan_off)
 {
+    // Per-slot (grid.y = b), same domain rule as compute_ado_norms_kernel.
+    const int b = blockIdx.y;
+    const int n = scan_off ? scan_off[b + 1] - scan_off[b] : n_scan;
     int slot = blockIdx.x * blockDim.y + threadIdx.y;
-    if (slot >= n_scan) return;
-    const int alpha = scan_list ? scan_list[slot] : slot;
+    if (slot >= n) return;
+    const int* list = (scan_list && scan_off) ? scan_list + scan_off[b] : scan_list;
+    const int alpha = list ? list[slot] : slot;
 
     const int lane = threadIdx.x;
-    // Union norm across batch slots (see compute_ado_norms_kernel). batch==1 ⇒
-    // single slot, boff==0 ⇒ byte-identical to the pre-batch warp scan.
-    const size_t N2 = static_cast<size_t>(N) * N;
     double local_max = 0.0;
 
-    // Flat index over the sub-block, NOT nested row/col loops: the production
-    // blocks are 7 columns wide (ESA 21x7, SE/GSB 7x1), so striding lanes along
-    // a row would leave 25 of 32 idle. One integer division per element buys a
-    // full warp; this kernel is bandwidth-bound (16 B read per element), so the
-    // division hides. (0,N,0,N) ⇒ idx == e ⇒ byte-identical to the old scan.
-    const int total = n_row * n_col;
-    for (int b = 0; b < batch; ++b) {
-        const complex_t* rho_alpha =
-            &rho_in[static_cast<size_t>(b) * M * N2 + static_cast<size_t>(alpha) * N2];
-        #pragma unroll 4
-        for (int e = lane; e < total; e += 32) {
-            const int idx = (row_off + e / n_col) * N + col_off + e % n_col;
-            double re = heom::c_re(rho_alpha[idx]);
-            double im = heom::c_im(rho_alpha[idx]);
-            double abs_sq = re * re + im * im;
-            if (abs_sq > local_max) local_max = abs_sq;
-        }
-    }
+    const complex_t* rho_alpha =
+        &rho_in[(static_cast<size_t>(b) * M + alpha) * Nb];
+    #pragma unroll 4
+    for (int e = lane; e < Nb; e += 32)
+        local_max = nan_sticky_max(local_max, heom::ado_abs_sq(rho_alpha[e]));
 
     // Warp shuffle max-reduction (32 lanes → 1)
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         double other = __shfl_xor_sync(0xFFFFFFFFu, local_max, offset);
-        if (other > local_max) local_max = other;
+        local_max = nan_sticky_max(local_max, other);
     }
 
-    if (lane == 0) norms[alpha] = sqrt(local_max);
+    if (lane == 0) norms[static_cast<size_t>(b) * M + alpha] = sqrt(local_max);
 }
 
 void compute_ado_norms(
@@ -134,58 +131,37 @@ void compute_ado_norms(
     double* norms,
     int M,
     int N,
-    int row_off,
-    int n_row,
-    int col_off,
-    int n_col,
+    const heom::ManifoldBlock& blk,
     const int* scan_list,
     int scan_count,
-    int batch
+    int batch,
+    const int* scan_off
 )
 {
-    // Same contract as HEOMContext (heom_derivatives.cuh): an empty block is
-    // the default-constructed value, so rejecting it forces callers to write
-    // "(0,N,0,N)" when they mean the whole matrix. Throw before launch — an
-    // out-of-range block would read past the ADO inside the kernel.
-    if (n_row <= 0 || n_col <= 0) {
-        throw std::invalid_argument(
-            "compute_ado_norms: manifold block must be non-empty; use "
-            "(0,N,0,N) for the whole matrix");
-    }
-    if (row_off < 0 || col_off < 0 ||
-        row_off + n_row > N || col_off + n_col > N) {
-        throw std::invalid_argument(
-            "compute_ado_norms: manifold block out of range");
-    }
+    // Same contract as HEOMContext, same single rule. The block is the storage
+    // shape of `rho_in`; a wrong one here is a wrong stride, so fail loud.
+    blk.validate(N, "compute_ado_norms");
+    const int Nb = blk.elems();
 
     // U-local: launch over the compact scan set instead of full M.
+    // With per-slot segments (scan_off) scan_count is the LONGEST segment —
+    // grid.x covers it and shorter slots return early.
     const int n_scan = scan_list ? scan_count : M;
-    if (n_scan <= 0) return;
-    // norms[] is [M] (one union entry per ADO), NOT [batch*M]: the union max
-    // over slots collapses the batch dimension here so downstream marking and
-    // the shared active_flags stay batch-agnostic.
+    if (n_scan <= 0 || batch <= 0) return;
+    // norms[] is [batch][M]: one row per slot (per-slot active sets).
 
-    // N*N ≥ 64 (empirical Ampere cross-over): warp kernel; smaller stays on the
-    // per-thread path where its lower overhead wins.
-    // Deliberately still keyed on N*N, not on the block's n_row*n_col: swapping
-    // a 7-element block onto the per-thread path would serialise 7 loads in one
-    // thread instead of issuing them from 7 lanes. Both kernels agree bitwise
-    // (max is order-independent), so this stays a pure performance choice —
-    // and it should not be re-tuned without a measurement.
-    if (N * N >= 64) {
+    // Nb >= 64: warp kernel; smaller blocks stay on the per-thread path.
+    // Both agree bitwise. Do not retune the cutoff without a measurement.
+    if (Nb >= 64) {
         constexpr int WARPS_PER_BLOCK = 4;          // 4 warps × 32 lanes = 128 threads/block
         dim3 block(32, WARPS_PER_BLOCK);
-        int num_blocks = (n_scan + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-        compute_ado_norms_warp_kernel<<<num_blocks, block>>>(
-            rho_in, norms, n_scan, N, M, batch,
-            row_off, n_row, col_off, n_col, scan_list
-        );
+        dim3 grid((n_scan + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch);
+        compute_ado_norms_warp_kernel<<<grid, block>>>(
+            rho_in, norms, n_scan, Nb, M, scan_list, scan_off);
     } else {
-        int num_blocks = (n_scan + HEOM_BLOCK_SIZE - 1) / HEOM_BLOCK_SIZE;
-        compute_ado_norms_kernel<<<num_blocks, HEOM_BLOCK_SIZE>>>(
-            rho_in, norms, n_scan, N, M, batch,
-            row_off, n_row, col_off, n_col, scan_list
-        );
+        dim3 grid((n_scan + HEOM_BLOCK_SIZE - 1) / HEOM_BLOCK_SIZE, batch);
+        compute_ado_norms_kernel<<<grid, HEOM_BLOCK_SIZE>>>(
+            rho_in, norms, n_scan, Nb, M, scan_list, scan_off);
     }
     CUDA_CHECK_KERNEL();
 }
@@ -206,42 +182,96 @@ void compute_ado_norms(
  * alpha == 0 lane writes 1 unconditionally. The constructor's initial
  * active_flags[0] = 1 is then merely a pre-first-filter default, not a
  * correctness dependency — no caller has to "remember" to keep index 0 set.
+ *
+ * NaN norm (the norm kernel lets it through on purpose): the ADO stays ACTIVE
+ * and nan_flag is raised. Active so the NaN keeps propagating toward ρ₀
+ * instead of being frozen behind an inactive flag; the flag so the host can
+ * abort at its next divergence check without waiting for that. The atomic
+ * only fires on the NaN path — the finite hot path is unchanged.
  */
 __global__ void filter_ados_kernel(
     const double* __restrict__ norms,
     int8_t* __restrict__ active_flags,
+    int* __restrict__ nan_flag,
     double threshold,
     int n_scan,
-    const int* __restrict__ scan_list
+    int M,
+    const int* __restrict__ scan_list,
+    const int* __restrict__ scan_off,
+    bool squared
 )
 {
+    // Per-slot (grid.y = b): slot b's flags [b·M, +M) from its own norms,
+    // over its own scan segment (see compute_ado_norms_kernel).
+    const int b = blockIdx.y;
+    const int n_b = scan_off ? scan_off[b + 1] - scan_off[b] : n_scan;
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= n_scan) return;
+    if (slot >= n_b) return;
     // U-local domain: flags outside scan_list keep their value. Callers pass
     // the previous step's WRITE SET, so any α outside it is inactive (A ⊆ U)
     // with a frozen sub-threshold norm — its flag is already 0 and stays 0.
-    const int alpha = scan_list ? scan_list[slot] : slot;
-    active_flags[alpha] = (alpha == 0 || norms[alpha] > threshold) ? 1 : 0;
+    const int* list = (scan_list && scan_off) ? scan_list + scan_off[b] : scan_list;
+    const int alpha = list ? list[slot] : slot;
+    const size_t at = static_cast<size_t>(b) * M + alpha;
+    // squared: norms holds max|ρ|² from the fused kFinal epilogue; the sqrt
+    // the standalone kernel would have taken is taken here (same operand).
+    const double n = squared ? sqrt(norms[at]) : norms[at];
+    const bool is_nan = (n != n);
+    if (is_nan) atomicOr(nan_flag, 1);
+    active_flags[at] = (alpha == 0 || is_nan || n > threshold) ? 1 : 0;
 }
 
 void filter_ados_mark_only(
     const double* norms,
     int8_t* active_flags,
+    int* nan_flag,
     double threshold,
     int M,
     const int* scan_list,
-    int scan_count
+    int scan_count,
+    int batch,
+    const int* scan_off,
+    bool norms_squared
 )
 {
+    if (nan_flag == nullptr) {
+        throw std::invalid_argument(
+            "filter_ados_mark_only: nan_flag must be a device int (the NaN "
+            "hazard this guards against is silent; no opt-out)");
+    }
     const int n_scan = scan_list ? scan_count : M;
-    if (n_scan <= 0) return;
-    const int num_blocks = (n_scan + HEOM_BLOCK_SIZE - 1) / HEOM_BLOCK_SIZE;
-    filter_ados_kernel<<<num_blocks, HEOM_BLOCK_SIZE>>>(
-        norms, active_flags, threshold, n_scan, scan_list
+    if (n_scan <= 0 || batch <= 0) return;
+    const dim3 grid((n_scan + HEOM_BLOCK_SIZE - 1) / HEOM_BLOCK_SIZE, batch);
+    filter_ados_kernel<<<grid, HEOM_BLOCK_SIZE>>>(
+        norms, active_flags, nan_flag, threshold, n_scan, M, scan_list, scan_off,
+        norms_squared
     );
     CUDA_CHECK_KERNEL();
     // No count here: |A| is derived on demand from the level distribution
     // (see emit_ado_stats). This drops one D2H sync per filter step.
+}
+
+__global__ void count_zero_norms_kernel(const double* __restrict__ norms,
+                                        int M, int* __restrict__ count)
+{
+    // grid.y = slot b: count[b] = #{α : norms[b·M + α] == 0}.
+    // One atomic per block (block-wide count).
+    const int b = blockIdx.y;
+    const int alpha = blockIdx.x * blockDim.x + threadIdx.x;
+    const int c = __syncthreads_count(
+        alpha < M && norms[static_cast<size_t>(b) * M + alpha] == 0.0);
+    if (threadIdx.x == 0 && c > 0) atomicAdd(&count[b], c);
+}
+
+void count_zero_norms(const double* norms, int M, int batch, int* d_count,
+                      int* h_count)
+{
+    CUDA_CHECK(cudaMemset(d_count, 0, batch * sizeof(int)));
+    const dim3 grid((M + HEOM_BLOCK_SIZE - 1) / HEOM_BLOCK_SIZE, batch);
+    count_zero_norms_kernel<<<grid, HEOM_BLOCK_SIZE>>>(norms, M, d_count);
+    CUDA_CHECK_KERNEL();
+    CUDA_CHECK(cudaMemcpy(h_count, d_count, batch * sizeof(int),
+                          cudaMemcpyDeviceToHost));
 }
 
 // ============================================================================
@@ -260,7 +290,7 @@ __global__ void count_active_by_level_kernel(
     const int8_t* __restrict__ active_flags,
     const int8_t* __restrict__ level_indices,
     int* __restrict__ level_counts,
-    int M, int n_bath, int K, int max_level
+    int M, int D, int max_level
 )
 {
     extern __shared__ int s_level[];   // [max_level + 1]
@@ -272,8 +302,7 @@ __global__ void count_active_by_level_kernel(
 
     int alpha = blockIdx.x * blockDim.x + threadIdx.x;
     if (alpha < M && active_flags[alpha]) {
-        const int level = filter_stats_level_for_ado(
-            level_indices, alpha, n_bath, K);
+        const int level = filter_stats_level_for_ado(level_indices, alpha, D);
         // Bounded by L_cutoff < 127 (HEOMConfig::validate enforces this);
         // s_level[level] is always in range.
         atomicAdd(&s_level[level], 1);
@@ -289,7 +318,7 @@ __global__ void count_active_by_level_kernel(
 void compute_active_level_distribution(
     const int8_t* active_flags,
     const int8_t* level_indices,
-    int M, int n_bath, int K,
+    int M, int D,
     int max_level,
     int* d_level_counts,
     int* h_level_counts
@@ -302,7 +331,7 @@ void compute_active_level_distribution(
         static_cast<size_t>(max_level + 1) * sizeof(int);
 
     count_active_by_level_kernel<<<num_blocks, HEOM_BLOCK_SIZE, smem_bytes>>>(
-        active_flags, level_indices, d_level_counts, M, n_bath, K, max_level
+        active_flags, level_indices, d_level_counts, M, D, max_level
     );
     CUDA_CHECK_KERNEL();
 

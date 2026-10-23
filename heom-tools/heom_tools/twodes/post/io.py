@@ -10,7 +10,7 @@ from typing import List, Tuple
 import h5py
 import numpy as np
 
-from heom_tools.common import mc_naming
+from heom_tools.common import heom_h5, mc_naming
 from heom_tools.common.heom_h5 import decode_attr as _decode_attr_common
 from heom_tools.common.mc_merge import ensure_shard_group_merged, fold_shard_groups
 
@@ -138,6 +138,7 @@ def is_solver_2des_h5(path: str, *, verbose: bool = False) -> bool:
 def load_meta(path: str) -> Tuple[np.ndarray, List[str], List[str]]:
     """Lightweight read for skip checks (no response tensor)."""
     with h5py.File(path, "r") as f:
+        heom_h5.require_complete(f)
         if "/results/tw_fs" not in f:
             raise ValueError(f"{path}: missing dataset /results/tw_fs")
         if "/parameters" not in f:
@@ -150,6 +151,7 @@ def load_meta(path: str) -> Tuple[np.ndarray, List[str], List[str]]:
 def load_axes(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], List[str]]:
     """Time axes and metadata only (no response tensor)."""
     with h5py.File(path, "r") as f:
+        heom_h5.require_complete(f)
         for ds in ("/results/tau_fs", "/results/tw_fs", "/results/t_fs", "/results/resp"):
             if ds not in f:
                 raise ValueError(f"{path}: missing dataset {ds}")

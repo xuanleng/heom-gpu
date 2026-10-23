@@ -1,5 +1,0 @@
-.pytest_cache/
-output/
-__pycache__/
-*.pyc
-dist/

@@ -40,7 +40,7 @@ import warnings
 import numpy as np
 import h5py
 
-from heom_tools.common import mc_naming
+from heom_tools.common import heom_h5, mc_naming
 
 MC_GROUP = "/mc"
 
@@ -74,6 +74,7 @@ def merge_mc_shards(paths, results_dataset):
 
     for f in paths:
         with h5py.File(f, "r") as p:
+            heom_h5.require_complete(p)
             if MC_GROUP not in p:
                 raise ValueError(
                     f"'{f}' has no /mc group; not an MC shard (looks like a "
@@ -401,10 +402,50 @@ def write_merged_spectrum(shard_ref, out_path, merged, results_dataset):
     marker) that las-post reads with zero special-casing. For quadrature this
     also normalises the /results placeholder into the true disorder average."""
     ds_path = f"/results/{results_dataset}"
-    shutil.copyfile(shard_ref, out_path)
-    with h5py.File(out_path, "r+") as f:
+    # Built under a temporary name and renamed into place: callers treat an
+    # existing merged name as done, so a failure must not leave one behind.
+    tmp_path = f"{out_path}.partial-{os.getpid()}"
+    shutil.copyfile(shard_ref, tmp_path)
+    try:
+        _write_merged_into(tmp_path, ds_path, merged)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    return out_path
+
+
+def _rebuild_group_v18(f, name):
+    """Recreate group `name` with a v2 (HDF5 1.8) object header.
+
+    A shard written in the earliest file format holds its attributes in a v1
+    object header, whose messages are capped at 64 KiB, so the merged r_done
+    (one int64 per realization) cannot exceed ~8190 entries there (measured: 8000 ok, 8191 fails). A group
+    created while `f` is open with libver >= v108 stores large attributes
+    densely. Members move by link (no data is copied) and attributes are
+    copied with their exact file datatypes; readers see the same group.
+    """
+    old = f[name]
+    tmp = name.rstrip("/") + "__v18"
+    new = f.create_group(tmp)
+    for key in list(old.keys()):
+        f.move(f"{name}/{key}", f"{tmp}/{key}")
+    for attr in list(old.attrs):
+        src = h5py.h5a.open(old.id, attr.encode())
+        buf = np.empty(src.shape, dtype=src.dtype)
+        src.read(buf)
+        dst = h5py.h5a.create(new.id, attr.encode(), src.get_type(), src.get_space())
+        dst.write(buf)
+    del f[name]
+    f.move(tmp, name)
+
+
+def _write_merged_into(path, ds_path, merged):
+    with h5py.File(path, "r+", libver=("v108", "latest")) as f:
         f[ds_path][...] = merged["mean"].astype(np.complex128)
         f[ds_path].attrs["disorder_averaged"] = np.int64(1)
+        _rebuild_group_v18(f, MC_GROUP)
         mc = f[MC_GROUP]
         mc["count"][...] = np.int64(merged["count"])
         mc.attrs["r_done"] = merged["r_done"]
@@ -431,4 +472,3 @@ def write_merged_spectrum(shard_ref, out_path, merged, results_dataset):
                 del mc["sem"]
             mc.create_dataset("sem", data=merged["sem"].astype(np.float64))
             mc.attrs["se_l2"] = float(merged["se_l2"])
-    return out_path

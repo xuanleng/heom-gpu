@@ -4,14 +4,14 @@
 #include "core/rk4_integrator.cuh"
 #include "core/ado_filter.cuh"
 #include "core/dipole_apply.cuh"
+#include "core/dressed_start.cuh"
+#include "core/hierarchy_distance.cuh"
 #include "core/precision.hpp"
 #include "gpu_alloc_plan.hpp"
 #include "memory_budget.hpp"
 #include "ulist_builder.hpp"
-#include "output/hdf5_writer.hpp"
-#include "output/console_printer.hpp"
 
-#include <chrono>
+#include <algorithm>    // std::fill (block expansion), std::max
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -20,17 +20,17 @@
 #include <stdexcept>
 #include <utility>      // std::swap (move-only GPUMemory ping-pong)
 
-// Definition required because HEOMTrajectory holds std::unique_ptr<HDF5Writer>
+// Definition required because HEOMTrajectory holds std::unique_ptr<UListBuilder>
 // (forward-declared in heom_trajectory.hpp); ~unique_ptr needs the complete
-// HDF5Writer destructor at the point the trajectory's destructor is emitted.
+// type at the point the trajectory's destructor is emitted.
 HEOMTrajectory::~HEOMTrajectory() = default;
 
-HEOMTrajectory::HEOMTrajectory(const SystemContext& sys, bool enable_hdf5,
-                               int batch)
+HEOMTrajectory::HEOMTrajectory(const SystemContext& sys, int batch)
     : sys_(sys)
-    , enable_hdf5_(enable_hdf5)
     , batch_(batch)
+    , capacity_(sys.rho_capacity())
     , active_batch_(batch)
+    , support_{}          // no ρ yet ⇒ no support; set_initial installs the first
     , use_filtering_(sys.config().filter.enabled)
     , filter_threshold_(sys.config().filter.tolerance)
     , integrator_(sys.config().time.integrator)
@@ -39,16 +39,14 @@ HEOMTrajectory::HEOMTrajectory(const SystemContext& sys, bool enable_hdf5,
         throw std::invalid_argument(
             "HEOMTrajectory: batch must be >= 1, got " + std::to_string(batch_));
     }
-    // Enforce the M·N² < 2^31 kernel index ceiling HERE, the one chokepoint
-    // every propagation path passes through. The derivative launcher re-checks
-    // per launch, but the dipole/gather/trace kernels compute int totals
-    // without a guard — and in 2DES the FIRST kernel to run is a dipole apply.
-    // Failing loud at construction closes that window.
-    (void)heom::checked_total_elements(sys_.M(), sys_.N());
+    // Enforce the M·Nb < 2^31 kernel index ceiling HERE, the one chokepoint
+    // every propagation path passes through, at the largest Nb this run can
+    // hold. The derivative launcher re-checks per launch, but the
+    // dipole/trace kernels compute int totals without a guard — and in
+    // 2DES the FIRST kernel to run is a dipole apply. Failing loud at
+    // construction closes that window.
+    (void)heom::checked_rho_elements(sys_.M(), capacity_);
     allocate_trajectory_buffers();
-    if (enable_hdf5_) {
-        writer_ = std::make_unique<HDF5Writer>(sys_.config().output.use_timestamp);
-    }
 }
 
 void HEOMTrajectory::allocate_trajectory_buffers() {
@@ -56,10 +54,12 @@ void HEOMTrajectory::allocate_trajectory_buffers() {
     // carry by B. SystemContext's pre-alloc budget check only saw the B=1
     // footprint, so re-check here with the real batch BEFORE cudaMalloc'ing B×
     // the biggest arrays. B==1 skips it (SystemContext already covered it).
+    // SystemContext's tables are on the device by now: free memory already
+    // excludes them.
     if (batch_ > 1) {
         auto budget = heom::estimate_budget(
             sys_.config(), static_cast<size_t>(sys_.M()),
-            static_cast<size_t>(batch_));
+            static_cast<size_t>(batch_), heom::Resident::SystemTables);
         size_t gpu_free = 0, gpu_total = 0;
         heom::query_gpu_memory(gpu_free, gpu_total);
         std::string err;
@@ -77,10 +77,12 @@ void HEOMTrajectory::allocate_trajectory_buffers() {
     }
 
     // Only the trajectory-mutable subset of the canonical plan. batch_ scales
-    // d_rho / d_workspace inside the plan (read-only structure stays ×1).
+    // d_rho / d_workspace inside the plan (read-only structure stays ×1);
+    // capacity_ is the per-ADO element count they are sized for.
     const auto plan = heom::plan_gpu_buffers(
-        static_cast<size_t>(sys_.M()), sys_.N(), sys_.K(),
-        sys_.n_bath(), sys_.L(), use_filtering_, static_cast<size_t>(batch_));
+        static_cast<size_t>(sys_.M()), sys_.N(), sys_.D(),
+        sys_.n_bath(), sys_.L(), use_filtering_, static_cast<size_t>(batch_),
+        static_cast<size_t>(capacity_));
 
     // typed_alloc throws std::logic_error if the plan's elem_bytes for the
     // named entry doesn't match sizeof(T), so a future change to either
@@ -88,15 +90,17 @@ void HEOMTrajectory::allocate_trajectory_buffers() {
     // sizeof(...) literal) cannot silently under/over-allocate.
     d_rho_       = heom::typed_alloc<heom::complex_t>(plan, "d_rho");
     d_workspace_ = heom::typed_alloc<heom::complex_t>(plan, "d_workspace");
+    d_dist_partials_ = heom::typed_alloc<double>(plan, "d_dist_partials");
+    h_dist_partials_.resize(d_dist_partials_.size());
 
     // Kahan carry for the mixed-precision RK4 combine: same shape
-    // as ρ (batch·M·N²), allocated + zeroed ONCE here and persisted for the run.
-    // FP64 build skips it entirely (empty ⇒ rk4_step gets nullptr ⇒ plain
+    // as ρ (batch·M·Nb_cap), allocated + zeroed ONCE here and persisted for the
+    // run. FP64 build skips it entirely (empty ⇒ rk4_step gets nullptr ⇒ plain
     // combine ⇒ bit-identical to history). Not in the alloc plan because it is a
     // precision-mode-only cost; memory_budget.cpp accounts for it separately.
     if constexpr (heom::kMixedPrecision) {
         d_kahan_comp_ = GPUMemory<heom::complex_t>(
-            static_cast<size_t>(batch_) * sys_.M() * sys_.N() * sys_.N());
+            static_cast<size_t>(batch_) * sys_.M() * capacity_);
         d_kahan_comp_.zero();
     }
 
@@ -104,369 +108,200 @@ void HEOMTrajectory::allocate_trajectory_buffers() {
     // default rk4 path pays zero extra GPU memory. Values are filled lazily on
     // the first run_step (dt is a run-time property), not here.
     if (integrator_ == Integrator::IfRk4) {
-        d_if_e_half_ = GPUMemory<heom::real_t>(static_cast<size_t>(sys_.M()));
-        d_if_e_full_ = GPUMemory<heom::real_t>(static_cast<size_t>(sys_.M()));
+        d_if_e_half_ = GPUMemory<heom::complex_t>(static_cast<size_t>(sys_.M()));
+        d_if_e_full_ = GPUMemory<heom::complex_t>(static_cast<size_t>(sys_.M()));
     }
 
     if (use_filtering_) {
         d_ado_norms_    = heom::typed_alloc<double>(plan, "d_ado_norms");
         d_active_flags_ = heom::typed_alloc<int8_t>(plan, "d_active_flags");
         d_level_counts_ = heom::typed_alloc<int>(plan, "d_level_counts");
+        d_nan_flag_     = GPUMemory<int>(1);   // 4 bytes; not worth a plan entry
+        d_nan_flag_.zero();
+        d_zero_count_   = GPUMemory<int>(static_cast<size_t>(batch_));
+        h_zero_counts_.resize(batch_);
 
         h_level_counts_.resize(d_level_counts_.size());
 
-        // All ADOs active for the pre-first-filter warmup. active_flags[0] is
-        // re-asserted every pass by the filter kernel (rho_0 active for life),
-        // so this is only a default, not a correctness dependency.
-        std::vector<int8_t> h_active_flags(sys_.M(), 1);
-        d_active_flags_.copy_from_host(h_active_flags.data(), sys_.M());
+        // All ADOs of every slot active until the first filter pass.
+        // active_flags[b·M + 0] is re-asserted every pass by the filter kernel
+        // (rho_0 active for life), so this is only a default, not a
+        // correctness dependency.
+        CUDA_CHECK(cudaMemset(d_active_flags_.get(), 1, d_active_flags_.size()));
         total_active_ados_ = sys_.M();
     }
 
-    // Host mirror of the α=0 block, one per batch slot ([B][N²], slot-major).
-    // B==1 ⇒ N² (unchanged). d2h_alpha0_batch() gathers the B non-contiguous
-    // device α=0 blocks (spaced M·N² apart) into this contiguous host buffer.
+    // Host mirror of the α=0 block, one per batch slot ([B][N²], slot-major,
+    // FULL matrix). d2h_alpha0_batch() pulls the B compact α=0 blocks (spaced
+    // M·Nb apart) into h_pack_ and expands them here with +0 outside the block.
     h_rho0_.resize(static_cast<size_t>(batch_) * sys_.N() * sys_.N());
-}
-
-// Gather the B α=0 blocks (device slot stride M·N²) into the contiguous host
-// mirror h_rho0_ ([B][N²]). One cudaMemcpy2D. B==1 degenerates to a single N²
-// D2H (dpitch==spitch==width, height 1), bit-identical to the old copy_to_host.
-void HEOMTrajectory::probe_blocks(const char* where) const {
-    const heom::StreamFormat fmt_guard(std::cout);
-    static const bool on = (std::getenv("HEOM_BLOCK_PROBE") != nullptr);
-    if (!on) return;
-
-    const int N = sys_.N();
-    const int M = sys_.M();
-    const int B = active_batch_;
-
-    // Manifold boundaries come from the declared basis, never from guessing at
-    // N: an unrecognised basis must say so, not silently mislabel the blocks.
-    const int n_states = sys_.config().physics.n_states;
-    int bound[4] = {0, 0, 0, N};   // [g_lo, e_lo, f_lo, N) — empty ranges collapse
-    const char* names[3] = {"g", "e", "f"};
-    switch (sys_.config().physics.basis) {
-        case BasisType::EXCITED_ONLY:     // no ground, no doubles: all of N is e
-            bound[0] = 0; bound[1] = 0; bound[2] = N; break;
-        case BasisType::WITH_GROUND:      // g=[0,1), e=[1,N), no f
-            bound[0] = 0; bound[1] = 1; bound[2] = N; break;
-        case BasisType::DOUBLE_EXCITED:   // g=[0,1), e=[1,1+n), f=[1+n,N)
-            bound[0] = 0; bound[1] = 1; bound[2] = 1 + n_states; break;
-        default:
-            std::cout << "[blockprobe] unknown basis; refusing to label blocks\n";
-            return;
-    }
-
-    std::vector<heom::complex_t> h(static_cast<size_t>(B) * M * N * N);
-    CUDA_CHECK(cudaMemcpy(h.data(), d_rho_.get(),
-                          h.size() * sizeof(heom::complex_t),
-                          cudaMemcpyDeviceToHost));
-
-    // max |ρ| per (row manifold, column manifold), folded over every slot and
-    // every ADO: one occupied block is the hypothesis, two is the refutation.
-    double blk[3][3] = {};
-    for (size_t e = 0; e < h.size(); ++e) {
-        const double mag = std::abs(std::complex<double>(heom::c_re(h[e]),
-                                                         heom::c_im(h[e])));
-        if (mag == 0.0) continue;
-        const int ij = static_cast<int>(e % (static_cast<size_t>(N) * N));
-        const int i = ij / N, j = ij % N;
-        int ri = 0, cj = 0;
-        while (ri < 2 && i >= bound[ri + 1]) ++ri;
-        while (cj < 2 && j >= bound[cj + 1]) ++cj;
-        if (mag > blk[ri][cj]) blk[ri][cj] = mag;
-    }
-
-    std::cout << "[blockprobe] seg=" << (log_prefix_.empty() ? "-" : log_prefix_)
-              << " at=" << where << " N=" << N << " B=" << B << " occ=";
-    int n_occ = 0;
-    int occ_r = -1, occ_c = -1;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            if (blk[r][c] > 0.0) {
-                std::cout << (n_occ ? "," : "") << names[r] << names[c] << ":"
-                          << std::scientific << std::setprecision(2) << blk[r][c];
-                ++n_occ;
-                occ_r = r; occ_c = c;
-            }
-    if (n_occ == 0) std::cout << "-";
-    std::cout << " n_occ=" << n_occ;
-
-    // What the kernel will ACTUALLY launch over — read from ctx_, not from the
-    // blk_* members. The difference matters: with HEOM_NO_MANIFOLD_BLOCK the
-    // driver still declares blocks, and printing the declaration would show a
-    // block while the kernel sweeps the whole matrix. This column is the one
-    // that can be compared against occ.
-    //
-    // Before the first propagation ctx_ does not exist yet (build_context is
-    // lazy), and printing its zero-initialised fields would flag every init and
-    // post-dipole observation as a mismatch against a launch that is not going
-    // to happen. Say "unbuilt" and skip the comparison.
-    if (!ctx_built_) {
-        std::cout << " launch=unbuilt\n" << std::flush;
-        return;
-    }
-    std::cout << " launch=" << ctx_.row_off << "+" << ctx_.n_row
-              << "," << ctx_.col_off << "+" << ctx_.n_col;
-
-    // Occupancy outside the launch domain is the failure this probe exists for:
-    // those elements are neither read nor written, so they are frozen and the
-    // answer is silently wrong. Say so in a word grep can find.
-    if (n_occ == 1) {
-        const bool inside = bound[occ_r]     >= ctx_.row_off
-                         && bound[occ_r + 1] <= ctx_.row_off + ctx_.n_row
-                         && bound[occ_c]     >= ctx_.col_off
-                         && bound[occ_c + 1] <= ctx_.col_off + ctx_.n_col;
-        if (!inside) std::cout << " MISMATCH";
-    } else if (n_occ > 1) {
-        std::cout << " MISMATCH";   // more than one block occupied: no single
-                                    // declaration can be right
-    }
-    std::cout << "\n" << std::flush;
+    h_pack_.resize(static_cast<size_t>(batch_) * capacity_);
+    norm0_.assign(batch_, 0.0);
+    fresh_state_.assign(batch_, 1);
+    fresh_zeros_.assign(batch_, -1);
 }
 
 void HEOMTrajectory::on_rho_replaced() {
     // Empty in the FP64 build (the kernel gets nullptr and runs the plain
-    // combine), so this whole hook costs nothing there.
+    // combine), so the clear costs nothing there.
     if (d_kahan_comp_.size() > 0) d_kahan_comp_.zero();
-    clear_manifold_block();
-    // The new ρ has not been propagated yet: whatever the hierarchy looked like
-    // a moment ago says nothing about it. See fresh_state_.
-    fresh_state_ = true;
+    fresh_state_.assign(batch_, 1);
+    fresh_zeros_.assign(batch_, -1);
+    norms_fused_ = false;
 }
 
 namespace {
-// The kill switch, read once. It lives at the point of CONSUMPTION (see
-// apply_manifold_block_to_ctx): switching it off at the setter instead would
-// skip validation, so the two halves of an A/B run would not even execute the
-// same checks, and blk_set_ could no longer mean "the driver declared a block".
-bool manifold_blocking_enabled() {
-    static const bool on = (std::getenv("HEOM_NO_MANIFOLD_BLOCK") == nullptr);
-    return on;
+void copy_d2d(heom::complex_t* dst, const heom::complex_t* src, size_t n) {
+    CUDA_CHECK(cudaMemcpy(dst, src, n * sizeof(heom::complex_t),
+                          cudaMemcpyDeviceToDevice));
+}
+
+// Host-side check that `r` is exactly 0.0 outside `blk`. Returns the first
+// offending (i, j) or nullopt. -0.0 == 0.0, so signed zeros pass; anything
+// merely small does not — the block is the storage shape, and whatever is out
+// there would simply be dropped.
+std::optional<std::pair<int, int>> first_nonzero_outside(
+    const Eigen::MatrixXcd& r, const heom::ManifoldBlock& blk) {
+    const int N = static_cast<int>(r.rows());
+    for (int i = 0; i < N; ++i) {
+        const bool row_in = i >= blk.row_off && i < blk.row_off + blk.n_row;
+        for (int j = 0; j < N; ++j) {
+            const bool col_in = j >= blk.col_off && j < blk.col_off + blk.n_col;
+            if (row_in && col_in) continue;
+            if (r(i, j) != std::complex<double>(0.0, 0.0)) return std::make_pair(i, j);
+        }
+    }
+    return std::nullopt;
+}
+
+std::string block_str(const heom::ManifoldBlock& b) {
+    return "rows [" + std::to_string(b.row_off) + "," + std::to_string(b.row_off + b.n_row)
+         + ") x cols [" + std::to_string(b.col_off) + ","
+         + std::to_string(b.col_off + b.n_col) + ")";
 }
 }  // namespace
 
-void HEOMTrajectory::apply_manifold_block_to_ctx() {
-    const bool use = blk_set_ && manifold_blocking_enabled();
-    ctx_.row_off = use ? blk_row_off_ : 0;
-    ctx_.n_row   = use ? blk_n_row_   : sys_.N();
-    ctx_.col_off = use ? blk_col_off_ : 0;
-    ctx_.n_col   = use ? blk_n_col_   : sys_.N();
+void HEOMTrajectory::set_support_(const heom::ManifoldBlock& blk, const char* who) {
+    blk.validate(sys_.N(), who);
+    if (blk.elems() > capacity_) {
+        throw std::invalid_argument(
+            std::string(who) + ": block " + block_str(blk) + " has "
+            + std::to_string(blk.elems()) + " elements, but this trajectory was "
+            "allocated for at most " + std::to_string(capacity_)
+            + " per ADO (rho_capacity of the config's task)");
+    }
+    support_ = blk;
+    if (ctx_built_) ctx_.block = support_;
 }
 
-void HEOMTrajectory::set_manifold_block(int row_off, int n_row,
-                                        int col_off, int n_col) {
+void HEOMTrajectory::expand_block_(const heom::complex_t* packed,
+                                   heom::complex_t* full) const {
+    // Compact [n_row][n_col] → full [N][N] with exact +0 outside the block.
+    // Same value the old zero-initialised full storage held there, so every
+    // host consumer of h_rho0_ (norm, HDF5, callbacks) is bit-identical.
     const int N = sys_.N();
-    if (n_row <= 0 || n_col <= 0 || row_off < 0 || col_off < 0 ||
-        row_off + n_row > N || col_off + n_col > N) {
-        throw std::invalid_argument(
-            "HEOMTrajectory::set_manifold_block: block out of range");
-    }
-    const bool identical = (row_off == col_off && n_row == n_col);
-    const bool disjoint  = (row_off + n_row <= col_off) ||
-                           (col_off + n_col <= row_off);
-    if (!identical && !disjoint) {
-        throw std::invalid_argument(
-            "HEOMTrajectory::set_manifold_block: row/col ranges must be "
-            "identical or disjoint");
-    }
-
-    blk_row_off_ = row_off; blk_n_row_ = n_row;
-    blk_col_off_ = col_off; blk_n_col_ = n_col;
-    blk_set_     = true;
-    // build_context() is idempotent (ctx_built_ guard), so a built context has
-    // to be updated here — the same reason set_active_batch touches ctx_.batch.
-    if (ctx_built_) apply_manifold_block_to_ctx();
-
-    if (!manifold_blocking_enabled()) {
-        // Say so once. A silent kill switch turns an A/B run into a coin flip
-        // over whether the variable was actually exported.
-        static bool announced = false;
-        if (!announced) {
-            std::cout << "[manifold] HEOM_NO_MANIFOLD_BLOCK set — declaring "
-                         "blocks but launching the full N^2 domain\n" << std::flush;
-            announced = true;
-        }
-    }
-}
-
-void HEOMTrajectory::clear_manifold_block() {
-    // Silent: on_rho_replaced() calls this on every dipole/restore/expand.
-    blk_set_ = false;
-    if (ctx_built_) apply_manifold_block_to_ctx();
+    std::fill(full, full + static_cast<size_t>(N) * N, heom::c_make(0.0, 0.0));
+    for (int r = 0; r < support_.n_row; ++r)
+        for (int c = 0; c < support_.n_col; ++c)
+            full[(support_.row_off + r) * N + (support_.col_off + c)] =
+                packed[r * support_.n_col + c];
 }
 
 void HEOMTrajectory::d2h_alpha0_batch() {
-    const size_t N2b   = static_cast<size_t>(sys_.N()) * sys_.N()
-                       * sizeof(heom::complex_t);
-    const size_t slot  = static_cast<size_t>(sys_.M()) * sys_.N() * sys_.N()
-                       * sizeof(heom::complex_t);
+    const int    N   = sys_.N();
+    const size_t N2  = static_cast<size_t>(N) * N;
+    const size_t Nb  = static_cast<size_t>(support_.elems());
+    const size_t Nbb = Nb * sizeof(heom::complex_t);
+    const size_t slot = static_cast<size_t>(sys_.M()) * Nbb;
     CUDA_CHECK(cudaMemcpy2D(
-        /*dst=*/h_rho0_.data(), /*dpitch=*/N2b,
+        /*dst=*/h_pack_.data(), /*dpitch=*/Nbb,
         /*src=*/d_rho_.get(),   /*spitch=*/slot,
-        /*width=*/N2b, /*height=*/static_cast<size_t>(active_batch_),
+        /*width=*/Nbb, /*height=*/static_cast<size_t>(active_batch_),
         cudaMemcpyDeviceToHost));
+    for (int b = 0; b < active_batch_; ++b)
+        expand_block_(h_pack_.data() + static_cast<size_t>(b) * Nb,
+                      h_rho0_.data() + static_cast<size_t>(b) * N2);
 }
 
-void HEOMTrajectory::set_initial(const Eigen::MatrixXcd& rho0) {
-    if (batch_ != 1) {
-        throw std::runtime_error(
-            "HEOMTrajectory::set_initial: single-state API on a batched "
-            "trajectory (batch=" + std::to_string(batch_)
-            + "); use set_initial_batch()");
-    }
-    // batch_==1 forces active_batch_==1, so the B=1 batch path is exactly this
-    // API: one N² H2D into the α=0 slot of a zeroed tensor, initial_norm_ =
-    // ‖ρ_0‖_F, and the per-tree counter reset.
-    set_initial_batch({rho0});
-}
-
-void HEOMTrajectory::set_initial_batch(const std::vector<Eigen::MatrixXcd>& rho0s) {
-    // Bound to active_batch_ (not batch_): the 2DES walk sets the τ layer at
-    // width 3 on a batch=21 trajectory. Default active_batch_==batch_ keeps the
-    // absorption path (B=3, active=3) unchanged.
-    if (static_cast<int>(rho0s.size()) != active_batch_) {
-        throw std::runtime_error(
-            "HEOMTrajectory::set_initial_batch: expected " + std::to_string(active_batch_)
-            + " initial matrices, got " + std::to_string(rho0s.size()));
+void HEOMTrajectory::set_initial(const std::vector<Eigen::MatrixXcd>& rho0s,
+                                 const heom::ManifoldBlock& support) {
+    // The width IS the number of matrices handed in: the 2DES walk sets 3 on a
+    // batch=21 trajectory and the τ layer runs at 3.
+    const int B = static_cast<int>(rho0s.size());
+    if (B < 1 || B > batch_) {
+        throw std::invalid_argument(
+            "HEOMTrajectory::set_initial: expected 1.." + std::to_string(batch_)
+            + " initial matrices, got " + std::to_string(B));
     }
     const int N = sys_.N();
-    const size_t N2 = static_cast<size_t>(N) * N;
 
-    // Zero the whole [batch_][M][N²] tensor (all slots, so idle slots > active
-    // are clean), then pack each active slot's ρ_0 into the contiguous host
-    // mirror and scatter the active α=0 blocks in one cudaMemcpy2D.
-    d_rho_.zero();
-    initial_norm_ = 0.0;
-    for (int b = 0; b < active_batch_; ++b) {
+    // All host-side checks before any state change, so a rejected call leaves
+    // the trajectory exactly as it was.
+    support.validate(N, "HEOMTrajectory::set_initial");
+    for (int b = 0; b < B; ++b) {
         const Eigen::MatrixXcd& r = rho0s[b];
         if (r.rows() != N || r.cols() != N) {
             throw std::runtime_error(
-                "HEOMTrajectory::set_initial_batch: rho0[" + std::to_string(b)
+                "HEOMTrajectory::set_initial: rho0[" + std::to_string(b)
                 + "] size mismatch (expected " + std::to_string(N) + "x"
                 + std::to_string(N) + ")");
         }
-        for (int i = 0; i < N; ++i)
-            for (int j = 0; j < N; ++j)
-                h_rho0_[static_cast<size_t>(b) * N2 + i * N + j] = heom::c_make(
-                    static_cast<heom::real_t>(r(i, j).real()),
-                    static_cast<heom::real_t>(r(i, j).imag()));
-        // Divergence ceiling is a single scalar for the whole batch: take the
-        // max ‖ρ‖_F so the guard holds for the most energetic slot too.
-        initial_norm_ = std::max(initial_norm_, r.norm());
+        if (const auto ij = first_nonzero_outside(r, support)) {
+            std::ostringstream os;
+            os << "HEOMTrajectory::set_initial: rho0[" << b << "](" << ij->first
+               << "," << ij->second << ") = " << r(ij->first, ij->second)
+               << " lies outside the declared support " << block_str(support)
+               << "; it would be dropped (the block is the storage shape)";
+            throw std::invalid_argument(os.str());
+        }
     }
 
-    const size_t N2b  = N2 * sizeof(heom::complex_t);
-    const size_t slot = static_cast<size_t>(sys_.M()) * N2 * sizeof(heom::complex_t);
+    // Shape first: the block is the storage shape, so it is installed —
+    // and checked against capacity_ — before a single element is written.
+    set_support_(support, "HEOMTrajectory::set_initial");
+    // Zero the whole tensor (all slots, so idle slots > active are clean), then
+    // pack each active slot's ρ_0 block into h_pack_ [B][Nb] and scatter the
+    // active α=0 blocks in one cudaMemcpy2D (slot pitch M·Nb).
+    set_width_(B);
+    d_rho_.zero();
+    const size_t Nb = static_cast<size_t>(support_.elems());
+    for (int b = 0; b < active_batch_; ++b) {
+        const Eigen::MatrixXcd& r = rho0s[b];
+        heom::complex_t* pk = h_pack_.data() + static_cast<size_t>(b) * Nb;
+        for (int lr = 0; lr < support_.n_row; ++lr)
+            for (int lc = 0; lc < support_.n_col; ++lc) {
+                const auto v = r(support_.row_off + lr, support_.col_off + lc);
+                pk[lr * support_.n_col + lc] = heom::c_make(
+                    static_cast<heom::real_t>(v.real()),
+                    static_cast<heom::real_t>(v.imag()));
+            }
+        norm0_[b] = r.norm();
+    }
+
+    const size_t Nbb  = Nb * sizeof(heom::complex_t);
+    const size_t slot = static_cast<size_t>(sys_.M()) * Nbb;
     CUDA_CHECK(cudaMemcpy2D(
         /*dst=*/d_rho_.get(), /*dpitch=*/slot,
-        /*src=*/h_rho0_.data(), /*spitch=*/N2b,
-        /*width=*/N2b, /*height=*/static_cast<size_t>(active_batch_),
+        /*src=*/h_pack_.data(), /*spitch=*/Nbb,
+        /*width=*/Nbb, /*height=*/static_cast<size_t>(active_batch_),
         cudaMemcpyHostToDevice));
 
     on_rho_replaced();
-    initial_rho_       = rho0s[0];   // HDF5 metadata unused in batch, keep slot 0
     initial_set_       = true;
     internal_step_     = 0;
-    filter_pass_index_ = 0;
-    ulist_dense_       = -1;
-    probe_blocks("init");
+    ulist_mode_        = UlistMode::Unset;
 }
 
-void HEOMTrajectory::set_initial_from_config() {
-    const heom::StreamFormat fmt_guard(std::cout);
-    // cfg.initial is optional: spectroscopy tasks build ρ(0) explicitly via
-    // set_initial(rho); only the dynamics entry path comes through here. Keep a
-    // defence-in-depth check against a future caller dereferencing an empty one.
-    if (!sys_.config().initial.has_value()) {
-        throw std::runtime_error(
-            "HEOMTrajectory::set_initial_from_config(): cfg.initial is empty. "
-            "Build ρ(0) yourself with set_initial(rho), or run the dynamics "
-            "task entry which requires 'initial_state:' in yaml.");
-    }
-    const InitialState& init = *sys_.config().initial;
-
-    // The human-readable summary lives here, not in build_initial_state(), so
-    // 2DES drivers that build ρ(0) themselves stay quiet.
-    switch (init.type) {
-        case InitialState::Type::SITE_EXCITATION:
-            std::cout << " pigment "
-                      << hilbert_to_pigment(init.excited_site,
-                                            sys_.config().physics.basis)
-                      << " excited";
-            break;
-        case InitialState::Type::EXCITON_EXCITATION:
-            heom::console::print_eigenspectrum(
-                sys_.eigenvalues(), init.exciton_index, sys_.N(),
-                sys_.config().physics.w0_cm);
-            heom::console::print_exciton_composition(
-                sys_.eigenvectors(), init.exciton_index, sys_.N());
-            break;
-        case InitialState::Type::COHERENT:
-            std::cout << " coherent superposition";
-            break;
-        case InitialState::Type::CUSTOM_MATRIX:
-            std::cout << " custom matrix";
-            break;
-    }
-
-    initial_rho_ = build_initial_state(sys_, init);
-
-    if (init.type == InitialState::Type::EXCITON_EXCITATION) {
-        // print_density_matrix_summary needs the actual built matrix
-        heom::console::print_density_matrix_summary(initial_rho_, sys_.N());
-    } else if (init.type == InitialState::Type::COHERENT) {
-        // Per-site populations need init.coherent_coeffs
-        for (int i = 0; i < sys_.N(); ++i) {
-            const double pop = std::norm(init.coherent_coeffs[i]);
-            if (pop > 1e-6)
-                std::cout << " |c" << i << "|^2="
-                          << std::fixed << std::setprecision(3) << pop;
-        }
-    }
-
-    set_initial(initial_rho_);
-}
-
-double HEOMTrajectory::final_trace() const {
-    double t = 0.0;
-    const int N = sys_.N();
-    for (int i = 0; i < N; ++i) t += heom::c_re(h_rho0_[i * N + i]);
-    return t;
-}
-
-double HEOMTrajectory::rho0_frobenius_norm() const {
-    // Batched: return max_b ‖ρ_0^(b)‖_F so the divergence guard trips on the
-    // most energetic slot. B==1 ⇒ the single historical norm (bit-identical).
-    // Only over ACTIVE slots: d2h_alpha0_batch() filled the first active_batch_
-    // entries; higher slots hold stale data that must not fold into the max.
+double HEOMTrajectory::rho0_norm_(int b) const {
     const size_t N2 = static_cast<size_t>(sys_.N()) * sys_.N();
-    double max_norm = 0.0;
-    for (int b = 0; b < active_batch_; ++b) {
-        double sum_sq = 0.0;
-        for (size_t k = 0; k < N2; ++k) {
-            const auto v = h_rho0_[static_cast<size_t>(b) * N2 + k];
-            const double re = heom::c_re(v);
-            const double im = heom::c_im(v);
-            sum_sq += re * re + im * im;
-        }
-        max_norm = std::max(max_norm, std::sqrt(sum_sq));
+    const heom::complex_t* r = h_rho0_.data() + static_cast<size_t>(b) * N2;
+    double sum_sq = 0.0;
+    for (size_t k = 0; k < N2; ++k) {
+        const double re = heom::c_re(r[k]);
+        const double im = heom::c_im(r[k]);
+        sum_sq += re * re + im * im;
     }
-    return max_norm;
-}
-
-Eigen::MatrixXcd HEOMTrajectory::final_rho0() const {
-    // Read from h_rho0_: solve() guarantees this mirror holds the final ρ_0
-    // (the conditional D2H at the bottom of solve()).
-    const int N = sys_.N();
-    Eigen::MatrixXcd out(N, N);
-    for (int i = 0; i < N; ++i)
-        for (int j = 0; j < N; ++j) {
-            const auto v = h_rho0_[i * N + j];
-            out(i, j) = std::complex<double>(heom::c_re(v), heom::c_im(v));
-        }
-    return out;
+    return std::sqrt(sum_sq);
 }
 
 Eigen::MatrixXcd HEOMTrajectory::slot_rho0(int b) const {
@@ -476,35 +311,20 @@ Eigen::MatrixXcd HEOMTrajectory::slot_rho0(int b) const {
             + " out of range [0, " + std::to_string(batch_) + ")");
     }
     const int N = sys_.N();
-    const size_t N2 = static_cast<size_t>(N) * N;
-    std::vector<heom::complex_t> buf(N2);
-    // slot b's α=0 block sits at offset b·M·N² (α=0 is the first ADO).
-    CUDA_CHECK(cudaMemcpy(buf.data(),
-                          d_rho_.get() + static_cast<size_t>(b) * sys_.M() * N2,
-                          N2 * sizeof(heom::complex_t), cudaMemcpyDeviceToHost));
+    const size_t Nb = static_cast<size_t>(support_.elems());
+    std::vector<heom::complex_t> packed(Nb);
+    std::vector<heom::complex_t> full(static_cast<size_t>(N) * N);
+    // slot b's α=0 block sits at offset b·M·Nb (α=0 is the first ADO).
+    CUDA_CHECK(cudaMemcpy(packed.data(),
+                          d_rho_.get() + static_cast<size_t>(b) * sys_.M() * Nb,
+                          Nb * sizeof(heom::complex_t), cudaMemcpyDeviceToHost));
+    expand_block_(packed.data(), full.data());
     Eigen::MatrixXcd out(N, N);
     for (int i = 0; i < N; ++i)
         for (int j = 0; j < N; ++j)
-            out(i, j) = std::complex<double>(heom::c_re(buf[i * N + j]),
-                                             heom::c_im(buf[i * N + j]));
+            out(i, j) = std::complex<double>(heom::c_re(full[i * N + j]),
+                                             heom::c_im(full[i * N + j]));
     return out;
-}
-
-const cuDoubleComplex* HEOMTrajectory::rho0_as_fp64() const {
-    if constexpr (heom::kMixedPrecision) {
-        // Mixed build: uplift the FP32 mirror to FP64 for the float64-only
-        // HDF5 writer (observable uplift). Reused scratch, no per-call alloc.
-        const size_t n = h_rho0_.size();
-        h_rho0_fp64_.resize(n);
-        for (size_t k = 0; k < n; ++k)
-            h_rho0_fp64_[k] = make_cuDoubleComplex(
-                heom::c_re(h_rho0_[k]), heom::c_im(h_rho0_[k]));
-        return h_rho0_fp64_.data();
-    } else {
-        // FP64 build: complex_t IS cuDoubleComplex — hand back the mirror
-        // directly, zero copy, bit-identical to history.
-        return reinterpret_cast<const cuDoubleComplex*>(h_rho0_.data());
-    }
 }
 
 void HEOMTrajectory::build_context() {
@@ -512,6 +332,7 @@ void HEOMTrajectory::build_context() {
     const auto& cfg = sys_.config();
     ctx_.hamiltonian        = sys_.d_hamiltonian();
     ctx_.c_bath             = sys_.d_c_bath();
+    ctx_.cbar_bath          = sys_.d_cbar_bath();
     ctx_.coeff_plus         = sys_.d_coeff_plus();
     ctx_.coeff_minus        = sys_.d_coeff_minus();
     ctx_.markov_residue     = sys_.d_markov_residue();
@@ -521,39 +342,41 @@ void HEOMTrajectory::build_context() {
     ctx_.total_decay        = sys_.d_total_decay();
     ctx_.active_flags       = use_filtering_ ? d_active_flags_.get() : nullptr;
     ctx_.d_coupling         = sys_.d_d_coupling();
-    ctx_.M = sys_.M();  ctx_.N = sys_.N();  ctx_.K = sys_.K();
+    ctx_.mode_off           = sys_.d_mode_off();
+    ctx_.M = sys_.M();  ctx_.N = sys_.N();  ctx_.D = sys_.D();
     ctx_.n_bath       = sys_.n_bath();
-    ctx_.batch        = active_batch_;   // grid.y width; set_active_batch mutates
-                                         // this too (build_context is idempotent)
-    // Spelled out even when no block is set — the kernel gets a real rectangle,
-    // never a sentinel to decode (see HEOMContext::row_off).
-    apply_manifold_block_to_ctx();
+    ctx_.batch        = active_batch_;   // grid.y width; set_width_ mutates this
+                                         // too (build_context is idempotent)
+    // The kernel gets a real rectangle, never a sentinel to decode (see
+    // HEOMContext::block). Both writers of ctx_.block — here and set_support_
+    // — copy support_ verbatim; there is no other block to launch over.
+    ctx_.block = support_;
     ctx_.sink_enabled = cfg.physics.sink.enabled;
     ctx_.sink_site    = cfg.physics.sink.site;
     ctx_.gamma_sink   = cfg.physics.sink.gamma;
 
-    // U-list launch compaction (opt-in via time_evolution.ulist). Build the
-    // collector once (D2H of the neighbor maps) and point ctx_ at the identity
-    // list; the first filter step swaps in the real closure set.
-    init_ulist_if_enabled();
-    if (ulist_builder_) {
+    // Closure builder (filter on), and with filter.ulist on the compact launch:
+    // point ctx_ at the identity list; the first filter step swaps in the
+    // real closure set.
+    init_closure_builder();
+    if (ulist_on()) {
         ctx_.u_list  = ulist_builder_->device_list();
         ctx_.u_count = ulist_builder_->count();
     }
     ctx_built_ = true;
 }
 
-void HEOMTrajectory::set_active_batch(int batch) {
-    if (batch < 1 || batch > batch_) {
+void HEOMTrajectory::set_width_(int w) {
+    if (w < 1 || w > batch_) {
         throw std::invalid_argument(
-            "HEOMTrajectory::set_active_batch: batch must be in [1, "
-            + std::to_string(batch_) + "], got " + std::to_string(batch));
+            "HEOMTrajectory: active width must be in [1, "
+            + std::to_string(batch_) + "], got " + std::to_string(w));
     }
-    active_batch_ = batch;
+    active_batch_ = w;
     // build_context() is guarded by ctx_built_ and will not re-run, so update
     // the live launch width directly. If ctx_ is not built yet, build_context()
     // will pick up active_batch_ on its first (and only) run.
-    if (ctx_built_) ctx_.batch = batch;
+    if (ctx_built_) ctx_.batch = w;
 }
 
 void HEOMTrajectory::propagate_steps(int n_internal_steps, bool check_div) {
@@ -561,15 +384,10 @@ void HEOMTrajectory::propagate_steps(int n_internal_steps, bool check_div) {
         throw std::runtime_error(
             "HEOMTrajectory::propagate_steps() called before set_initial()");
     }
-    // Once per SEGMENT, not per step. A missing block is correct but slow, and
-    // a bitwise A/B gate cannot see it — both halves agree precisely because
-    // nothing was blocked. This counter is the only thing that can.
-    if (!blk_set_) ++propagations_without_block_;
-    // The 2DES carry-through driver never calls solve(), so this is the only
-    // place a blown-up segment can be caught before its NaN/Inf silently fills
-    // the response grid. diverged_ latches across the whole tree (set_initial
-    // does not clear it) so once tripped, the remaining propagation short-
-    // circuits and compute_2des()'s diverged() check aborts the run.
+    // diverged_ latches across a whole 2DES tree (set_initial does not clear
+    // it), so once tripped the remaining propagation short-circuits and the
+    // driver's diverged() check aborts the run instead of letting NaN/Inf
+    // silently fill the response grid.
     if (diverged_) return;
     build_context();
     for (int s = 0; s < n_internal_steps; ++s) {
@@ -589,143 +407,88 @@ void HEOMTrajectory::propagate_steps(int n_internal_steps, bool check_div) {
     if (check_div && n_internal_steps > 0) {
         check_divergence(internal_step_ * sys_.config().time.dt, internal_step_, 0);
     }
-    probe_blocks("after-propagate");
 }
 
-bool HEOMTrajectory::check_divergence_now(double t_fs, int step) {
+bool HEOMTrajectory::check_divergence_now(double t_fs, int step, int n_total) {
     if (diverged_) return true;
-    return check_divergence(t_fs, step, 0);
+    return check_divergence(t_fs, step, n_total);
 }
 
-void HEOMTrajectory::detect_begin(const Eigen::MatrixXcd& mu_det, int n_samples) {
-    // Single-state API: on a wider active batch it would trace slot 0 only and
-    // silently drop the rest. Mirror set_initial's guard.
-    if (active_batch_ != 1) {
-        throw std::runtime_error(
-            "HEOMTrajectory::detect_begin: single-state API at active_batch="
-            + std::to_string(active_batch_) + "; use detect_begin_batch()");
-    }
-    // B_det=1 sizes d_mu_det_ to N² and d_detect_ to n_samples, exactly as the
-    // single-slot path did.
-    detect_begin_batch({mu_det}, n_samples);
-}
-
-void HEOMTrajectory::detect_sample(int idx) {
-    // detect_batch_==1 ⇒ grid.y==1, slot offset 0, out[0·n_samples+idx]==out[idx]:
-    // the same launch the single-slot trace used.
-    detect_sample_batch(idx);
-}
-
-void HEOMTrajectory::detect_flush(std::complex<double>* out_host, int n_samples) {
-    detect_flush_batch(out_host, n_samples);
-}
-
-void HEOMTrajectory::detect_begin_batch(
-    const std::vector<Eigen::MatrixXcd>& mus_det, int n_samples) {
-    const int N = sys_.N();
-    const int B_det = static_cast<int>(mus_det.size());
-    if (B_det < 1 || B_det > batch_) {
-        throw std::invalid_argument(
-            "detect_begin_batch: B_det=" + std::to_string(B_det)
-            + " out of range [1, " + std::to_string(batch_) + "]");
-    }
-    if (n_samples <= 0) {
-        throw std::runtime_error("detect_begin_batch: n_samples must be > 0");
-    }
-    for (int b = 0; b < B_det; ++b) {
-        if (mus_det[b].rows() != N || mus_det[b].cols() != N) {
-            throw std::runtime_error(
-                "detect_begin_batch: mu_det[" + std::to_string(b)
-                + "] size mismatch (expected " + std::to_string(N) + "x"
-                + std::to_string(N) + ")");
-        }
-    }
-    const size_t N2 = static_cast<size_t>(N) * N;
-
-    // Detection width comes from mus_det.size() and is stored; detect_sample_
-    // batch launches at this width regardless of the current active_batch_.
-    detect_batch_     = B_det;
-    detect_n_samples_ = n_samples;
-
-    // Per-slot μ_det, packed slot-major [B_det·N²].
-    const size_t mu_need = static_cast<size_t>(B_det) * N2;
-    d_mu_det_.ensure(mu_need);
-    h_mu_pack_.resize(mu_need);
-    for (int b = 0; b < B_det; ++b) {
-        const auto& mu = mus_det[b];
-        for (int i = 0; i < N; ++i)
-            for (int j = 0; j < N; ++j)
-                h_mu_pack_[static_cast<size_t>(b) * N2 + i * N + j] = heom::c_make(
-                    static_cast<heom::real_t>(mu(i, j).real()),
-                    static_cast<heom::real_t>(mu(i, j).imag()));
-    }
-    d_mu_det_.copy_from_host(h_mu_pack_.data(), mu_need);
-
-    // Result grid [B_det·n_samples], slot-major (slot b at [b·n_samples..)).
-    const size_t det_need = static_cast<size_t>(B_det) * n_samples;
-    d_detect_.ensure(det_need);
-    h_detect_.resize(det_need);
-}
-
-void HEOMTrajectory::detect_sample_batch(int idx) {
-    // grid.y = detect_batch_; slot b traces its own α=0 block (b·M·N²) against
-    // its own μ_det (b·N²) into out[b·n_samples+idx]. No sync / no D2H.
-    launch_trace_BR_batch(d_mu_det_.get(), d_rho_.get(), d_detect_.get(),
-                          idx, sys_.N(), sys_.M(), detect_batch_,
-                          detect_n_samples_);
-}
-
-void HEOMTrajectory::detect_flush_batch(std::complex<double>* out_host,
-                                        int n_samples) {
-    const size_t total = static_cast<size_t>(detect_batch_) * n_samples;
-    CUDA_CHECK(cudaMemcpy(h_detect_.data(), d_detect_.get(),
-                          total * sizeof(heom::complex_t),
-                          cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < total; ++i)
-        out_host[i] = std::complex<double>(heom::c_re(h_detect_[i]),
-                                           heom::c_im(h_detect_[i]));
-}
-
-void HEOMTrajectory::apply_dipole_full_hierarchy(
-    const Eigen::MatrixXcd& mu, heom::spectra::DipoleSide side) {
+void HEOMTrajectory::read_alpha0(std::vector<std::complex<double>>& out) {
     if (!initial_set_) {
         throw std::runtime_error(
-            "HEOMTrajectory::apply_dipole_full_hierarchy() before set_initial()");
+            "HEOMTrajectory::read_alpha0() called before set_initial()");
     }
-    // Single-state API: at a wider active batch the single-slot launch would
-    // touch slot 0 only while the refilter/norm refresh below spans all active
-    // slots — a silent half-update. Mirror set_initial's guard.
-    if (active_batch_ != 1) {
-        throw std::runtime_error(
-            "HEOMTrajectory::apply_dipole_full_hierarchy: single-state API at "
-            "active_batch=" + std::to_string(active_batch_)
-            + "; use apply_dipole_per_slot()");
-    }
-    // active_batch_==1 ⇒ the batched launch is grid.y==1 over the same [M·N²]
-    // range with the same single-copy μ, so this is the batch path verbatim.
-    apply_dipole_per_slot({mu}, side);
+    const size_t tot = static_cast<size_t>(active_batch_) * sys_.N() * sys_.N();
+    d2h_alpha0_batch();   // fills h_rho0_[b·N²] for the active slots
+    out.resize(tot);
+    // Elementwise hier → std::complex<double>, not reinterpret_cast: layout
+    // compatibility is implementation-defined, and consumers must stay
+    // CUDA-free. c_re/c_im promote the hier element (float in mixed) into the
+    // double observable — the uplift boundary.
+    for (size_t i = 0; i < tot; ++i)
+        out[i] = std::complex<double>(heom::c_re(h_rho0_[i]), heom::c_im(h_rho0_[i]));
 }
 
-void HEOMTrajectory::apply_dipole_per_slot(
-    const std::vector<Eigen::MatrixXcd>& mus, heom::spectra::DipoleSide side) {
+void HEOMTrajectory::apply_dipole(
+    const std::vector<Eigen::MatrixXcd>& mus, heom::spectra::DipoleSide side,
+    const heom::ManifoldBlock& support_after) {
     if (!initial_set_) {
         throw std::runtime_error(
-            "HEOMTrajectory::apply_dipole_per_slot() before set_initial()");
+            "HEOMTrajectory::apply_dipole() before set_initial()");
     }
     if (static_cast<int>(mus.size()) != active_batch_) {
         throw std::runtime_error(
-            "apply_dipole_per_slot: expected " + std::to_string(active_batch_)
+            "apply_dipole: expected " + std::to_string(active_batch_)
             + " dipoles (active_batch_), got " + std::to_string(mus.size()));
     }
     const int N = sys_.N();
     const int M = sys_.M();
     const size_t N2 = static_cast<size_t>(N) * N;
+    support_after.validate(N, "HEOMTrajectory::apply_dipole");
+    const bool left = (side == heom::spectra::DipoleSide::Left);
     for (int b = 0; b < active_batch_; ++b) {
         if (mus[b].rows() != N || mus[b].cols() != N) {
             throw std::runtime_error(
-                "apply_dipole_per_slot: mu[" + std::to_string(b)
+                "apply_dipole: mu[" + std::to_string(b)
                 + "] size mismatch (expected " + std::to_string(N) + "x"
                 + std::to_string(N) + ")");
+        }
+        // Left: (μρ)(i,j) = Σ_k μ(i,k) ρ(k,j) — columns stay, rows move to
+        // {i : μ(i,k) ≠ 0 for some k in the current rows R}. Right: (ρμ)(i,j)
+        // = Σ_k ρ(i,k) μ(k,j) — rows stay, columns move likewise from C. So:
+        // the fixed axis must be unchanged, and along the moving axis every
+        // nonzero of μ reachable from the current range must land in the
+        // declared one. Only the reachable k-slice of μ is scanned.
+        const heom::ManifoldBlock& S = support_;
+        const heom::ManifoldBlock& T = support_after;
+        const bool fixed_ok = left ? (T.col_off == S.col_off && T.n_col == S.n_col)
+                                   : (T.row_off == S.row_off && T.n_row == S.n_row);
+        if (!fixed_ok) {
+            throw std::invalid_argument(
+                std::string("HEOMTrajectory::apply_dipole: a ") + (left ? "Left" : "Right")
+                + " dipole keeps the " + (left ? "columns" : "rows")
+                + " of the support, but " + block_str(S) + " -> " + block_str(T)
+                + " changes them");
+        }
+        const auto& mu = mus[b];
+        for (int k = left ? S.row_off : S.col_off,
+                 k_end = left ? S.row_off + S.n_row : S.col_off + S.n_col;
+             k < k_end; ++k) {
+            for (int i = 0; i < N; ++i) {
+                const std::complex<double> v = left ? mu(i, k) : mu(k, i);
+                if (v == std::complex<double>(0.0, 0.0)) continue;
+                const bool inside = left ? (i >= T.row_off && i < T.row_off + T.n_row)
+                                         : (i >= T.col_off && i < T.col_off + T.n_col);
+                if (inside) continue;
+                std::ostringstream os;
+                os << "HEOMTrajectory::apply_dipole: mu[" << b << "]("
+                   << (left ? i : k) << "," << (left ? k : i) << ") = " << v
+                   << " maps the current support " << block_str(S)
+                   << " outside the declared support " << block_str(T)
+                   << " (" << (left ? "Left" : "Right") << " side)";
+                throw std::invalid_argument(os.str());
+            }
         }
     }
 
@@ -743,14 +506,22 @@ void HEOMTrajectory::apply_dipole_per_slot(
     }
     d_mu_scratch_.copy_from_host(h_mu_pack_.data(), mu_need);
 
-    // Batched single-side multiply into the RK4 scratch (idle here), then D2D
-    // copy the active prefix back. Slot b uses mu[b·N²], reads/writes b·M·N².
-    const int s = (side == heom::spectra::DipoleSide::Left) ? 0 : 1;
-    const size_t MN2 = static_cast<size_t>(M) * N2;
-    launch_apply_single_side_mu_batch(d_rho_.get(), d_workspace_.get(),
-                                      d_mu_scratch_.get(), s, M, N, active_batch_);
+    // Shape first: install and capacity-check the new block before the
+    // kernel writes it. The kernel still needs the OLD block to read ρ, so it
+    // is copied out first; nothing reads d_rho_ between here and the D2D copy.
+    const heom::ManifoldBlock S_old = support_;
+    set_support_(support_after, "HEOMTrajectory::apply_dipole");
+
+    // Batched rectangular multiply S→T into the RK4 scratch (idle here), then
+    // D2D copy the active prefix back. Slot b uses mu[b·N²], reads b·M·Nb_S,
+    // writes b·M·Nb_T; both fit: Nb ≤ capacity_ and the workspace is 3× ρ.
+    const int s = left ? 0 : 1;
+    const size_t MNb_T = static_cast<size_t>(M) * support_.elems();
+    launch_apply_single_side_mu(d_rho_.get(), d_workspace_.get(),
+                                d_mu_scratch_.get(), s, M, N,
+                                S_old, support_, active_batch_);
     CUDA_CHECK(cudaMemcpy(d_rho_.get(), d_workspace_.get(),
-                          static_cast<size_t>(active_batch_) * MN2
+                          static_cast<size_t>(active_batch_) * MNb_T
                               * sizeof(heom::complex_t),
                           cudaMemcpyDeviceToDevice));
     on_rho_replaced();
@@ -767,285 +538,253 @@ void HEOMTrajectory::apply_dipole_per_slot(
         activate_all_ados(ctx_);
     }
     d2h_alpha0_batch();
-    initial_norm_ = rho0_frobenius_norm();
-    probe_blocks("after-dipole");
+    for (int b = 0; b < active_batch_; ++b) norm0_[b] = rho0_norm_(b);
 }
 
 void HEOMTrajectory::snapshot_device(DeviceHierarchySnapshot& snap) {
-    const int N = sys_.N();
-    const int M = sys_.M();
-    const size_t N2 = static_cast<size_t>(N) * N;
-    snap.N = N;
-    snap.batch = active_batch_;   // # slots captured (variable-width walk)
-
-    // Active set = recompute norms→flags NOW (never read stale flags); this also
-    // refreshes the ulist state, part of the snapshot contract. perform_ado_
-    // filtering folds the union over the active_batch_ slots.
-    std::vector<int> ado_ids;
-    if (use_filtering_) {
-        refresh_active_set_and_ulist(filter_threshold_);
-        std::vector<int8_t> hflags(M);
-        d_active_flags_.copy_to_host(hflags.data(), M);
-        ado_ids.reserve(M);
-        for (int a = 0; a < M; ++a)
-            if (hflags[a]) ado_ids.push_back(a);
-    } else {
-        ado_ids.reserve(M);
-        for (int a = 0; a < M; ++a) ado_ids.push_back(a);
+    if (!initial_set_) {
+        throw std::runtime_error(
+            "HEOMTrajectory::snapshot_device() before set_initial()");
     }
+    const size_t M = static_cast<size_t>(sys_.M());
+    snap.sys     = &sys_;
+    snap.batch   = active_batch_;
+    snap.support = support_;
+    snap.fresh.assign(fresh_state_.begin(), fresh_state_.begin() + active_batch_);
+    snap.fresh_zeros.assign(fresh_zeros_.begin(), fresh_zeros_.begin() + active_batch_);
+    snap.norm0.assign(norm0_.begin(), norm0_.begin() + active_batch_);
 
-    const int n_active = static_cast<int>(ado_ids.size());
-    snap.n_active = n_active;
-
-    // alpha = 0 divergence baseline: max over active slots of ||rho_0||_F.
-    // d2h_alpha0_batch fills h_rho0_ with the
-    // active_batch_ α=0 blocks; rho0_frobenius_norm folds the max.
-    d2h_alpha0_batch();
-    snap.alpha0_norm = rho0_frobenius_norm();
-
-    if (n_active == 0) return;
-
-    // ids buffer sized to M (grow-only) so it is allocated at most once. Shared
-    // by all slots (union closure): one ids list drives every slot's gather.
-    snap.ids.ensure(static_cast<size_t>(M));
-    snap.ids.copy_from_host(ado_ids.data(), n_active);
-
-    // Block buffer [batch·n_active·N²], grow-only. After filter warmup n_active
-    // stabilises, so reallocs stop.
-    const size_t need = static_cast<size_t>(active_batch_) * n_active * N2;
-    snap.blocks.ensure(need);
-    // Device gather over active slots: NO D2H, NO host conversion. Every slot
-    // gathers the SAME ids into its own [b·n_active·N²] staging region.
-    launch_gather_ado_blocks_batch(d_rho_.get(), snap.blocks.get(),
-                                   snap.ids.get(), n_active, N, M, active_batch_);
-
+    const size_t cap = static_cast<size_t>(active_batch_) * M * capacity_;
+    const size_t n   = static_cast<size_t>(active_batch_) * M * support_.elems();
+    snap.rho.ensure(cap);
+    copy_d2d(snap.rho.get(), d_rho_.get(), n);
+    if (d_kahan_comp_.size() > 0) {
+        snap.kahan.ensure(cap);
+        copy_d2d(snap.kahan.get(), d_kahan_comp_.get(), n);
+    }
     if (use_filtering_) {
-        snap.flags.ensure(static_cast<size_t>(M));
-        CUDA_CHECK(cudaMemcpy(snap.flags.get(), d_active_flags_.get(),
-                              static_cast<size_t>(M),
+        // One flag row per active slot (per-slot active sets).
+        const size_t nf = static_cast<size_t>(active_batch_) * M;
+        snap.flags.ensure(nf);
+        CUDA_CHECK(cudaMemcpy(snap.flags.get(), d_active_flags_.get(), nf,
                               cudaMemcpyDeviceToDevice));
     }
 }
 
+void HEOMTrajectory::check_snapshot_(const DeviceHierarchySnapshot& snap,
+                                     int width, const char* who) const {
+    if (snap.sys != &sys_) {
+        throw std::invalid_argument(
+            std::string(who) + (snap.sys ? ": snapshot was taken on another "
+                                           "SystemContext"
+                                         : ": snapshot was never filled"));
+    }
+    if (width < 1 || width > batch_) {
+        throw std::invalid_argument(
+            std::string(who) + ": " + std::to_string(width) + " slots requested, "
+            "this trajectory has " + std::to_string(batch_));
+    }
+}
+
+// Shape and width are installed (set_support_ / set_width_) before ρ is
+// written, so ctx_.block and ctx_.batch describe the copied state on the next
+// launch; neither can throw once check_snapshot_ has passed.
+//
+// After the copy the flags are the snapshot's. The U-list is not: the builder
+// still holds the last branch's list. Pointing ctx_ at the dense launch makes
+// the next filter pass scan all M, which by the U-local contract (see
+// perform_ado_filtering) yields exactly the flags the compact scan would have,
+// and that pass rebuilds U from them.
 void HEOMTrajectory::restore_device(const DeviceHierarchySnapshot& snap) {
-    const int N = sys_.N();
-    const int M = sys_.M();
-    if (snap.N != N) {
-        throw std::runtime_error(
-            "restore_device: snapshot N mismatch (expected "
-            + std::to_string(N) + ", got " + std::to_string(snap.N) + ")");
-    }
-
-    // Restore the captured width first: sets active_batch_ AND ctx_.batch, so
-    // every subsequent launch (and the zero/scatter below) spans snap.batch
-    // slots. Without this the launch width would stay at the caller's prior
-    // (e.g. t-layer 21) width and advance stale slots.
-    set_active_batch(snap.batch);
-
-    // Zero the active working prefix → device scatter the active blocks back
-    // (D2D, no H2D). Only snap.batch·M·N² is cleared: slots ≥ snap.batch are
-    // inactive (never launched) until a later expand overwrites them.
-    const size_t N2 = static_cast<size_t>(N) * N;
-    CUDA_CHECK(cudaMemset(
-        d_rho_.get(), 0,
-        static_cast<size_t>(snap.batch) * M * N2 * sizeof(heom::complex_t)));
-    if (snap.n_active > 0) {
-        launch_scatter_ado_blocks_batch(snap.blocks.get(), d_rho_.get(),
-                                        snap.ids.get(), snap.n_active, N, M,
-                                        snap.batch);
-    }
-    on_rho_replaced();
-
-    // Restore active_flags from the device snapshot + rebuild U immediately
-    // (flags come from the snapshot, so we rebuild U but do NOT refilter — do
-    // not wait for the next filter step, which would freeze snapshot-active
-    // ADOs for a full step). Flags/ulist are shared across all slots (union).
-    if (use_filtering_) {
+    check_snapshot_(snap, snap.batch, "HEOMTrajectory::restore_device");
+    const size_t M = static_cast<size_t>(sys_.M());
+    set_support_(snap.support, "HEOMTrajectory::restore_device");
+    set_width_(snap.batch);
+    const size_t n = static_cast<size_t>(snap.batch) * M * support_.elems();
+    copy_d2d(d_rho_.get(), snap.rho.get(), n);
+    if (d_kahan_comp_.size() > 0) copy_d2d(d_kahan_comp_.get(), snap.kahan.get(), n);
+    if (use_filtering_)
         CUDA_CHECK(cudaMemcpy(d_active_flags_.get(), snap.flags.get(),
-                              static_cast<size_t>(M),
+                              static_cast<size_t>(snap.batch) * M,
                               cudaMemcpyDeviceToDevice));
-        total_active_ados_ = snap.n_active;
-        build_context();
-        rebuild_ulist_into_ctx();
-    }
-
-    initial_norm_ = snap.alpha0_norm;
-    initial_set_  = true;
+    if (ctx_built_) { ctx_.u_list = nullptr; ctx_.u_count = 0; ctx_.u_flags = nullptr; ctx_.u_off = nullptr; ctx_.block_off = nullptr; ctx_.launch_blocks = 0; }
+    std::copy(snap.fresh.begin(), snap.fresh.end(), fresh_state_.begin());
+    std::copy(snap.fresh_zeros.begin(), snap.fresh_zeros.end(), fresh_zeros_.begin());
+    norms_fused_ = false;
+    std::copy(snap.norm0.begin(), snap.norm0.end(), norm0_.begin());
+    initial_set_ = true;
 }
 
 void HEOMTrajectory::expand_slots(const DeviceHierarchySnapshot& parent,
                                   const std::vector<int>& child_to_parent) {
-    const int N = sys_.N();
-    const int M = sys_.M();
-    if (parent.N != N) {
-        throw std::runtime_error(
-            "expand_slots: snapshot N mismatch (expected "
-            + std::to_string(N) + ", got " + std::to_string(parent.N) + ")");
-    }
     const int B_child = static_cast<int>(child_to_parent.size());
-    if (B_child < 1 || B_child > batch_) {
-        throw std::invalid_argument(
-            "expand_slots: child count " + std::to_string(B_child)
-            + " out of range [1, " + std::to_string(batch_) + "]");
-    }
-    const size_t N2  = static_cast<size_t>(N) * N;
-    const size_t MN2 = static_cast<size_t>(M) * N2;
-
-    // Set the child width (active_batch_ + ctx_.batch) BEFORE any launch.
-    set_active_batch(B_child);
-
-    // Zero the child working prefix, then fill each child slot from its parent
-    // slot's active blocks (shared ids). The map is general/uneven (3→9, 9→21).
-    CUDA_CHECK(cudaMemset(d_rho_.get(), 0,
-                          static_cast<size_t>(B_child) * MN2 * sizeof(heom::complex_t)));
-    if (parent.n_active > 0) {
-        for (int c = 0; c < B_child; ++c) {
-            const int p = child_to_parent[c];
-            if (p < 0 || p >= parent.batch) {
-                throw std::out_of_range(
-                    "expand_slots: child_to_parent[" + std::to_string(c) + "]="
-                    + std::to_string(p) + " out of range [0, "
-                    + std::to_string(parent.batch) + ")");
-            }
-            // Scatter parent slot p's gathered blocks into child slot c's ρ
-            // region (single-slot scatter into a per-child base pointer; shared
-            // ids place each block at its ADO id within slot c).
-            launch_scatter_ado_blocks(
-                parent.blocks.get() + static_cast<size_t>(p) * parent.n_active * N2,
-                d_rho_.get() + static_cast<size_t>(c) * MN2,
-                parent.ids.get(), parent.n_active, N);
+    check_snapshot_(parent, B_child, "HEOMTrajectory::expand_slots");
+    for (int c = 0; c < B_child; ++c) {
+        const int p = child_to_parent[c];
+        if (p < 0 || p >= parent.batch) {
+            throw std::invalid_argument(
+                "HEOMTrajectory::expand_slots: child_to_parent[" + std::to_string(c)
+                + "]=" + std::to_string(p) + " out of range [0, "
+                + std::to_string(parent.batch) + ")");
         }
     }
-    on_rho_replaced();
-
-    // Inherit the shared flags/ulist + divergence baseline from the parent.
-    if (use_filtering_) {
-        CUDA_CHECK(cudaMemcpy(d_active_flags_.get(), parent.flags.get(),
-                              static_cast<size_t>(M),
-                              cudaMemcpyDeviceToDevice));
-        total_active_ados_ = parent.n_active;
-        build_context();
-        rebuild_ulist_into_ctx();
+    const size_t M = static_cast<size_t>(sys_.M());
+    set_support_(parent.support, "HEOMTrajectory::expand_slots");
+    set_width_(B_child);
+    const size_t MNb = M * support_.elems();
+    for (int c = 0; c < B_child; ++c) {
+        const int p = child_to_parent[c];
+        copy_d2d(d_rho_.get() + c * MNb, parent.rho.get() + p * MNb, MNb);
+        if (d_kahan_comp_.size() > 0)
+            copy_d2d(d_kahan_comp_.get() + c * MNb, parent.kahan.get() + p * MNb, MNb);
+        norm0_[c] = parent.norm0[p];
+        // Child c inherits its parent's own active set and fill state.
+        if (use_filtering_)
+            CUDA_CHECK(cudaMemcpy(d_active_flags_.get() + c * M,
+                                  parent.flags.get() + p * M, M,
+                                  cudaMemcpyDeviceToDevice));
+        fresh_state_[c] = parent.fresh[p];
+        fresh_zeros_[c] = parent.fresh_zeros[p];
     }
-
-    initial_norm_ = parent.alpha0_norm;
-    initial_set_  = true;
+    if (ctx_built_) { ctx_.u_list = nullptr; ctx_.u_count = 0; ctx_.u_flags = nullptr; ctx_.u_off = nullptr; ctx_.block_off = nullptr; ctx_.launch_blocks = 0; }
+    norms_fused_ = false;
+    initial_set_ = true;
 }
 
-std::complex<double> HEOMTrajectory::expectation(const Eigen::MatrixXcd& B) const {
-    const int N = sys_.N();
-    if (B.rows() != N || B.cols() != N) {
-        throw std::runtime_error(
-            "expectation: B size mismatch (expected "
-            + std::to_string(N) + "x" + std::to_string(N) + ")");
+double HEOMTrajectory::relative_distance(const DeviceHierarchySnapshot& snap) {
+    check_snapshot_(snap, snap.batch, "HEOMTrajectory::relative_distance");
+    if (snap.batch != active_batch_ || snap.support != support_) {
+        throw std::invalid_argument(
+            "HEOMTrajectory::relative_distance: snapshot holds "
+            + std::to_string(snap.batch) + " slot(s) on " + block_str(snap.support)
+            + ", the trajectory " + std::to_string(active_batch_) + " on "
+            + block_str(support_));
     }
-    const size_t N2 = static_cast<size_t>(N) * N;
+    const size_t n = static_cast<size_t>(active_batch_) * sys_.M() * support_.elems();
+    const bool carry = d_kahan_comp_.size() > 0;
+    const int blocks = heom::launch_hierarchy_distance(
+        d_rho_.get(), carry ? d_kahan_comp_.get() : nullptr,
+        snap.rho.get(), carry ? snap.kahan.get() : nullptr,
+        n, d_dist_partials_.get());
+    d_dist_partials_.copy_to_host(h_dist_partials_.data(), 2 * static_cast<size_t>(blocks));
+    double dist = 0.0, norm = 0.0;
+    for (int b = 0; b < blocks; ++b) {
+        dist += h_dist_partials_[2 * b];
+        norm += h_dist_partials_[2 * b + 1];
+    }
+    if (norm == 0.0) {
+        throw std::runtime_error(
+            "HEOMTrajectory::relative_distance: the hierarchy is identically zero");
+    }
+    return std::sqrt(dist / norm);
+}
 
-    // Own D2H of the α=0 block — propagate_steps() does not refresh h_rho0_.
-    std::vector<heom::complex_t> rho0(N2);
-    CUDA_CHECK(cudaMemcpy(rho0.data(), d_rho_.get(),
-                          N2 * sizeof(heom::complex_t), cudaMemcpyDeviceToHost));
-
-    // Tr(B·ρ0) = Σ_i Σ_k B(i,k) ρ0(k,i)
-    std::complex<double> tr(0.0, 0.0);
-    for (int i = 0; i < N; ++i)
-        for (int k = 0; k < N; ++k) {
-            const heom::complex_t v = rho0[static_cast<size_t>(k) * N + i];
-            tr += B(i, k) * std::complex<double>(heom::c_re(v), heom::c_im(v));
-        }
-    return tr;
+void HEOMTrajectory::dress_ados() {
+    if (!initial_set_) {
+        throw std::logic_error("HEOMTrajectory::dress_ados() before set_initial()");
+    }
+    build_context();
+    for (int tier = 1; tier <= sys_.L(); ++tier)
+        launch_dress_tier(ctx_, d_rho_.get(), tier);
+    on_rho_replaced();
+    if (use_filtering_) activate_all_ados(ctx_);
 }
 
 void HEOMTrajectory::perform_ado_filtering(double threshold,
-                                           int row_off, int n_row,
-                                           int col_off, int n_col,
+                                           const heom::ManifoldBlock& blk,
                                            const int* scan_list,
-                                           int scan_count) {
+                                           int scan_count,
+                                           const int* scan_off) {
     // U-local contract: the scan domain MUST cover the previous
     // write set of ρ. New threshold crossings can only happen where ρ was
     // written; everything outside kept a frozen sub-threshold norm and an
     // inactive flag (A ⊆ U), so skipping it is exact — not an approximation.
     //   scan_list == nullptr : full-M sweep (previous write set was the full
-    //                          grid: dense fallback, ulist off, dipole apply,
-    //                          restore-scatter).
+    //                          grid: dense fallback, ulist off; or unknown:
+    //                          the first step after restore / expand). A
+    //                          superset of the write set gives the same flags:
+    //                          everything outside it was inactive at its last
+    //                          scan, is unchanged since, and the threshold
+    //                          is fixed for the run.
     //   scan_list != nullptr : compact sweep over the previous whole-step's U.
-    // Batched (active_batch_>1): the norm kernel folds the union max over the
-    // ACTIVE slots, so the single active_flags is the union closure — an ADO
-    // active in ANY active slot survives. Only active_batch_ slots
-    // hold live state (higher slots are stale/idle), so union over active_batch_
-    // (not batch_) is both correct and avoids folding stale slots.
+    // Batched (active_batch_>1): every active slot is filtered on its OWN
+    // state into its own flag row (per-slot active sets, 2026-10-22-batch-
+    // per-slot; this replaced the union of all slots, which made every slot
+    // compute every other slot's ADOs). scan_off gives each slot its own
+    // previous write set. Only active_batch_ slots hold live state.
     // active_batch_==1 ⇒ ordinary single-state norms.
-    // Manifold block: scanning only the sub-block is exact, not an
-    // approximation — out-of-block entries are exactly zero and the max norm
-    // has no accumulation, so max(sub-block) ≡ max(whole matrix).
-    compute_ado_norms(d_rho_.get(), d_ado_norms_.get(), sys_.M(), sys_.N(),
-                      row_off, n_row, col_off, n_col,
-                      scan_list, scan_count, active_batch_);
+    // Manifold block: it is the storage shape, so the Nb elements it names are
+    // the whole ADO — the norm scan reads exactly what exists.
+    // Fused (norms_fused_): the last kFinal already folded max|ρ_α|² over
+    // its launch set (per slot), which is exactly this scan domain (both are
+    // the previous step's ctx.u_list / full grid), so the scan is skipped and
+    // the filter takes the sqrt. Same max of the same values ⇒ same flags, bitwise.
+    const bool fused = norms_fused_;
+    norms_fused_ = false;
+    if (!fused)
+        compute_ado_norms(d_rho_.get(), d_ado_norms_.get(), sys_.M(), sys_.N(),
+                          blk, scan_list, scan_count, active_batch_, scan_off);
 
     // Mark-only: write active_flags on device, no count / no D2H. |A| is
     // derived on demand from the level distribution in emit_ado_stats, so the
     // hot per-step filter path carries zero host synchronization.
     filter_ados_mark_only(
-        d_ado_norms_.get(), d_active_flags_.get(), threshold, sys_.M(),
-        scan_list, scan_count);
-}
-
-void HEOMTrajectory::rebuild_ulist_into_ctx() {
-    if (!ulist_builder_) return;
-    const int uc = rebuild_ulist();
-    closure_count_ = uc;
-    ctx_.u_list  = ulist_builder_->device_list();
-    ctx_.u_count = uc;
-}
-
-void HEOMTrajectory::refresh_active_set_and_ulist(double threshold) {
-    build_context();
-    // Whole matrix, deliberately — do NOT "optimise" this into ctx_'s block.
-    // Callers are apply_dipole() and snapshot_device(), and the 2DES driver
-    // declares the next segment's block only just before propagate_steps:
-    //     two_dim.cpp:252  apply_dipole_full_hierarchy()   <- we are in here
-    //     two_dim.cpp:274  apply_block(traj, blk[0])       <- block updates here
-    // So at this point ctx_ still carries the PREVIOUS segment's block while ρ
-    // has just been moved into a new one. Scanning that stale block would read
-    // exact zeros, yield zero norms, and mark every ADO but α=0 inactive —
-    // silently. build_context() above refreshes the context, NOT the block;
-    // that is exactly what makes the trap look safe.
-    // Cost of the full sweep: once per segment against dozens of steps.
-    perform_ado_filtering(threshold, 0, sys_.N(), 0, sys_.N());
-    rebuild_ulist_into_ctx();
+        d_ado_norms_.get(), d_active_flags_.get(), d_nan_flag_.get(),
+        threshold, sys_.M(), scan_list, scan_count, active_batch_, scan_off, fused);
 }
 
 void HEOMTrajectory::activate_all_ados(HEOMContext& ctx) {
-    CUDA_CHECK(cudaMemset(d_active_flags_.get(), 1,
-                          static_cast<size_t>(sys_.M())));
+    CUDA_CHECK(cudaMemset(d_active_flags_.get(), 1, d_active_flags_.size()));
     total_active_ados_ = sys_.M();
     // |A| = M ⇒ U = M, so the compact launch would only add a full-length
     // indirection table. Take the dense path (byte-equal, no indirection) —
-    // the same choice the adaptive gate below would make at |E|/M = 1.
-    if (ulist_builder_) {
-        closure_count_ = sys_.M();
+    // the same choice the adaptive gate below would make at |E|/M = 1 — with
+    // no U gate: the builder's flags describe the previous active set.
+    ctx.u_flags = nullptr;
+    if (ulist_on()) {
+        closure_count_ = active_batch_ * sys_.M();
         ctx.u_list     = nullptr;
+        ctx.u_off      = nullptr;
         ctx.u_count    = 0;
-        ulist_dense_   = 1;
+        ctx.block_off  = nullptr;
+        ctx.launch_blocks = 0;
+        ulist_mode_    = UlistMode::Dense;
     }
 }
 
-void HEOMTrajectory::init_ulist_if_enabled() {
-    if (!use_filtering_ || sys_.config().filter.ulist_tau <= 0.0) return;
+void HEOMTrajectory::hierarchy_filling_(const heom::ManifoldBlock& blk) {
+    // Per slot, like the filter: each slot's fill window is judged on its own
+    // exact-zero count, so a batched slot opens and closes its window on the
+    // same step as that slot alone would (batch: false).
+    norms_fused_ = false;   // overwrites d_ado_norms_
+    compute_ado_norms(d_rho_.get(), d_ado_norms_.get(), sys_.M(), sys_.N(),
+                      blk, nullptr, 0, active_batch_);
+    count_zero_norms(d_ado_norms_.get(), sys_.M(), active_batch_,
+                     d_zero_count_.get(), h_zero_counts_.data());
+    for (int b = 0; b < active_batch_; ++b) {
+        if (!fresh_state_[b]) continue;
+        const int zeros = h_zero_counts_[b];
+        const bool filling = fresh_zeros_[b] < 0
+                          || (zeros > 0 && zeros < fresh_zeros_[b]);
+        fresh_zeros_[b]  = filling ? zeros : -1;
+        fresh_state_[b]  = filling ? 1 : 0;
+    }
+}
+
+void HEOMTrajectory::init_closure_builder() {
+    if (!use_filtering_) return;
 
     // Fully device-side builder: borrows SystemContext's GPU neighbor maps
     // directly (no D2H, no permanent host mirror — the old host builder
     // kept 2·M·channels·4 B of RAM alive for the whole run).
     ulist_builder_ = std::make_unique<UListBuilder>(
-        sys_.M(), sys_.n_bath(), sys_.K(),
+        sys_.M(), sys_.D(), batch_,
         sys_.d_plus_map(), sys_.d_minus_map());
 
-    // τ comes from the config (filter.ulist, the single knob); the env var is
-    // an optional override for parameter sweeps without editing the YAML.
+    // τ comes from the config (filter.ulist) and nowhere else, so it is part
+    // of config_hash like every other number that changes the result.
     ulist_tau_ = sys_.config().filter.ulist_tau;
-    if (const char* tau = std::getenv("HEOM_ULIST_TAU")) {
-        if (tau[0] != '\0') ulist_tau_ = std::atof(tau);
-    }
+    if (!ulist_on()) return;
 
     std::cout << "[ulist] enabled; whole-step over U=E "
                  "(axpy+combine in-place, no swap, freeze a/=U), "
@@ -1053,8 +792,7 @@ void HEOMTrajectory::init_ulist_if_enabled() {
 }
 
 int HEOMTrajectory::rebuild_ulist() {
-    if (!ulist_builder_) return sys_.M();
-    return ulist_builder_->build(d_active_flags_.get());
+    return ulist_builder_->build(d_active_flags_.get(), active_batch_);
 }
 
 void HEOMTrajectory::emit_ado_stats(const std::string& prefix) {
@@ -1063,10 +801,20 @@ void HEOMTrajectory::emit_ado_stats(const std::string& prefix) {
     // so it is safe to call off the filter cadence (e.g. forced τ/T progress
     // lines from the 2DES driver). |A| and |E| are the most recent filter /
     // ulist-rebuild values held in members.
-    compute_active_level_distribution(
-        d_active_flags_.get(), sys_.d_level_indices(),
-        sys_.M(), sys_.n_bath(), sys_.K(), sys_.L(),
-        d_level_counts_.get(), h_level_counts_.data());
+    // Batched: one flag row per slot, so |A| and the level bins are summed
+    // over the active slots and M is printed as active_batch_·M (the size of
+    // the flag space). active_batch_ == 1 ⇒ the historical line exactly.
+    std::vector<int> level_sum(h_level_counts_.size(), 0);
+    for (int b = 0; b < active_batch_; ++b) {
+        compute_active_level_distribution(
+            d_active_flags_.get() + static_cast<size_t>(b) * sys_.M(),
+            sys_.d_level_indices(),
+            sys_.M(), sys_.D(), sys_.L(),
+            d_level_counts_.get(), h_level_counts_.data());
+        for (size_t lev = 0; lev < level_sum.size(); ++lev) level_sum[lev] += h_level_counts_[lev];
+    }
+    h_level_counts_ = level_sum;
+    const int M_flags = active_batch_ * sys_.M();
 
     // |A| derived from the distribution we just pulled back: every active ADO
     // lands in exactly one level bin, so Σ_lev counts == active count. This is
@@ -1080,19 +828,19 @@ void HEOMTrajectory::emit_ado_stats(const std::string& prefix) {
 
     std::cout << std::fixed << prefix;
 
-    if (closure_count_ >= 0) {
+    if (closure_count_) {
         // U-list on: |A|/|E|/M with active% and closure% (|E|=A∪neighbors(A)).
         std::cout << "ADOs |A|/|E|/M = "
-                  << total_active_ados_ << "/" << closure_count_ << "/" << sys_.M()
+                  << total_active_ados_ << "/" << *closure_count_ << "/" << M_flags
                   << " (" << std::setprecision(1)
-                  << (100.0 * total_active_ados_ / sys_.M()) << "%, "
-                  << (100.0 * closure_count_ / sys_.M()) << "%)";
+                  << (100.0 * total_active_ados_ / M_flags) << "%, "
+                  << (100.0 * *closure_count_ / M_flags) << "%)";
     } else {
         // U-list off (no |E| computed): keep the original |A|/M line.
         std::cout << "Active ADOs = "
-                  << total_active_ados_ << "/" << sys_.M()
+                  << total_active_ados_ << "/" << M_flags
                   << " (" << std::setprecision(1)
-                  << (100.0 * total_active_ados_ / sys_.M()) << "%)";
+                  << (100.0 * total_active_ados_ / M_flags) << "%)";
     }
 
     std::cout << " [L0:" << h_level_counts_[0];
@@ -1118,15 +866,16 @@ void HEOMTrajectory::emit_ado_stats(const std::string& prefix) {
 
     // U-list gate flip, as an indented continuation of the line just printed.
     // Only when the compact/full-grid mode actually changed since the last
-    // emitted line (ulist_dense_ is the live state set in run_one_internal_step;
-    // -1 means ulist off / before first build ⇒ no line). No numbers: |E|/M is
-    // already the closure% above and the gate value is in the "[ulist] enabled"
-    // banner, so the flip line carries only the decision.
-    if (ulist_dense_ >= 0 && ulist_dense_ != last_logged_dense_) {
+    // emitted line (ulist_mode_ is the live state set in run_one_internal_step;
+    // Unset means ulist off / before first build ⇒ no line). No numbers: |E|/M
+    // is already the closure% above and the gate value is in the "[ulist]
+    // enabled" banner, so the flip line carries only the decision.
+    if (ulist_mode_ != UlistMode::Unset && ulist_mode_ != last_logged_mode_) {
         std::cout << "    \u2514 U-list \u2192 "
-                  << (ulist_dense_ == 1 ? "full-grid fallback" : "compact whole-step")
+                  << (ulist_mode_ == UlistMode::Dense ? "full-grid fallback"
+                                                      : "compact whole-step")
                   << "\n";
-        last_logged_dense_ = ulist_dense_;
+        last_logged_mode_ = ulist_mode_;
     }
 
 }
@@ -1138,25 +887,27 @@ HEOMTrajectory::SlotActiveStats HEOMTrajectory::slot_active_stats() {
     // slots would be counted (T0a fix). Union and per-slot are thus temporally
     // consistent, so union_count >= max_b(per_slot).
     const int M = sys_.M();
-    const size_t slot_stride =
-        static_cast<size_t>(M) * sys_.N() * sys_.N();
+    const size_t slot_stride = static_cast<size_t>(M) * support_.elems();
     // Grow-only member scratch (see header): no per-call heap alloc, and the
     // union mask lives off the stack (GCC 12/13 -Wfree-nonheap-object FP).
     h_slot_norms_.resize(M);
     h_slot_union_.assign(M, 0);
     h_slot_union_[0] = 1;  // α=0 is always live
+    norms_fused_ = false;  // the per-slot scans below overwrite d_ado_norms_
     SlotActiveStats st;
     st.per_slot.assign(active_batch_, 1);
     for (int b = 0; b < active_batch_; ++b) {
-        // Whole matrix: this is the per-slot diagnostic (filter.log_per_slot,
-        // off by default), not the hot path. Keeping it unblocked also makes it
-        // an independent oracle for the blocked main path — both must produce
-        // the same |A| from the same ρ.
+        // Per-slot diagnostic (filter.log_per_slot, off by default). Same
+        // support as the main path: it is the storage shape, there is nothing
+        // else to scan.
         compute_ado_norms(d_rho_.get() + b * slot_stride, d_ado_norms_.get(),
-                          M, sys_.N(), 0, sys_.N(), 0, sys_.N());
+                          M, sys_.N(), support_);
         d_ado_norms_.copy_to_host(h_slot_norms_.data(), M);
+        // Same predicate as filter_ados_kernel (NaN counts as active) so this
+        // oracle and the device flags agree on |A| even mid-blow-up.
         for (int a = 1; a < M; ++a)
-            if (h_slot_norms_[a] > filter_threshold_) {
+            if (h_slot_norms_[a] > filter_threshold_ ||
+                h_slot_norms_[a] != h_slot_norms_[a]) {
                 ++st.per_slot[b];
                 h_slot_union_[a] = 1;
             }
@@ -1184,7 +935,7 @@ void HEOMTrajectory::print_filtering_statistics(int step,
         prefix = os.str();
     } else {
         // 2DES: the driver's prefix already carries the physical τ/T/t axis
-        // coordinates (run_pathway_tree). The cumulative internal step counter
+        // coordinates (seg_prefix in two_dim.cpp). The cumulative internal step counter
         // and step*dt "time" are meaningless across the depth-first τ→tw→t tree
         // (they also count discarded branches), so they are dropped here.
         prefix = log_prefix_;
@@ -1207,27 +958,45 @@ void HEOMTrajectory::run_step(HEOMContext& ctx, double dt_internal_au) {
     // null — the RK4 epilogues are fused into the derivative kernel, so no
     // k buffer exists at all (workspace = temp_a | temp_b | acc).
     ctx.rho_in = d_rho_.get();
+    // Filter on and past the fill window: the next step filters, so let the
+    // final stage fold the norms it needs (norms_fused_). In the fill window
+    // the next step runs hierarchy_filling_'s own full scan instead.
+    unsigned long long* norm_sq_bits = nullptr;
+    // Fuse only when no live slot is still in the fill window — otherwise the
+    // next step's hierarchy_filling_ overwrites d_ado_norms_. Per-slot rows.
+    bool any_fresh = false;
+    if (use_filtering_) {
+        for (int b = 0; b < active_batch_; ++b)
+            if (fresh_state_[b]) { any_fresh = true; break; }
+    }
+    if (use_filtering_ && !any_fresh) {
+        CUDA_CHECK(cudaMemsetAsync(d_ado_norms_.get(), 0, d_ado_norms_.bytes()));
+        norm_sq_bits = reinterpret_cast<unsigned long long*>(d_ado_norms_.get());
+    }
     // d_kahan_comp_ is empty in the FP64 build ⇒ get() is nullptr ⇒ rk4_step
     // does the plain (bit-identical) combine. Non-null only in mixed precision.
     if (integrator_ == Integrator::IfRk4) {
-        // Factors depend on dt only; rebuild on the first step (last_if_dt_<0)
-        // or whenever the internal dt changes (τ vs t vs dynamics grids).
-        if (dt_internal_au != last_if_dt_) {
+        // Factors depend on dt only; rebuild on the first step (no dt yet) or
+        // whenever the internal dt changes (τ vs t vs dynamics grids).
+        if (if_factors_dt_ != dt_internal_au) {
             compute_if_factors(sys_.d_total_decay(), dt_internal_au, sys_.M(),
                                d_if_e_half_.get(), d_if_e_full_.get());
-            last_if_dt_ = dt_internal_au;
+            if_factors_dt_ = dt_internal_au;
         }
         rk4_step_if(ctx, dt_internal_au, d_workspace_.get(),
                     d_kahan_comp_.get(),
-                    d_if_e_half_.get(), d_if_e_full_.get());
+                    d_if_e_half_.get(), d_if_e_full_.get(), norm_sq_bits);
     } else {
-        rk4_step(ctx, dt_internal_au, d_workspace_.get(), d_kahan_comp_.get());
+        rk4_step(ctx, dt_internal_au, d_workspace_.get(), d_kahan_comp_.get(),
+                 norm_sq_bits);
     }
+    norms_fused_ = norm_sq_bits != nullptr;
 }
 
-void HEOMTrajectory::report_divergence(double t_fs, double rho_norm,
+void HEOMTrajectory::report_divergence(double t_fs, int slot, double rho_norm,
                                        double norm_ceiling,
-                                       int step, int n_steps) {
+                                       int step, int n_steps,
+                                       bool nan_in_hierarchy) {
     const heom::StreamFormat fmt_guard(std::cerr);
     // Plain ASCII so the message survives stripped-down logs (CI capture,
     // tee | less, journald with non-UTF locale, ...).
@@ -1242,10 +1011,16 @@ void HEOMTrajectory::report_divergence(double t_fs, double rho_norm,
               << "  DIVERGENCE DETECTED -- COMPUTATION ABORTED\n"
               << "----------------------------------------------------\n"
               << "  Time:           " << std::setprecision(6)  << t_fs       << " fs\n"
+              << "  Slot:           " << slot << " of " << active_batch_      << "\n"
               << "  ||rho_0(t)||_F: " << std::setprecision(6)  << rho_norm   << "\n"
               << "  Threshold:      " << std::setprecision(6)  << norm_ceiling << "\n"
-              << "  ||rho_0(0)||_F: " << std::setprecision(6)  << initial_norm_ << "\n"
+              << "  Baseline:       " << std::setprecision(6)  << norm0_[slot]
+              << "  (||rho_0||_F at the last set_initial / dipole)\n"
               << "  Step:           " << step  << " / " << n_steps           << "\n"
+              << "  NaN in hierarchy: " << (nan_in_hierarchy ? "yes" : "no")
+              << (nan_in_hierarchy
+                  ? " (an ADO norm is NaN; rho_0 above may still look finite)\n"
+                  : "\n")
               << "----------------------------------------------------\n"
               << "  Check: truncation level L, time step dt,\n"
               << "         Matsubara terms K, temperature.\n"
@@ -1253,17 +1028,27 @@ void HEOMTrajectory::report_divergence(double t_fs, double rho_norm,
 }
 
 bool HEOMTrajectory::check_divergence(double t_fs, int step, int n_steps) {
-    // Refresh the host α=0 mirror(s) so rho0_frobenius_norm() sees the current
-    // device state (solve() also D2H's via its emit lambda; the extra copy here
-    // is a few KB per slot and keeps this guard self-contained for callers like
-    // propagate_steps() that do not). Batched ⇒ all B α=0 blocks.
+    // Refresh the host α=0 mirror(s) so rho0_norm_() sees the current device
+    // state. A few KB per slot; keeps this guard self-contained for every
+    // caller.
     d2h_alpha0_batch();
-    const double rho_norm  = rho0_frobenius_norm();
-    const double norm_ceil = std::max(initial_norm_ * kDivergenceNormFactor,
-                                      kDivergenceNormFloor);
-    if (rho_norm > norm_ceil || std::isnan(rho_norm) || std::isinf(rho_norm)) {
-        report_divergence(t_fs, rho_norm, norm_ceil, step, n_steps);
-        diverged_ = true;
+    // The filter kernel raises this when any scanned ADO norm is NaN. It is
+    // the only way a NaN that has not yet reached ρ_0 becomes visible: with
+    // the old norm kernel such an ADO reported a finite norm, was marked
+    // inactive, and the run finished with a finite, wrong result. It is one
+    // flag for the whole hierarchy, so it fails on the first slot checked.
+    int nan_in_hierarchy = 0;
+    if (use_filtering_) d_nan_flag_.copy_to_host(&nan_in_hierarchy, 1);
+    for (int b = 0; b < active_batch_; ++b) {
+        const double rho_norm  = rho0_norm_(b);
+        const double norm_ceil = std::max(norm0_[b] * kDivergenceNormFactor,
+                                          kDivergenceNormFloor);
+        if (nan_in_hierarchy || !(rho_norm <= norm_ceil)) {   // NaN fails <=
+            report_divergence(t_fs, b, rho_norm, norm_ceil, step, n_steps,
+                              nan_in_hierarchy != 0);
+            diverged_ = true;
+            break;
+        }
     }
     return diverged_;
 }
@@ -1274,15 +1059,6 @@ void HEOMTrajectory::run_one_internal_step(HEOMContext& ctx, int step) {
     const int    print_interval = cfg.time.print_interval;
     const double step_time_fs   = step * cfg.time.dt;
 
-    // Warmup gating: relax the threshold while still inside
-    // [0, filter_start_step) OR on the first-ever pass, so the warmup knob
-    // can never silently no-op.
-    const bool in_warmup = (step < cfg.filter.start_step)
-                        || (filter_pass_index_ == 0);
-    const double effective_threshold = in_warmup
-        ? filter_threshold_ * cfg.filter.warmup_factor
-        : filter_threshold_;
-
     // Unified cadence: filtering + U rebuild run EVERY step on both
     // paths — one semantics, no interval knob. Boundary ADOs (E\A) get their
     // Term 1-3 self-evolution the step after they cross the threshold, so an
@@ -1291,269 +1067,89 @@ void HEOMTrajectory::run_one_internal_step(HEOMContext& ctx, int step) {
     // A four times, so the unfiltered hierarchy grows FOUR hops per step. The
     // lag is real, which is why it must not compound — see fresh_state_.)
     //
-    // fresh_state_: ρ was just replaced (trajectory start, dipole, restore or
-    // slot expand), so the hierarchy is not populated and the cold path that
-    // replaced it may have left the flags saying so. Activate everything and let
-    // THIS step populate the hierarchy; the next one filters real data.
+    // fresh_state_: ρ was replaced (trajectory start, dipole, or a restore /
+    // expand of a snapshot taken in that state) and the hierarchy is still
+    // filling, so some ADOs are exactly 0 only because no step has reached
+    // them yet. Activate everything and let full steps populate it; filtering
+    // starts on the first step that finds the fill finished.
     //
-    // Marking active is never wrong, only slower. Filtering here is wrong at any
-    // threshold: every α>0 norm is exactly 0, so all of them go inactive and
-    // Term 4/5's neighbor gate then releases one level per step.
+    // Marking active is never wrong, only slower. Filtering a not-yet-reached
+    // ADO is wrong at any threshold: its norm is exactly 0, so it goes inactive
+    // and Term 4/5's neighbor gate then releases one level per step.
     //
-    // This used to read `step > 0`, which covers the trajectory start (hence
-    // dynamics/absorption) but not the 2DES dipoles. Keying off ρ replacement
-    // covers all four cold paths at once — they all funnel through
-    // on_rho_replaced().
-    if (use_filtering_ && fresh_state_) {
+    // Keying off ρ replacement covers all four cold paths at once:
+    // set_initial / apply_dipole set it in on_rho_replaced(), restore / expand
+    // reinstall the snapshot's. The window ends with ctx on the dense launch
+    // (activate_all_ados, or restore / expand), so the filter pass that
+    // follows scans all M.
+    //
+    // Per slot (batched): each slot has its own window. While every live
+    // slot is filling the step is dense, as before; once some have finished,
+    // those filter and the still-filling ones keep an all-active flag row
+    // (their closure is then all M) — each slot does what it would do alone.
+    auto count_fresh = [&] {
+        int n = 0;
+        for (int b = 0; b < active_batch_; ++b) n += fresh_state_[b] ? 1 : 0;
+        return n;
+    };
+    if (use_filtering_ && count_fresh() > 0) hierarchy_filling_(ctx.block);
+    const int n_fresh = use_filtering_ ? count_fresh() : 0;
+    if (use_filtering_ && n_fresh == active_batch_) {
         activate_all_ados(ctx);
     } else if (use_filtering_) {
         // Scan domain = the PREVIOUS step's write set (U-local contract).
         // ctx.u_list is exactly the launch set the last run_step wrote through
-        // (nullptr = full grid: ulist off, dense fallback, or pre-first-build
-        // full launch), and rebuild_ulist below overwrites the device list
+        // (nullptr = full grid: ulist off, dense fallback, pre-first-build
+        // full launch, or a restore that does not know the last write set),
+        // and rebuild_ulist below overwrites the device list
         // only AFTER this scan — so reading it here is the correct domain.
         // Block and scan domain both come from the SAME ctx, so they cannot
         // disagree: whatever launch domain the last run_step wrote through is
         // the domain we scan, inside the block it wrote into.
-        const bool prev_compact = ulist_builder_ && (ctx.u_list != nullptr);
-        perform_ado_filtering(effective_threshold,
-                              ctx.row_off, ctx.n_row, ctx.col_off, ctx.n_col,
+        const bool prev_compact = ctx.u_list != nullptr;
+        perform_ado_filtering(filter_threshold_, ctx.block,
                               prev_compact ? ctx.u_list  : nullptr,
-                              prev_compact ? ctx.u_count : 0);
-        ++filter_pass_index_;
+                              prev_compact ? ctx.u_count : 0,
+                              prev_compact ? ctx.u_off   : nullptr);
+        // Slots still in their fill window: all active (see above).
+        for (int b = 0; b < active_batch_ && n_fresh > 0; ++b)
+            if (fresh_state_[b])
+                CUDA_CHECK(cudaMemset(d_active_flags_.get() + static_cast<size_t>(b) * sys_.M(),
+                                      1, static_cast<size_t>(sys_.M())));
 
-        // Recompute the compact launch set from the just-updated active_flags.
-        if (ulist_builder_) {
-            const int ucount = rebuild_ulist();
-            closure_count_ = ucount;   // |E| for the stats line (raw, pre-gate)
-            ctx.u_list  = ulist_builder_->device_list();
-            ctx.u_count = ucount;
+        // Recompute U_b from the just-updated active_flags (returns Σ_b |U_b|).
+        const int ucount = rebuild_ulist();
+        closure_count_ = ucount;   // |E| for the stats line (raw, pre-gate)
 
-            // Hard threshold: dense (|E|/M > gate) falls back to the full grid
-            // (byte-equal, no u_list indirection); else compact whole-step. The
-            // flip is NOT logged here — emit_ado_stats prints it as an indented
-            // continuation of the stats line so it rides a real Step / τ·T·t
-            // line (and carries no @step, meaningless in the 2DES tree).
-            const double frac = static_cast<double>(ucount) / sys_.M();
-            const bool dense = frac > ulist_tau_;
-            if (dense) { ctx.u_list = nullptr; ctx.u_count = 0; }
-            ulist_dense_ = dense ? 1 : 0;
+        // Hard threshold: dense (|E|/M > gate, or ulist off) takes the full
+        // grid (no u_list indirection, U gated by u_flags); else compact
+        // whole-step. The flip is NOT logged here — emit_ado_stats prints it
+        // as an indented continuation of the stats line so it rides a real
+        // Step / τ·T·t line (and carries no @step, meaningless in the 2DES
+        // tree).
+        const double frac = static_cast<double>(ucount)
+                          / (static_cast<double>(active_batch_) * sys_.M());
+        const bool dense = !ulist_on() || frac > ulist_tau_;
+        ctx.u_list  = dense ? nullptr : ulist_builder_->device_list();
+        ctx.u_off   = dense ? nullptr : ulist_builder_->device_offsets();
+        ctx.u_count = dense ? 0 : ulist_builder_->max_count();
+        if (dense) {
+            ctx.launch_blocks = 0;
+            ctx.block_off = nullptr;
+        } else {
+            ctx.launch_blocks = ulist_builder_->prepare_launch(
+                ctx.block.elems(), HEOM_BLOCK_SIZE);
+            ctx.block_off = ulist_builder_->device_block_off();
         }
+        ctx.u_flags = dense ? ulist_builder_->device_flags() : nullptr;
+        if (ulist_on()) ulist_mode_ = dense ? UlistMode::Dense : UlistMode::Compact;
     }
 
     if (use_filtering_ && print_interval > 0 && cadence_logging_
         && (step % print_interval == 0))
         print_filtering_statistics(step, step_time_fs);
 
-    // This step is the one that populates the fresh hierarchy, so from the next
-    // one on there is real data to filter.
-    fresh_state_ = false;
     run_step(ctx, dt_internal_au);
-}
-
-// Shared solve loop for both the single-state solve() and the batched
-// solve_batch(). `emit` is the per-record sink (record_idx, t_fs); it owns the
-// D2H + fan-out (writer / callback), so the loop stays fan-out-agnostic. The
-// emit's D2H(via d2h_alpha0_batch) and the divergence guard (max over slots)
-// both degenerate for B==1, so the single path runs byte-identical to history.
-void HEOMTrajectory::run_solve_loop(
-    const std::function<void(int, double)>& emit)
-{
-    std::cout << "=== Time Evolution ===\n";
-
-    const auto& cfg = sys_.config();
-    const double dt_output_fs    = cfg.time.dt;
-    const int    n_output_steps  = cfg.time.n_steps;
-    const int    output_interval = cfg.time.output_interval;
-
-    // Formatting stated here, not inherited. This line used to print "1000.0 fs"
-    // or "1000.000 fs" for the SAME run length depending on which initial-state
-    // branch had printed last and what precision it leaked.
-    {
-        const heom::StreamFormat fmt_guard(std::cout);
-        std::cout << "Running " << n_output_steps << " steps ("
-                  << std::fixed << std::setprecision(1)
-                  << (n_output_steps * dt_output_fs) << " fs)...\n";
-    }
-
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // t=0 goes through emit() so the record_idx=0 / writer / callback contract
-    // is identical to every later step.
-    emit(0, 0.0);
-
-    // Build once and reuse the cached HEOM context. run_one_internal_step
-    // mutates ctx_.u_list/u_count at filter steps through this reference.
-    build_context();
-    HEOMContext& ctx = ctx_;
-
-    // record_idx == 0 was the t=0 emit above; main loop starts at record 1.
-    int next_record_idx = 1;
-
-    for (int step = 0; step < n_output_steps; ++step) {
-        run_one_internal_step(ctx, step);
-
-        const double output_time_fs = (step + 1) * dt_output_fs;
-
-        if ((step + 1) % output_interval == 0) {
-            emit(next_record_idx, output_time_fs);
-            ++next_record_idx;
-
-            // Norm-based divergence guard: catches both trace-violating
-            // exponential growth (dynamics: ρ(0) trace=1) and traceless
-            // off-diagonal explosion (spectroscopy: ρ(0)=μ⁺ρ_eq, trace≡0). A
-            // trace-only guard gives false negatives on the absorption path.
-            if (check_divergence(output_time_fs, step + 1, n_output_steps))
-                break;
-        }
-    }
-
-    // Only D2H if h_rho0_ doesn't already mirror the final ρ_0:
-    // - n_steps % output_interval == 0: the last iteration emitted — skip.
-    // - divergence: the in-loop emit ran before diverged_ was set — skip.
-    // - loop ended on a non-output step without diverging: D2H so 2DES drivers
-    //   can call final_rho0()/final_trace(). No callback fires (no record_idx).
-    const bool last_was_output_step =
-        (n_output_steps % output_interval == 0);
-    if (!last_was_output_step && !diverged_) {
-        d2h_alpha0_batch();
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
-    simulation_time_seconds_ = elapsed.count();
-
-    std::cout << "done. (computation time: "
-              << heom::console::format_computation_time(simulation_time_seconds_) << ")\n\n";
-}
-
-void HEOMTrajectory::solve(const StepCallback& on_output_step) {
-    if (batch_ != 1) {
-        throw std::runtime_error(
-            "HEOMTrajectory::solve(): batched trajectory (batch="
-            + std::to_string(batch_) + "); use solve_batch()");
-    }
-    if (!initial_set_) {
-        throw std::runtime_error(
-            "HEOMTrajectory::solve() called before set_initial()");
-    }
-
-    if (writer_) {
-        writer_->open(sys_, initial_rho_, use_filtering_, filter_threshold_);
-    }
-
-    // Lazy allocation of the std::complex mirror handed to StepCallback. The
-    // dynamics CLI / 2DES enable_hdf5=false drivers pass no callback and pay
-    // nothing here.
-    const bool has_callback = static_cast<bool>(on_output_step);
-    if (has_callback) {
-        h_rho_alpha0_mirror_.resize(static_cast<size_t>(sys_.N()) * sys_.N());
-    }
-
-    // Unified per-record sink: one D2H of ρ_0, then fan out to the HDF5 writer
-    // (if enabled) and the StepCallback (if registered).
-    auto emit = [&](int record_idx, double t_fs) {
-        const int N = sys_.N();
-        const size_t N2 = static_cast<size_t>(N) * N;
-
-        d2h_alpha0_batch();   // B==1 ⇒ single N² D2H into h_rho0_
-
-        if (writer_) {
-            // HDF5 is float64-only (schema unchanged): hand it the FP64 view.
-            // FP64 build ⇒ zero-copy alias of h_rho0_; mixed ⇒ uplift.
-            writer_->write_timestep(t_fs, rho0_as_fp64(), N);
-        }
-
-        if (has_callback) {
-            // Elementwise hier → std::complex<double>, not reinterpret_cast:
-            // layout compatibility is implementation-defined, and
-            // spectra/dipole.hpp must stay CUDA-free. c_re/c_im promote the
-            // hier element (float in mixed) into the double observable.
-            for (size_t i = 0; i < N2; ++i) {
-                h_rho_alpha0_mirror_[i] = std::complex<double>(
-                    heom::c_re(h_rho0_[i]), heom::c_im(h_rho0_[i]));
-            }
-            on_output_step(record_idx, t_fs,
-                           h_rho_alpha0_mirror_.data(), N);
-        }
-    };
-
-    run_solve_loop(emit);
-}
-
-void HEOMTrajectory::solve_batch(const BatchStepCallback& on_output_step) {
-    if (!initial_set_) {
-        throw std::runtime_error(
-            "HEOMTrajectory::solve_batch() called before set_initial_batch()");
-    }
-    // Absorption batching serves only the enable_hdf5=false in-memory drivers: the HDF5
-    // schema is single-ρ0, so a batched write has nowhere to land. Fail loud
-    // rather than silently drop B-1 slots.
-    if (enable_hdf5_) {
-        throw std::runtime_error(
-            "HEOMTrajectory::solve_batch(): batching requires enable_hdf5=false "
-            "(HDF5 schema is single-ρ0)");
-    }
-    // The emit lambda converts batch_ slots and hands batch_ to the callback,
-    // but d2h_alpha0_batch() only refreshes active_batch_ slots. A narrowed
-    // width would silently feed the callback stale bytes for slots ≥ active —
-    // solve_batch requires the full allocated width.
-    if (active_batch_ != batch_) {
-        throw std::runtime_error(
-            "HEOMTrajectory::solve_batch(): active_batch ("
-            + std::to_string(active_batch_) + ") != batch ("
-            + std::to_string(batch_) + "); reset via set_active_batch(batch())");
-    }
-
-    const bool has_callback = static_cast<bool>(on_output_step);
-    if (has_callback) {
-        h_rho_alpha0_mirror_.resize(
-            static_cast<size_t>(batch_) * sys_.N() * sys_.N());
-    }
-
-    auto emit = [&](int record_idx, double t_fs) {
-        const int N = sys_.N();
-        const size_t tot = static_cast<size_t>(batch_) * N * N;
-
-        d2h_alpha0_batch();   // fills h_rho0_[b·N²] for all B slots
-
-        if (has_callback) {
-            for (size_t i = 0; i < tot; ++i) {
-                h_rho_alpha0_mirror_[i] = std::complex<double>(
-                    heom::c_re(h_rho0_[i]), heom::c_im(h_rho0_[i]));
-            }
-            on_output_step(record_idx, t_fs,
-                           h_rho_alpha0_mirror_.data(), N, batch_);
-        }
-    };
-
-    run_solve_loop(emit);
-}
-
-void HEOMTrajectory::save_results() {
-    const heom::StreamFormat fmt_guard(std::cout);
-    if (writer_) {
-        writer_->close(simulation_time_seconds_,
-                       use_filtering_ ? &filtering_history_ : nullptr);
-    }
-
-    // solve() ends with a final D2H into h_rho0_, so the host mirror holds the
-    // final ρ_0 here. No extra cudaMemcpy.
-    const double trace = final_trace();
-
-    if (diverged_) {
-        // `fixed` stated explicitly: setprecision alone means SIGNIFICANT
-        // digits, so an exact trace of 1 printed as "1", not "1.0000000000".
-        // It only ever looked right because `fixed` had leaked in from a
-        // previous printer.
-        std::cerr << "Final trace: " << std::fixed << std::setprecision(10) << trace
-                  << " (DIVERGED)\n";
-    } else {
-        std::cout << "Final trace: " << std::fixed << std::setprecision(6) << trace << "\n";
-    }
-    if (writer_) {
-        std::cout << "Results saved to: " << writer_->get_output_path() << "\n";
-    }
 }
 
 // ---------------------------------------------------------------------------

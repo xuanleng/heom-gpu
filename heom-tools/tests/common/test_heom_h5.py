@@ -50,6 +50,26 @@ def test_task_and_run_kind() -> None:
         Path(path).unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize(
+    "status, ok",
+    [(None, True), ("complete", True), (b"complete", True),
+     ("running", False), ("diverged", False), ("aborted", False)],
+)
+def test_require_complete(tmp_path: Path, status, ok: bool) -> None:
+    path = tmp_path / "run.h5"
+    with h5py.File(path, "w") as f:
+        f.attrs["task"] = "dynamics"
+        if status is not None:
+            f.attrs["status"] = status
+            f.attrs["n_records_written"] = 3
+    with h5py.File(path, "r") as f:
+        if ok:
+            heom_h5.require_complete(f)
+        else:
+            with pytest.raises(heom_h5.IncompleteRunError, match="n_records_written=3"):
+                heom_h5.require_complete(f)
+
+
 def test_eigenvalues_absolute_cm() -> None:
     with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tf:
         path = tf.name

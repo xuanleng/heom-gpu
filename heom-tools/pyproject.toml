@@ -12,10 +12,8 @@ dependencies = [
   "h5py>=3.0",
   "matplotlib>=3.5",
   "pyyaml>=6.0",
+  "scipy>=1.13",
 ]
-
-[project.optional-dependencies]
-rqmc = ["scipy>=1.13"]
 
 [project.scripts]
 pop-plot = "heom_tools.population.cli:main"
@@ -23,6 +21,8 @@ pop-compare = "heom_tools.population.compare_cli:main"
 las-post = "heom_tools.absorption.post.cli:main"
 las-plot = "heom_tools.absorption.plot.cli:main"
 las-compare = "heom_tools.absorption.plot.compare_cli:main"
+flu-post = "heom_tools.fluorescence.post.cli:main"
+flu-plot = "heom_tools.fluorescence.plot.cli:main"
 twodes-post = "heom_tools.twodes.post.cli:main"
 twodes-plot = "heom_tools.twodes.plot.cli:main"
 twodes-animate = "heom_tools.twodes.animate.cli:main"
@@ -43,9 +43,7 @@ packages = ["heom_tools"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = [
-  "tests",
-]
+testpaths = ["tests"]
 filterwarnings = [
   "ignore:Unable to import Axes3D:UserWarning",
 ]

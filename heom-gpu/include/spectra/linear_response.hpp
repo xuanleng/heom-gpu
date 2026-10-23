@@ -22,7 +22,7 @@ namespace heom::spectra {
  * operator; new fields are non-breaking under the API stability rule. Removing
  * or renaming a field is breaking.
  *
- * **Don't add Stage-2 hooks now**: the public-API stability
+ * Public-API stability note: the stability
  * promise locks this struct. The semantics of the preparation-side selector
  * (left mul vs. right mul vs. commutator?) and the sampling operator (μ⁻ vs.
  * something else?) cannot be pinned until emission / CD / 2DES algorithms
@@ -122,18 +122,22 @@ struct LinearResponseResult {
  * Python bindings / ML fitting drivers will consume directly.
  *
  * Algorithm:
- *   - For each direction α (skip if `req.dipole.mu_α.norm() < 1e-12`):
- *       1. ρ(0) = μ⁺_α · ρ_eq   (ρ_eq ≈ |g⟩⟨g|).
- *       2. Build a HEOMTrajectory with HDF5 disabled (the spectroscopy
- *          compute layer never opens files) and seed it
- *          with ρ(0) via `traj.set_initial(ρ(0))`.
- *       3. `traj.solve(callback)` — the callback memcpy's ρ_0 from the host
- *          mirror into `out.rho_xyz` at the right offset (see the
- *          callback contract), and records `out.time_fs[record] = t_fs`.
- *   - After each direction, throw if
- *     `traj.diverged()` or if `records_seen != n_outputs`. This avoids
- *     leaking zero-initialised tail records into a "spectrum" the caller
- *     would then FFT and treat as truth.
+ *   - Directions α with `req.dipole.mu_α.norm() < 1e-12` are skipped (their
+ *     slab of `out.rho_xyz` stays zero). The rest are grouped into
+ *     propagations: one B-wide group when `absorption.batch` (Config::linear_batch) is on, one B=1
+ *     group per direction otherwise. The two groupings run the same code and
+ *     are bit-identical with the ADO filter off; with it on, a batched group
+ *     filters on the union active set.
+ *   - For each group:
+ *       1. ρ_b(0) = μ⁺_{α_b} · ρ_eq   (ρ_eq ≈ |g⟩⟨g|).
+ *       2. Build a HEOMTrajectory(sys, B) and seed it via
+ *          `traj.set_initial({ρ_0(0), …, ρ_{B-1}(0)}, (e,g) block)`.
+ *       3. `heom::run_output_loop(traj, callback)` — the callback memcpy's each slot's ρ_0 from
+ *          the host mirror into `out.rho_xyz` at that direction's offset (see the
+ *          run_output_loop callback contract), and records `out.time_fs[record] = t_fs`.
+ *   - After each group, throw if `traj.diverged()` or if
+ *     `records_seen != n_outputs`. This avoids leaking zero-initialised tail
+ *     records into a "spectrum" the caller would then FFT and treat as truth.
  *
  * `n_outputs` comes from the free function
  * `output_record_count(sys.config().time)` — NOT from constructing a

@@ -1,6 +1,7 @@
 #include "heom_config.hpp"
 #include "output/hdf5_writer.hpp"
 #include "output/hdf5_metadata.hpp"
+#include "harness.hpp"
 
 #include <hdf5.h>
 
@@ -56,8 +57,10 @@ std::string read_string_dataset(hid_t loc, const char* name) {
 
 }  // namespace
 
-int main() {
-    const std::string path = "/tmp/test_heom_hdf5_config_metadata.h5";
+// Body throws on the first broken expectation (the `require` helpers above);
+// the harness turns that into a FAIL with the message.
+static void test_group_layout_metadata_body() {
+    const std::string path = heom_test::tmp("test_heom_hdf5_config_metadata.h5");
     std::remove(path.c_str());
 
     HEOMConfig::Config cfg{};
@@ -136,7 +139,20 @@ int main() {
 
     require(H5Fclose(file) >= 0, "cannot close HDF5 test file after read");
     std::remove(path.c_str());
+}
 
-    std::cout << "HDF5 group layout metadata test PASS\n";
-    return 0;
+static void test_group_layout_metadata() {
+    TEST("HDF5 group layout metadata (root identity / parameters / provenance)");
+    try {
+        test_group_layout_metadata_body();
+    } catch (const std::exception& e) {
+        std::cout << "FAIL\n    " << e.what() << "\n";
+        return;
+    }
+    PASS();
+}
+
+int main() {
+    test_group_layout_metadata();
+    return heom_test_summary("test_hdf5_config_metadata");
 }

@@ -12,6 +12,7 @@
 #include <vector>
 #include <complex>
 #include <Eigen/Dense>
+#include "core/mode_layout.hpp"
 
 // Physical constants (atomic units)
 constexpr double BOLTZMANN = 3.166811563e-6;    // a.u./K (k_B in atomic units)
@@ -36,6 +37,18 @@ enum class BasisType {
     DOUBLE_EXCITED      // Ground + single-excited + double-excited
 };
 
+// The yaml spelling (`system.basis`), also what the HDF5 `basis` attr and the
+// console summary print. One switch, no `default:` — adding an enumerator
+// makes -Wswitch point here.
+inline const char* basis_to_string(BasisType b) {
+    switch (b) {
+        case BasisType::EXCITED_ONLY:    return "excited_only";
+        case BasisType::WITH_GROUND:     return "with_ground";
+        case BasisType::DOUBLE_EXCITED:  return "double_excited";
+    }
+    return "unknown";
+}
+
 /**
  * @brief Bath-correlation exponential-expansion scheme.
  *
@@ -51,24 +64,26 @@ enum class BathExpansion {
     PADE
 };
 
-// Inverse mapping: convert internal 0-based Hilbert index back to the
-// user-facing 1-based PHYSICAL pigment index. This is the inverse of
-// parse_site_excitation() in heom_config.cpp and is the canonical
-// representation for console output, HDF5 attributes, and any downstream
-// post-processing that should mirror the YAML input.
-//
-//   EXCITED_ONLY            : pigment k → Hilbert k-1   ⇒ inverse k = h + 1
-//   WITH_GROUND / DOUBLE_*  : pigment k → Hilbert k     ⇒ inverse k = h
-inline int hilbert_to_pigment(int hilbert_idx, BasisType basis) {
-    return (basis == BasisType::EXCITED_ONLY) ? hilbert_idx + 1 : hilbert_idx;
+// The ONE fact behind every user-index ↔ Hilbert-index conversion: how many
+// Hilbert slots precede the single-excitation block. EXCITED_ONLY has no
+// ground state; WITH_GROUND / DOUBLE_EXCITED put |g⟩ at index 0.
+inline int ground_slots(BasisType basis) {
+    return (basis == BasisType::EXCITED_ONLY) ? 0 : 1;
 }
 
-// Convert the internal eigenvector/Hilbert index used for single-exciton
-// excitation back to the YAML-facing 1-based single-exciton index.
-// EXCITED_ONLY has no ground slot; WITH_GROUND stores ground at index 0, so
-// single excitons start at Hilbert/eigenvector index 1.
-inline int single_exciton_user_index_1based(int internal_idx, BasisType basis) {
-    return (basis == BasisType::EXCITED_ONLY) ? internal_idx + 1 : internal_idx;
+// YAML-facing 1-based index (pigment for site_excitation / sink.target_site,
+// single-exciton index for exciton_excitation — same block, same offset) →
+// internal 0-based Hilbert / eigenvector index, and back. The inverse is the
+// canonical form for console output, HDF5 attributes and post-processing that
+// should mirror the YAML input.
+//
+//   EXCITED_ONLY            : k → k-1
+//   WITH_GROUND / DOUBLE_*  : k → k      (ground occupies 0)
+inline int pigment_to_hilbert(int user_1b, BasisType basis) {
+    return user_1b - 1 + ground_slots(basis);
+}
+inline int hilbert_to_pigment(int hilbert_idx, BasisType basis) {
+    return hilbert_idx + 1 - ground_slots(basis);
 }
 
 // Hierarchy index alpha = (alpha_{n,k}) for n in [0, n_bath), k in [0, K]:
@@ -207,12 +222,45 @@ struct SinkConfig {
  * NO separate global scalar (eliminates the homogeneous-vs-heterogeneous
  * special case — homogeneous is just "all rows equal").
  */
+/**
+ * @brief One underdamped Brownian-oscillator vibrational mode coupled to a pigment.
+ *
+ *   J_m(ω) = 4 λ_m γ ω₀² ω / ((ω₀² − ω²)² + 4 γ² ω²),   λ_m = S ω₀
+ *
+ * γ is the decay rate of the correlation function, exactly as for Drude:
+ * C(t) ~ e^{-γt} e^{±iω₁t}, two ladders ν± = γ ± iω₁, ω₁ = sqrt(ω₀² − γ²).
+ * The Lorentzian FWHM of the mode is 2γ (literature often writes the same J
+ * with Γ = 2γ in the denominator; convert Γ_cm ⇒ gamma_inverse = 5308.8/(Γ_cm/2)).
+ */
+struct VibMode {
+    double omega_cm = 0.0;          // ω₀ (cm⁻¹, input)
+    double huang_rhys = 0.0;        // S (dimensionless, input); λ = S·ω₀
+    // 1/γ (fs): the C(t) envelope decay time. Same key, same conversion, SAME
+    // meaning as BathSite::gamma_inverse_fs. FWHM of the mode = 2γ.
+    double gamma_inverse_fs = 0.0;
+    double omega_au = 0.0;          // ω₀ (a.u.)
+    double lambda_au = 0.0;         // λ = S·ω₀ (a.u.)
+    double gamma_au = 0.0;          // γ (a.u.), envelope decay rate; FWHM = 2γ
+};
+
 struct BathSite {
     double eta_cm = 0.0;            // Drude coupling η (cm⁻¹, input); λ_reorg = η/2
     double eta_au = 0.0;            // η (a.u.)
     double gamma_inverse_fs = 0.0;  // 1/γ (fs, input)
     double gamma_au = 0.0;          // γ (a.u.)
+    // Non-Drude poles K_n for THIS site (Matsubara frequencies or Padé poles).
+    // Defaults to the global bath.n_extra_poles; `sites:<n>: n_extra_poles`
+    // overrides it. Padé convergence is set by βγ_n, and γ_n is already
+    // per-site — so K_n must be too.
+    int n_extra_poles = 0;
+    // Underdamped vibrational modes on this pigment; each adds 2 ladders.
+    std::vector<VibMode> modes;
+    // Ladders this site owns: Drude + K_n + 2·modes.
+    int n_slots() const { return 1 + n_extra_poles + 2 * static_cast<int>(modes.size()); }
 };
+
+// Per-slot provenance tag, written to HDF5 /derived/mode_kind (int8).
+enum class ModeKind : int8_t { Drude = 0, Pole = 1, BOPlus = 2, BOMinus = 3 };
 
 struct PhysicalParameters {
     // Internal storage: ATOMIC UNITS (for GPU)
@@ -221,25 +269,39 @@ struct PhysicalParameters {
     // applied, pre-expansion). Kept so a task can (re)expand into its chosen
     // basis via HEOMConfig::apply_basis() without re-reading the yaml.
     Eigen::MatrixXcd hamiltonian_site;
-    // Per-site bath-correlation coefficients, flat row-major [n][k], length
-    // n_bath*(n_bath_modes_total+1). Index via mode_idx(n,k). c_{nk} = entry
-    // (n, k); ν_{nk} likewise. Every physical bath n carries its own
-    // correlation function C_n(t) = Σ_k c_{nk} e^{-ν_{nk} t}.
-    std::vector<std::complex<double>> c_bath;       // c_{nk} (a.u.), [n_bath*(K+1)]
-    std::vector<double> nu_bath;                    // ν_{nk} (a.u.), [n_bath*(K+1)]
+    // λ_n = η_n/2 + Σ S ω₀ (cm⁻¹), [n_states]: the shift hamiltonian_site
+    // carries on its diagonal. Bare H_S (e block) = hamiltonian_site −
+    // diag(reorg_cm)·CM_TO_AU (+ w0); MC disorder moves only hamiltonian_site.
+    std::vector<double> reorg_cm;
+    // Per-site bath-correlation coefficients, flat, length D = mode_off.back().
+    // Bath n owns slots [mode_off[n], mode_off[n+1]); index via mode_idx(n,k).
+    // c_{nk} = entry (n, k); ν_{nk} likewise. Every physical bath n carries
+    // its own correlation function C_n(t) = Σ_k c_{nk} e^{-ν_{nk} t}.
+    std::vector<std::complex<double>> c_bath;       // c_{nk} (a.u.), [D]
+    // ν_{nk} is complex: real for Drude/Matsubara/Padé poles, a conjugate
+    // pair nu = gamma ± i*omega for an underdamped vibrational mode.
+    std::vector<std::complex<double>> nu_bath;      // ν_{nk} (a.u.), [D]
+    // Right-action coefficient of slot k: C*(t) = Σ_k c_k* e^{-ν_k* t}, so on
+    // the ladder decaying with ν_k the coefficient is c_j* for the slot j with
+    // ν_j = ν_k*. Real pole ⇒ j = k ⇒ c̄_k = c_k*; conjugate pair ⇒ j = partner.
+    // Filled by finalize_site (physics_utils) with the ONE rule above.
+    std::vector<std::complex<double>> cbar_bath;    // c̄_{nk} (a.u.), [D]
     std::vector<double> markov_residue;             // per-site Markov term Σ_{k>K} c_{nk}/ν_{nk} (a.u.), [n_bath]
+    // What generated each slot (Drude / Padé-Matsubara pole / BO± ladder), [D].
+    // Provenance only: kernel never reads it; HDF5 /derived and error messages do.
+    std::vector<ModeKind> mode_kind;
+
+    // Ladder layout: prefix sums over per-bath slot counts, [n_bath+1],
+    // mode_off[0] == 0, mode_off[n_bath] == D. Filled by set_mode_counts()
+    // (called from the bath-correlation builders) BEFORE c_bath/nu_bath are
+    // sized. This is the ONLY place the (n,k)→slot map is defined; every
+    // consumer goes through mode_layout(). See core/mode_layout.hpp.
+    std::vector<int> mode_off;
 
     // Which exponential-expansion scheme generated c_bath / nu_bath. Set from
     // the required YAML field bath.expansion_method (no implicit default).
     BathExpansion expansion = BathExpansion::MATSUBARA;
 
-    // Padé-only reference caches (length n_extra_poles + 1, index [0] is the
-    // Drude placeholder = 0, [1..K] the PSD poles/weights). Filled by
-    // compute_pade_drude; left empty on the Matsubara path. Written to HDF5
-    // /derived for post-processing cross-checks; never read by the kernel.
-    std::vector<double> pade_zeta;                  // dimensionless pole positions ζ_l
-    std::vector<double> pade_chi;                   // Padé rational weights χ_l
-    
     double temperature;                             // Temperature (a.u.) — GLOBAL (all sites share)
 
     // Per-site bath input (η_n, γ_n) in both raw and a.u. forms. Single source
@@ -256,25 +318,35 @@ struct PhysicalParameters {
     BasisType basis;                                // Hilbert space basis type
     int n_sites;                                    // Total Hilbert space dimension (auto-computed)
 
-    // Two bath-mode counts kept as separate fields for their distinct
-    // conceptual roles (user-input snapshot vs runtime last index). They now
-    // coincide numerically: n_bath_modes_total == n_extra_poles.
-    //
-    //   n_extra_poles       : USER input from YAML, immutable after parse_bath.
-    //                         Number of non-Drude bath poles k=1..K (Matsubara
-    //                         frequencies or Padé poles). The k=0 Drude mode is
-    //                         implicit (always present).
-    //   n_bath_modes_total  : RUNTIME index of the last entry in c_bath /
-    //                         nu_bath arrays. Equals n_extra_poles. All kernel
-    //                         loops `for k in 0..n_bath_modes_total` use this
-    //                         field.
-    int n_bath_modes_total = 0;
+    // USER input from YAML, immutable after parse_bath: the DEFAULT number of
+    // non-Drude bath poles k=1..K (Matsubara frequencies or Padé poles). The
+    // bath builders read bath_sites[n].n_extra_poles (K_n), which parse_bath
+    // seeds from this and `sites:<n>: n_extra_poles` may override. The k=0
+    // Drude mode is implicit (always present). Nothing downstream of the
+    // builders (kernel, hierarchy, budget) reads either — they read the
+    // layout (mode_off / D) instead.
     int n_extra_poles = 0;
 
-    int n_modes_per_bath() const { return n_bath_modes_total + 1; }
+    // Total ladder count N_ell = Σ_n P_n (the hierarchy index width).
+    int n_ladders() const { return mode_off.empty() ? 0 : mode_off.back(); }
 
-    // Flat row-major index into c_bath/nu_bath: entry (n, k).
-    int mode_idx(int n, int k) const { return n * (n_bath_modes_total + 1) + k; }
+    // Pin the ladder layout from per-bath slot counts. counts.size() must be
+    // n_bath(). Uniform K+1 everywhere reproduces the old rectangle.
+    void set_mode_counts(const std::vector<int>& counts) {
+        mode_off.assign(counts.size() + 1, 0);
+        for (size_t n = 0; n < counts.size(); ++n)
+            mode_off[n + 1] = mode_off[n] + counts[n];
+    }
+
+    // The (n,k) layout of c_bath/nu_bath and of every per-ADO mode table the
+    // kernels read. Defined once in core/mode_layout.hpp; this is a view of it
+    // (non-owning: valid while this object and mode_off are alive/unchanged).
+    heom::ModeLayout mode_layout() const {
+        return {n_states, n_ladders(), mode_off.data()};
+    }
+
+    // Flat index into c_bath/nu_bath: entry (n, k).
+    int mode_idx(int n, int k) const { return mode_layout().slot(n, k); }
     
     // Sink/Trap configuration (single source of truth)
     SinkConfig sink;
@@ -297,8 +369,12 @@ struct PhysicalParameters {
         return c_bath[mode_idx(n, k)] / (CM_TO_AU * CM_TO_AU);
     }
     
-    double nu_bath_in_cm(int n, int k) const {
+    std::complex<double> nu_bath_in_cm(int n, int k) const {
         return nu_bath[mode_idx(n, k)] / CM_TO_AU;
+    }
+
+    std::complex<double> cbar_bath_in_cm(int n, int k) const {
+        return cbar_bath[mode_idx(n, k)] / (CM_TO_AU * CM_TO_AU);
     }
 };
 
@@ -311,7 +387,7 @@ struct PhysicalParameters {
 // and the Markov-residue formula.
 // boson_pade_NmN exposes the raw Padé [K-1/K] poles/weights for unit tests
 // (anchors ζ_1²=60, χ_1=5/2). Algorithm is transcribed from the authoritative
-// reference bath_correlation Padé poles helper — not rederived.
+// transcribed, not re-derived.
 void compute_matsubara_drude(PhysicalParameters& phys);
 void compute_pade_drude(PhysicalParameters& phys);
 void compute_bath_correlation(PhysicalParameters& phys);
@@ -331,7 +407,7 @@ std::vector<int8_t> build_d_coupling(const PhysicalParameters& phys);
  * no knob. All filter
  * knobs live in FilterConfig (heom_config.hpp), not here.
  */
-// Time integrator selection (per-task YAML key `integrator`, default rk4).
+// Time integrator selection (per-task YAML key `integrator`, required — no default).
 //   Rk4   : plain 4th-order RK4 (historical, bit-identical baseline).
 //   IfRk4 : integrating-factor RK4 — Term 2 (hierarchy decay) is integrated
 //           EXACTLY per-ADO, RK4 handles only the non-stiff coupling. Lets the
@@ -342,7 +418,6 @@ struct TimeParameters {
     double dt = 0.0;                    // Time step in fs
     double dt_au = 0.0;                 // Time step in a.u. (= dt × FS_TO_AU, for RK4)
     int n_steps = 0;                    // Total number of output steps (0 for 2des)
-    std::vector<double> output_times;   // Times to output (fs)
     int output_interval = 0;            // Output every N steps (write to file; 0 for 2des)
     int print_interval = 0;             // Print statistics every N steps; 0 disables printing
     Integrator integrator = Integrator::Rk4;  // time integrator (default: plain RK4)
@@ -351,8 +426,8 @@ struct TimeParameters {
 /**
  * @brief Number of output records produced by a HEOM run with this time config.
  *
- * Single source of truth used by
- *   - HEOMTrajectory::n_output_records()
+ * Spectroscopy n_outputs: single source of truth used by
+ *   - heom::run_output_loop() (emit count per run)
  *   - HDF5Writer::open() (replaces the hardcoded `n_steps/output_interval + 1`
  *     formula that previously lived at hdf5_writer.cpp:112)
  *   - heom::spectra::compute_linear_response() (avoids constructing a dummy
@@ -405,12 +480,14 @@ struct InitialState {
  * - filename: "auto" for auto-naming from config params, or custom string
  *   Auto-naming only works for site_excitation and exciton_excitation.
  *   For coherent/custom_matrix, user must provide a custom filename.
- * - use_timestamp: append _YYYYMMDD_HHMM to filename
+ * - use_timestamp: append _YYYYMMDD_HHMMSS to filename. Such a file is
+ *   created exclusively (an existing one is an error); a fixed name
+ *   (use_timestamp: false) replaces an existing file, with a note.
  */
 struct OutputConfig {
     std::string save_path;              // Directory path
     std::string filename = "auto";      // "auto" → auto-generated, else custom name
-    bool use_timestamp = true;          // true: append _YYYYMMDD_HHMM
+    bool use_timestamp = true;          // true: append _YYYYMMDD_HHMMSS
     // When false (default), the pre-allocation memory budget prints
     // a single compact line; full per-bucket detail is only printed when the
     // estimate exceeds 50% of free GPU memory. When true, always full detail.

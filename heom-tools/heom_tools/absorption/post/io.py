@@ -18,16 +18,16 @@ from heom_tools.common import mc_naming
 from .util import format_duration
 from heom_tools.common.spectrum import (
     SpectrumData,
-    absorption_h5_skip_reason,
     default_absorption_frequency_window_cm,
     has_processed_absorption_sibling,
     is_processed_absorption_h5_filename,
-    is_raw_with_ground_absorption_h5,
+    linear_h5_skip_reason,
     processed_absorption_h5_path,
 )
 
 __all__ = [
     "discover_unprocessed_absorption_h5_flat",
+    "discover_unprocessed_linear_h5_flat",
     "count_dynamics_h5_flat",
     "ensure_base_merged",
     "fold_rank_groups",
@@ -72,6 +72,11 @@ def fold_rank_groups(cwd: str) -> None:
 
 def discover_unprocessed_absorption_h5_flat(cwd: str) -> list[str]:
     """Non-recursive scan: raw absorption ``*.h5`` missing ``*_spectrum.h5``."""
+    return discover_unprocessed_linear_h5_flat(cwd, "absorption")
+
+
+def discover_unprocessed_linear_h5_flat(cwd: str, task: str) -> list[str]:
+    """Non-recursive scan: raw ``task`` ``*.h5`` missing ``*_spectrum.h5``."""
     if not os.path.isdir(cwd):
         return []
     names = sorted(
@@ -90,8 +95,8 @@ def discover_unprocessed_absorption_h5_flat(cwd: str) -> list[str]:
             continue
         if has_processed_absorption_sibling(src):
             continue
-        if not is_raw_with_ground_absorption_h5(src):
-            reason = absorption_h5_skip_reason(src) or "not a raw with_ground absorption HDF5"
+        reason = linear_h5_skip_reason(src, task)
+        if reason is not None:
             skipped[reason].append(fn)
             continue
         out.append(os.path.abspath(src))

@@ -41,32 +41,30 @@ struct TwoDESConfig {
     // for output/MC-merge provenance; the YAML `orientation` key is validated to
     // reject anything but "isotropic" (the non-physical "none" shortcut was removed).
     std::string orientation = "isotropic";
-    bool batch = false;                   // isotropic 3->9->21 LOCKSTEP batched walk
-                                          // (YAML: 2des.batch). Default off. On packs
-                                          // each layer's fanout (3/9/21) into one
-                                          // batched propagation, supersedes
-                                          // orient_reuse when both set.
-    bool orient_reuse = false;            // isotropic 3->9->21 prefix-share walk
-                                          // (YAML: 2des.orient_reuse). Default off =
-                                          // current flat 21-tree path (bit-exact).
-                                          // On shares τ/T-segment propagation across
-                                          // the m1/(m1,m2) fanout.
+    // YAML 2des.batch: walk width B_t ∈ {1, 7, 21}, or kTwoDESBatchAuto (0) for
+    // "auto" (try 21, then 7, then 1). 1 / false (default):
+    // B=1 reuse walk. 21 / true: lockstep 3/9/21. 7: per-m1 subtree 1/3/7.
+    // An explicit width that exceeds the GPU budget is an error, never a
+    // silent switch; auto only when the user wrote "auto".
+    int batch = 1;
 };
+
+/// Sentinel for YAML `2des.batch: auto`. Resolved to 21/7/1 inside compute_2des
+/// before the walk; never written to HDF5 as-is (write_2des records the chosen
+/// width from TwoDESResult::batch_width).
+inline constexpr int kTwoDESBatchAuto = 0;
+
 
 /**
  * @brief ADO filtering knobs (YAML: the `filter:` block).
  *
  * `enabled` is the single explicit on/off switch. When false, every other field
  * is ignored (left at its default) — no "set four knobs to 0" ceremony. When
- * true, parse_filter validates tolerance > 0, start_step > 0, warmup_factor ∈
- * (0,1], ulist_tau ∈ [0,1].
+ * true, parse_filter validates tolerance > 0, ulist_tau ∈ [0,1].
  */
 struct FilterConfig {
     bool   enabled = false;         // master on/off
     double tolerance = 0.0;         // ADO max-norm threshold (> 0 when enabled)
-    int    start_step = 10;         // warmup (relaxed-threshold) window; the first
-                                    // pass is pinned to the warmup threshold too.
-    double warmup_factor = 0.1;     // warmup threshold = tolerance * warmup_factor
     double ulist_tau = 0.0;         // U-list whole-step launch (YAML: filter.ulist).
                                     // 0 = off; (0,1] enables the compact derivative
                                     // + in-place RK4 over the active closure AND is
@@ -76,6 +74,17 @@ struct FilterConfig {
                                     // counts slots[|A_0|,|A_1|,...] beside the union
                                     // |A|. Default off ⇒ zero hot-path cost (the union
                                     // norm kernel emits one max norm, no per-slot pass).
+};
+
+/**
+ * @brief Excited-state equilibration before fluorescence emission (YAML:
+ * `fluorescence.equilibration`). Stop when max(δ, ε) ≤ tolerance, δ = relative
+ * hierarchy change over one check_interval, ε its geometric-tail estimate.
+ */
+struct EquilibrationConfig {
+    double t_max_fs = 0.0;
+    double check_interval_fs = 0.0;
+    double tolerance = 0.0;
 };
 
 /**
@@ -91,6 +100,15 @@ struct FilterConfig {
  */
 struct Config {
     PhysicalParameters physics;
+
+    // Which task this config was resolved for. Set by resolve_<task>_config();
+    // a config straight out of load_yaml() reads Dynamics. That default is
+    // deliberate and safe: Dynamics stores the full N×N ρ, the largest block
+    // any task needs (rho_capacity), so a config that never went through a
+    // resolver over-allocates rather than under-allocates.
+    enum class Task { Dynamics, Absorption, TwoDES, Fluorescence };
+    Task task = Task::Dynamics;
+
     // Active time grid + output. Empty after load_yaml(); filled by
     // resolve_<task>_config() from the running task's YAML block.
     TimeParameters time;
@@ -102,11 +120,14 @@ struct Config {
     std::string yaml_path;          // Config file path (for auto-naming)
     std::string config_yaml;        // Exact YAML text used to build this config
     // "Same physics?" fingerprint: FNV-1a of the PARSED config, canonicalised
-    // (comments / whitespace / key-order stripped) with the non-physical
-    // `output` sub-blocks and disorder-owned `static_disorder` block removed.
-    // Editing a comment or reflowing the yaml does NOT change it (so an MC
-    // incremental batch still merges, and 2des self-consistency stays); a real
-    // physical edit does. The exact input text is preserved in `config_yaml`.
+    // (comments / whitespace / key-order stripped) and scoped to what changes
+    // this task's numbers: `system` + `bath` + `filter` (minus log_per_slot)
+    // + the ONE task block being run (minus output / print_interval / batch).
+    // The other task blocks and `static_disorder` are not in it. Editing a
+    // comment, an output path, or another task's dt does NOT change it (so an
+    // MC incremental batch still merges); a real physical edit does. Final
+    // after resolve_<task>_config(); load_yaml alone yields the task-less core
+    // hash. The exact input text is preserved in `config_yaml`.
     std::string config_hash;
     // MC static-disorder node file, from the optional top-level
     // `static_disorder: { draws_file: ... }` block. Empty ⇒ block absent.
@@ -120,17 +141,18 @@ struct Config {
     // ADO filtering knobs (the `filter:` block). enabled is the on/off switch.
     FilterConfig filter;
 
-    // Absorption 3-polarization (x/y/z) batching switch (YAML: absorption.batch).
+    // Linear-response 3-polarization (x/y/z) batching switch (YAML:
+    // absorption.batch / fluorescence.batch — one run has one task block).
     // true ⇒ pack the ≤3 non-zero directions into one B-wide propagation;
     // false (default) ⇒ historical serial 3-direction loop, bit-identical.
-    // Absorption exposes batching ONLY here; 2DES batching is intrinsic to its
-    // batched walk and does not read this field.
-    bool absorption_batch = false;
+    // 2DES batching is its own switch (TwoDESConfig::batch).
+    bool linear_batch = false;
+    EquilibrationConfig equilibration;   // fluorescence only
 
     /**
      * @brief Load configuration from YAML file.
      *
-     * The unconditional `resolve_auto_filename(cfg)` call that was at
+     * Historically an unconditional `resolve_auto_filename(cfg)` call at
      * the bottom of this function has moved into `resolve_dynamics_config()`
      * (the only task whose auto-naming rule reads `cfg.initial`). Spectro-
      * scopy tasks resolve `output.filename == "auto"` in their own
@@ -150,7 +172,7 @@ struct Config {
     /**
      * @brief Validate configuration (schema-level only).
      *
-     * optional-aware. initial-related branches are gated on
+     * Optional-aware: initial-related branches are gated on
      * `initial.has_value()`. Task-required-section checks live in the
      * matching `resolve_<task>_config()` entry, NOT here.
      */
@@ -184,7 +206,8 @@ std::string resolve_dynamics_auto_filename(const Config& cfg);
 //   - resolving `output.filename == "auto"` per the task's naming rule.
 // All mutations happen here; `run_<task>(sys, cfg)` is read-only on cfg.
 // SystemContext holds `const Config&`, so writing to `cfg` after
-// `SystemContext sys(cfg)` would NOT be visible to the writer.
+// `SystemContext sys(cfg)` would NOT be visible to the writer (plan
+//).
 
 /// Dynamics task entry. Throws std::invalid_argument if
 /// `cfg.initial` is empty; resolves `output.filename` via
@@ -196,6 +219,11 @@ void resolve_dynamics_config(Config& cfg);
 /// system.dipoles/strengths to be present. Resolves `output.filename` to
 /// `<system>_absorption` when "auto".
 void resolve_absorption_config(Config& cfg);
+
+/// Fluorescence task entry: like absorption (with_ground basis, dipoles
+/// required, `batch`) plus the required `equilibration:` sub-block, validated
+/// here. Resolves `output.filename` to `<system>_fluorescence` when "auto".
+void resolve_fluorescence_config(Config& cfg);
 
 /// 2des task entry: parses the `2des:` block (dt/print_interval + axes +
 /// output). Throws if system.dipoles/strengths are absent or an axis spacing

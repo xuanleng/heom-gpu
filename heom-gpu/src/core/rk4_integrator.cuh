@@ -32,9 +32,14 @@
  *                   buffer MUST persist across steps (the carry lives in it;
  *                   zeroing it mid-run defeats the point) — HEOMTrajectory owns
  *                   and zero-inits it once.
+ * @param norm_sq_bits [batch×M] fused ADO max-norm (per-slot rows) for the next filter pass, or
+ *                   nullptr. Non-null ⇒ the final stage folds max|ρ_new|² of
+ *                   every ADO it writes into it (see RK4StageArgs); the caller
+ *                   zeroes it first.
  */
 void rk4_step(const HEOMContext& ctx, double dt, heom::complex_t* workspace,
-              heom::complex_t* kahan_comp = nullptr);
+              heom::complex_t* kahan_comp = nullptr,
+              unsigned long long* norm_sq_bits = nullptr);
 
 /**
  * @brief Integrating-factor RK4 step (Lawson): Term 2 (hierarchy decay g_α) is
@@ -42,7 +47,7 @@ void rk4_step(const HEOMContext& ctx, double dt, heom::complex_t* workspace,
  *        only the non-stiff coupling. Same 4-launch structure, workspace layout
  *        and in-place semantics as rk4_step (reuses [temp_a|temp_b|acc]).
  *
- * @param e_half device [M] exp(-½·dt·g_α)  (must match the dt passed here)
+ * @param e_half device [M] exp(-½·dt·g_α), complex  (must match the dt passed here)
  * @param e_full device [M] exp(-dt·g_α)
  *
  * The factors are a function of dt; the caller (HEOMTrajectory) recomputes them
@@ -50,7 +55,7 @@ void rk4_step(const HEOMContext& ctx, double dt, heom::complex_t* workspace,
  */
 void rk4_step_if(const HEOMContext& ctx, double dt, heom::complex_t* workspace,
                  heom::complex_t* kahan_comp,
-                 const heom::real_t* e_half, const heom::real_t* e_full);
-
+                 const heom::complex_t* e_half, const heom::complex_t* e_full,
+                 unsigned long long* norm_sq_bits = nullptr);
 
 #endif // RK4_INTEGRATOR_CUH

@@ -22,28 +22,31 @@ using heom::c_make;
 //   - acc           : running sum k1 + 2·k2 + 2·k3 (k4 folded in the final).
 //
 // The final combine is in-place into rho on both paths (no second rho buffer,
-// no swap). Whole-step (u_list set) shrinks every launch from M·N² to |U|·N²
-// and freezes α∉U by never indexing it.
+// no swap). Whole-step (u_list set) shrinks every launch from M·Nb to |U|·Nb
+// and freezes α∉U by never indexing it; the full launch freezes the same set
+// through u_flags, so the two are bit-identical.
 void rk4_step(const HEOMContext& ctx, double dt, complex_t* workspace,
-              complex_t* kahan_comp)
+              complex_t* kahan_comp, unsigned long long* norm_sq_bits)
 {
     HEOMContext step_ctx = ctx;
 
     complex_t* rho = const_cast<complex_t*>(step_ctx.rho_in);
-    // per_slot = M·N² keeps the int overflow guard; the workspace is laid out as
-    // [temp_a | temp_b | acc], each sub-buffer spanning ALL batch slots
-    // (batch·M·N²). The derivative kernel writes slot b at boff = b·M·N² inside
-    // whichever sub-buffer it is handed, so the three bases must be batch·M·N²
-    // apart. size_t stride: batch·M·N² can exceed the int per-slot ceiling.
-    const int per_slot = heom::checked_total_elements(step_ctx.M, step_ctx.N);
+    // per_slot = M·Nb (Nb = the CURRENT block's element count, not the
+    // allocation capacity) keeps the int overflow guard; the workspace is laid
+    // out as [temp_a | temp_b | acc], each sub-buffer spanning ALL batch slots
+    // (batch·M·Nb). The derivative kernel writes slot b at boff = b·M·Nb inside
+    // whichever sub-buffer it is handed, so the three bases must be batch·M·Nb
+    // apart. size_t stride: batch·M·Nb can exceed the int per-slot ceiling.
+    const int per_slot = heom::checked_rho_elements(step_ctx.M, step_ctx.block.elems());
     const size_t stride = static_cast<size_t>(step_ctx.batch) * per_slot;
 
     complex_t* temp_a = workspace;
     complex_t* temp_b = workspace + stride;
     complex_t* acc    = workspace + 2 * stride;
 
-    // RK4 stage scalars are exact small integers/halves — representable in FP32
-    // without loss, so c_make (float in mixed) introduces no error here.
+    // c_make rounds to the hierarchy precision: one and two are exact, but in
+    // the mixed build dt/2 and dt/6 carry a relative error of up to 2^-24
+    // (≈ 6e-8), the same size as rounding the FP32 state itself.
     const complex_t half_dt = c_make(dt / 2.0, 0.0);
     const complex_t full_dt = c_make(dt,       0.0);
     const complex_t one     = c_make(1.0,      0.0);
@@ -72,6 +75,7 @@ void rk4_step(const HEOMContext& ctx, double dt, complex_t* workspace,
     // k4 = f(temp_a);  rho += (dt/6)·(k4 + acc)   [in-place, opt. Kahan]
     step_ctx.rho_in = temp_a;
     st.comp = kahan_comp;  st.w = one;  st.dt6 = dt_6th;
+    st.norm_sq_bits = norm_sq_bits;
     compute_heom_derivatives_final(step_ctx, st);
 
     // Each fused launch validates + checks itself inside
@@ -87,12 +91,13 @@ void rk4_step(const HEOMContext& ctx, double dt, complex_t* workspace,
 // if_stage differ.
 void rk4_step_if(const HEOMContext& ctx, double dt, complex_t* workspace,
                  complex_t* kahan_comp,
-                 const heom::real_t* e_half, const heom::real_t* e_full)
+                 const heom::complex_t* e_half, const heom::complex_t* e_full,
+                 unsigned long long* norm_sq_bits)
 {
     HEOMContext step_ctx = ctx;
 
     complex_t* rho = const_cast<complex_t*>(step_ctx.rho_in);
-    const int per_slot = heom::checked_total_elements(step_ctx.M, step_ctx.N);
+    const int per_slot = heom::checked_rho_elements(step_ctx.M, step_ctx.block.elems());
     const size_t stride = static_cast<size_t>(step_ctx.batch) * per_slot;
 
     complex_t* temp_a = workspace;
@@ -128,5 +133,6 @@ void rk4_step_if(const HEOMContext& ctx, double dt, complex_t* workspace,
     // k4 = F(temp_a); rho = E2·rho + (dt/6)·(k4 + acc)  [in-place, opt. Kahan]
     step_ctx.rho_in = temp_a;
     st.comp = kahan_comp;  st.w = one;  st.dt6 = dt_6th;
+    st.norm_sq_bits = norm_sq_bits;
     compute_heom_derivatives_final_if(step_ctx, st);
 }

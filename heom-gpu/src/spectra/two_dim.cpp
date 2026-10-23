@@ -2,6 +2,7 @@
 
 #include "system_context.hpp"
 #include "heom_trajectory.hpp"
+#include "detector.hpp"                 // heom::Detector (device-side Tr(μ_det·ρ_0))
 #include "memory_budget.hpp"            // estimate/check_budget (batch=21 guard)
 #include "output/console_printer.hpp"   // format_computation_time (per-tree elapsed)
 
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 
 namespace heom::spectra {
@@ -42,10 +44,9 @@ TwoDESRequest build_2des_request(const HEOMConfig::TwoDESConfig& spec,
             prev = spec.tw_fs[k];
         }
     }
-    req.signals      = spec.signals;
-    req.pathways     = spec.pathways;
-    req.orient_reuse = spec.orient_reuse;
-    req.batch        = spec.batch;
+    req.signals  = spec.signals;
+    req.pathways = spec.pathways;
+    req.batch    = spec.batch;
     return req;
 }
 
@@ -78,46 +79,6 @@ const std::array<PathSpec, 6>& two_des_path_table() {
     return kTable;
 }
 
-ManifoldLayout ManifoldLayout::from(BasisType basis, int n_states, int N) {
-    ManifoldLayout lay;
-    int want = 0;
-    switch (basis) {
-        case BasisType::WITH_GROUND:      // g=[0,1), e=[1,1+n)
-            lay.n_level = 2;
-            lay.bound = {0, 1, 1 + n_states, 1 + n_states};
-            want = 1 + n_states;
-            break;
-        case BasisType::DOUBLE_EXCITED:   // g=[0,1), e=[1,1+n), f=[1+n,N)
-            lay.n_level = 3;
-            lay.bound = {0, 1, 1 + n_states, N};
-            want = 1 + n_states + n_states * (n_states - 1) / 2;
-            break;
-        default:
-            // EXCITED_ONLY has no ground manifold, so |g><g| — where every 2DES
-            // pathway starts — is not representable. 2DES never builds it.
-            throw std::invalid_argument(
-                "ManifoldLayout::from: 2DES needs a ground state in the basis");
-    }
-    // The one mistake this argument exists to catch: compute_2des holds a
-    // single-excitation and a double-excitation context at the same time, so
-    // the wrong N is always within reach, and a layout built from it would
-    // declare blocks that are quietly the wrong size.
-    if (N != want)
-        throw std::invalid_argument(
-            "ManifoldLayout::from: N=" + std::to_string(N) + " does not match "
-            "n_states=" + std::to_string(n_states) + " for this basis (want "
-            + std::to_string(want) + ") — wrong SystemContext?");
-    return lay;
-}
-
-ManifoldBlock ManifoldLayout::block(int row_level, int col_level) const {
-    if (row_level < 0 || row_level >= n_level ||
-        col_level < 0 || col_level >= n_level)
-        throw std::invalid_argument("ManifoldLayout::block: level out of range");
-    return {bound[row_level], bound[row_level + 1] - bound[row_level],
-            bound[col_level], bound[col_level + 1] - bound[col_level]};
-}
-
 std::pair<int, int> apply_pulse(const ManifoldLayout& lay,
                                 std::pair<int, int> level, PathStep step) {
     const int d = step.raise ? +1 : -1;
@@ -127,7 +88,10 @@ std::pair<int, int> apply_pulse(const ManifoldLayout& lay,
                                                  // μ⁺ is nonzero one level UP
                                                  // from j — so j sits one level
                                                  // BELOW ρ's old column.
-    if (r < 0 || r >= lay.n_level || c < 0 || c >= lay.n_level)
+    // Off the ladder: below g, above f, or onto a level this basis does not
+    // populate (f in WITH_GROUND). Either way the pulse table and the basis
+    // disagree, which is a config bug, not a zero result to propagate.
+    if (r < 0 || r >= 3 || c < 0 || c >= 3 || lay.empty(r) || lay.empty(c))
         throw std::invalid_argument(
             "apply_pulse: dipole walks off the manifold ladder — the pulse "
             "table and the basis disagree");
@@ -136,6 +100,9 @@ std::pair<int, int> apply_pulse(const ManifoldLayout& lay,
 
 std::array<ManifoldBlock, 3> pathway_segment_blocks(const PathSpec& spec,
                                                     const ManifoldLayout& lay) {
+    if (lay.empty(0))
+        throw std::invalid_argument(
+            "pathway_segment_blocks: 2DES needs a ground state in the basis");
     std::pair<int, int> lv{0, 0};        // |g><g|
     std::array<ManifoldBlock, 3> out{};
     for (int p = 0; p < 3; ++p) {
@@ -147,13 +114,6 @@ std::array<ManifoldBlock, 3> pathway_segment_blocks(const PathSpec& spec,
 
 namespace {
 
-// The ONLY place the four positional ints of set_manifold_block are spelled
-// out. Nine call sites pass a ManifoldBlock; none of them can transpose it
-// into a block — (e,f) instead of (f,e) — that no pathway ever occupies.
-void apply_block(HEOMTrajectory& traj, const ManifoldBlock& b) {
-    traj.set_manifold_block(b.row_off, b.n_row, b.col_off, b.n_col);
-}
-
 // |0><0| — the ground projector. In both WITH_GROUND and DOUBLE_EXCITED the
 // ground state sits at Hilbert index 0 (compute_hilbert_dim layout).
 Eigen::MatrixXcd ground_projector(int N) {
@@ -161,6 +121,9 @@ Eigen::MatrixXcd ground_projector(int N) {
     P(0, 0) = std::complex<double>(1.0, 0.0);
     return P;
 }
+
+// Its support: the (g,g) block, which lay.block(0,0) spells as {0,1,0,1}.
+ManifoldBlock ground_block(const ManifoldLayout& lay) { return lay.block(0, 0); }
 
 const PathSpec& find_path(bool rephasing, const std::string& pathway) {
     for (const auto& p : two_des_path_table())
@@ -194,146 +157,6 @@ const std::vector<Component>& isotropic_components() {
         return v;  // size == 21
     }();
     return kComps;
-}
-
-// Run one depth-first τ→tw→t carry-through tree for a single dipole projection,
-// writing the full grid[(it*n_tw+k)*n_t+j]. The trajectory is reused across
-// calls (set_initial resets internal_step_), so the caller keeps exactly one
-// one hierarchy resident per basis.
-void run_pathway_tree(HEOMTrajectory& traj, const PathSpec& spec,
-                      const Eigen::MatrixXcd& mu0, const Eigen::MatrixXcd& mu1,
-                      const Eigen::MatrixXcd& mu2, const Eigen::MatrixXcd& mu_det,
-                      const TwoDESRequest& req, int N,
-                      const std::array<ManifoldBlock, 3>& blk,
-                      std::vector<std::complex<double>>& grid,
-                      const std::string& tree_tag, bool log_on,
-                      int print_interval) {
-    // Tag every per-step filtering line with the PHYSICAL 2D coordinates being
-    // propagated toward: "tau=<fs> (<it>) T=<fs> (<k>) t=<fs> (<j>) fs". Axes
-    // not yet started (their dipole pulse not yet applied) show "-". Only built
-    // when logging is on (print_interval>0); else the trajectory never prints.
-    auto fmt = [](double v) {
-        char b[32];
-        long long iv = static_cast<long long>(v);
-        if (static_cast<double>(iv) == v) std::snprintf(b, sizeof b, "%lld", iv);
-        else                              std::snprintf(b, sizeof b, "%.1f", v);
-        return std::string(b);
-    };
-    auto ax = [&](const char* nm, int idx, double d) {
-        if (idx < 0) return std::string(nm) + "=-";
-        return std::string(nm) + "=" + fmt(idx * d)
-             + " (" + std::to_string(idx) + ")";
-    };
-    // T axis is non-uniform: label with the explicit sample time, not idx*step.
-    auto axv = [&](const char* nm, int idx, double val) {
-        if (idx < 0) return std::string(nm) + "=-";
-        return std::string(nm) + "=" + fmt(val)
-             + " (" + std::to_string(idx) + ")";
-    };
-    auto seg = [&](int it, int k, int j) {
-        if (!log_on) return;
-        traj.set_log_prefix(tree_tag + " "
-            + ax("tau", it, req.dtau_fs) + " "
-            + axv("T",  k,  k >= 0 ? req.tw_fs[k] : 0.0) + " "
-            + ax("t",   j,  req.dt_detect_fs) + " fs : ");
-    };
-
-    // 2DES owns ALL logging from the driver: one forced line per τ/T advance,
-    // plus one t-line every print_interval internal steps SNAPPED to a t-point
-    // (printed AFTER the expectation, so the label and the shown active set are
-    // the same point — no off-by-one — and the t-prints land on round j across
-    // every τ/T because the counter resets per t-scan). The trajectory's own
-    // per-step cadence printout is therefore disabled here.
-    traj.set_cadence_logging(false);
-
-    traj.set_initial(ground_projector(N));
-    traj.apply_dipole_full_hierarchy(mu0, spec.pulses[0].side);
-
-    // Batch detection on the GPU: μ_det is fixed for the whole tree, so upload
-    // it once and size the device result grid to the full tree. Each t-point
-    // launches a trace kernel into its slot (no D2H/sync); one bulk D2H lands in
-    // `grid` at the end (detect_flush). Divergence is checked once per t-scan.
-    const size_t grid_sz =
-        static_cast<size_t>(req.n_tau) * req.n_tw * req.n_t;
-    traj.detect_begin(mu_det, static_cast<int>(grid_sz));
-    bool diverged = false;
-
-    // Device-resident snapshots, reused (grow-only) across the whole tree so the
-    // τ/T carry-through never round-trips the hierarchy to host. Two live at
-    // once: τ (held across the T loop) and T (per T point).
-    DeviceHierarchySnapshot tau_snap, tw_snap;
-
-    for (int it = 0; it < req.n_tau && !diverged; ++it) {
-        if (it > 0) {
-            seg(it, -1, -1);
-            // Re-declared on every advance, not hoisted: the μ and restore calls
-            // below clear the descriptor (it described the previous ρ), so the
-            // only placement that survives refactoring is next to the launch.
-            apply_block(traj, blk[0]);
-            traj.propagate_steps(req.steps_per_tau);
-            if (log_on) traj.log_stats();  // force one τ-progress line per point
-        }
-        traj.snapshot_device(tau_snap);
-        traj.apply_dipole_full_hierarchy(mu1, spec.pulses[1].side);
-        for (int k = 0; k < req.n_tw && !diverged; ++k) {
-            if (req.tw_gap_steps[k] > 0) {
-                seg(it, k, -1);
-                apply_block(traj, blk[1]);
-                traj.propagate_steps(req.tw_gap_steps[k]);
-                if (log_on) traj.log_stats();  // force one T-progress line per advance
-            }
-            traj.snapshot_device(tw_snap);
-            traj.apply_dipole_full_hierarchy(mu2, spec.pulses[2].side);
-            // Reset per t-scan so every scan prints at the same round j
-            // (print_interval, 2·print_interval, … in internal steps), instead
-            // of wherever the carried-over global step counter happens to land.
-            int t_since_print = 0;
-            for (int j = 0; j < req.n_t; ++j) {
-                if (j > 0) {
-                    // check_div=false: no per-t-point D2H; divergence is checked
-                    // once per t-scan below.
-                    apply_block(traj, blk[2]);
-                    traj.propagate_steps(req.steps_per_t, /*check_div=*/false);
-                    t_since_print += req.steps_per_t;
-                }
-                // Async device-side Tr(μ_det·ρ_0) into the tree grid slot.
-                traj.detect_sample(
-                    static_cast<int>(
-                        static_cast<size_t>(it * req.n_tw + k) * req.n_t + j));
-                if (log_on && print_interval > 0 && t_since_print >= print_interval) {
-                    seg(it, k, j);          // label = the t-point we are AT now
-                    traj.log_stats();
-                    t_since_print = 0;
-                }
-            }
-            // One divergence guard per t-scan (instead of per t-point). The
-            // label is the last t-coordinate of this scan.
-            if (traj.check_divergence_now(
-                    (req.n_t - 1) * req.dt_detect_fs, it * req.n_tw + k))
-                diverged = true;
-            traj.restore_device(tw_snap);
-        }
-        traj.restore_device(tau_snap);
-    }
-
-    // Single bulk D2H of the whole tree's detection grid.
-    traj.detect_flush(grid.data(), static_cast<int>(grid_sz));
-}
-
-// Compose the "(xxxx)->I1,I2,I3" component label for the per-tree header line.
-std::string component_label(const Component& c) {
-    static const char ax[] = "xyz";
-    std::string s = "(";
-    for (int i = 0; i < 4; ++i) s += ax[c.m[i]];
-    s += ")->";
-    bool first = true;
-    for (int ip = 0; ip < 3; ++ip) {
-        if (!c.bucket[ip]) continue;
-        if (!first) s += ",";
-        s += "I" + std::to_string(ip + 1);
-        first = false;
-    }
-    return s;
 }
 
 }  // namespace
@@ -383,19 +206,59 @@ BranchPlan build_branch_plan() {
     return plan;
 }
 
+std::vector<BranchPlan> walk_plans(const BranchPlan& plan, int width) {
+    if (width == plan.B_t) return {plan};
+    if (width != 7)
+        throw std::invalid_argument("walk_plans: width " + std::to_string(width) +
+                                    " (want 21 or 7)");
+    // One subtree per m1 (τ-slot): its T-slots and leaves, renumbered locally.
+    // Depth-first flatten ⇒ each subtree is a contiguous run of T- and t-slots.
+    std::vector<BranchPlan> subs;
+    for (int i1 = 0; i1 < plan.B_tau; ++i1) {
+        BranchPlan s;
+        s.B_tau = 1;
+        s.m1_axis = {plan.m1_axis[i1], -1, -1};
+        s.m2_axis.clear(); s.tau_to_T.clear(); s.T_to_t.clear();
+        std::vector<int> local_T(plan.B_T, -1);
+        for (int T = 0; T < plan.B_T; ++T) {
+            if (plan.tau_to_T[T] != i1) continue;
+            local_T[T] = static_cast<int>(s.m2_axis.size());
+            s.m2_axis.push_back(plan.m2_axis[T]);
+            s.tau_to_T.push_back(0);
+        }
+        int nt = 0;
+        for (int t = 0; t < plan.B_t; ++t) {
+            if (local_T[plan.T_to_t[t]] < 0) continue;
+            s.T_to_t.push_back(local_T[plan.T_to_t[t]]);
+            s.leaves[nt++] = plan.leaves[t];
+        }
+        s.B_T = static_cast<int>(s.m2_axis.size());
+        s.B_t = nt;
+        if (s.B_t != width)   // 3 m1 × 7 leaves; anything else is a new tree
+            throw std::logic_error("walk_plans: m1 subtree " + std::to_string(i1) + " has " +
+                                   std::to_string(s.B_t) + " leaves, expected 7");
+        subs.push_back(std::move(s));
+    }
+    return subs;
+}
+
 // ===========================================================================
-// Orientation-reuse walk (3→9→21 prefix tree, B=1). Pure host reshuffle of
-// run_pathway_tree's τ→T→t carry-through: set_initial+μ0 once per m1 (3), μ1+T
-// once per (m1,m2) (9), and the t-scan + μ⁻(m4) detection per leaf (21). Only 2
-// device snapshots live at once (tau_snap, tw_snap) — same as the flat tree.
-// Filter OFF is bit-identical to the flat walk; filter ON stays within tolerance.
+// Orientation-reuse walk (3→9→21 prefix tree, B=1): the B=1 production walk
+// (LHC-II ESA lives here). Depth-first τ→T→t carry-through with the
+// isotropic fanout shared by prefix: set_initial+μ0 once per m1 (3), μ1+T once
+// per (m1,m2) (9), the t-scan + μ⁻(m4) detection per leaf (21). Only 2 device
+// snapshots live at once (tau_snap, tw_snap). Its independent oracle is the
+// batched walk below: filter OFF ⇒ bit-identical, filter ON ⇒ within filter
+// tolerance (test_2des_reuse). The historical flat 21-tree that both were
+// once checked against is gone; its numbers live on as the
+// benchmark_3sites_2des baseline.
 // ===========================================================================
 namespace {
 
 using Cd = std::complex<double>;
 
-// FINE-log label helpers (own copies; the flat path keeps its lambdas untouched
-// so it stays the byte-for-byte golden reference).
+// FINE-log label helpers: "tau=<fs> (<it>) T=<fs> (<k>) t=<fs> (<j>) fs".
+// Axes not yet started (their pulse not yet applied) show "-".
 std::string fmt_num(double v) {
     char b[32];
     long long iv = static_cast<long long>(v);
@@ -436,10 +299,12 @@ std::string leaf_label(const ReuseLeaf& leaf) {
 // helpers stay shallow.
 struct ReuseCtx {
     HEOMTrajectory& traj;
+    heom::Detector& det;
     const PathSpec& spec;
     const std::array<const Eigen::MatrixXcd*, 3>& Rax;
     const TwoDESRequest& req;
     int N;
+    ManifoldBlock gg;                   // (g,g): where |g><g| lives before μ0
     std::array<ManifoldBlock, 3> blk;   // [τ, T, t] — pathway_segment_blocks()
     std::string base;       // "rp SE" etc — FINE-log tag stem
     bool log_on;
@@ -453,24 +318,24 @@ Eigen::MatrixXcd rsel(const ReuseCtx& c, int axis, bool raise) {
 
 // Innermost primitive: one leaf's t-scan + μ⁻(m4) detection. Restores the clean
 // T-snapshot, applies μ2, scans t with async device detection, checks
-// divergence once, flushes n_t samples into grid_c at the (it,k) plane. Mirrors
-// run_pathway_tree's j-loop exactly. Returns true iff diverged.
+// divergence once, flushes n_t samples into grid_c at the (it,k) plane. The
+// batched tscan_batched is this loop over 21 slots at once; keep them in step.
+// Returns true iff diverged.
 bool detect_leaf(ReuseCtx& c, const DeviceHierarchySnapshot& tw_snap,
                  const ReuseLeaf& leaf, int it, int k, std::vector<Cd>& grid_c) {
     const TwoDESRequest& req = c.req;
     c.traj.restore_device(tw_snap);
-    c.traj.apply_dipole_full_hierarchy(rsel(c, leaf.m[2], c.spec.pulses[2].raise),
-                                       c.spec.pulses[2].side);
+    c.traj.apply_dipole({rsel(c, leaf.m[2], c.spec.pulses[2].raise)},
+                        c.spec.pulses[2].side, c.blk[2]);
     const Eigen::MatrixXcd mu_det = c.Rax[leaf.m[3]]->adjoint();  // μ⁻(m4)
-    c.traj.detect_begin(mu_det, req.n_t);
+    c.det.begin({mu_det}, static_cast<size_t>(req.n_t));
     int t_since_print = 0;
     for (int j = 0; j < req.n_t; ++j) {
         if (j > 0) {
-            apply_block(c.traj, c.blk[2]);
             c.traj.propagate_steps(req.steps_per_t, /*check_div=*/false);
             t_since_print += req.steps_per_t;
         }
-        c.traj.detect_sample(j);
+        c.det.sample(static_cast<size_t>(j));
         if (c.log_on && c.print_interval > 0 && t_since_print >= c.print_interval) {
             c.traj.set_log_prefix(
                 seg_prefix(req, c.base + " " + leaf_label(leaf), it, k, j));
@@ -480,8 +345,7 @@ bool detect_leaf(ReuseCtx& c, const DeviceHierarchySnapshot& tw_snap,
     }
     const bool div = c.traj.check_divergence_now(
         (req.n_t - 1) * req.dt_detect_fs, it * req.n_tw + k);
-    c.traj.detect_flush(
-        grid_c.data() + static_cast<size_t>(it * req.n_tw + k) * req.n_t, req.n_t);
+    c.det.flush(grid_c.data() + static_cast<size_t>(it * req.n_tw + k) * req.n_t);
     return div;
 }
 
@@ -494,13 +358,12 @@ bool run_tau_fanout(ReuseCtx& c, const DeviceHierarchySnapshot& tau_snap,
     const TwoDESRequest& req = c.req;
     for (const auto& b2 : b1.m2s) {
         c.traj.restore_device(tau_snap);
-        c.traj.apply_dipole_full_hierarchy(
-            rsel(c, b2.m2, c.spec.pulses[1].raise), c.spec.pulses[1].side);
+        c.traj.apply_dipole({rsel(c, b2.m2, c.spec.pulses[1].raise)},
+                            c.spec.pulses[1].side, c.blk[1]);
         for (int k = 0; k < req.n_tw; ++k) {
             if (req.tw_gap_steps[k] > 0) {
                 if (c.log_on)
                     c.traj.set_log_prefix(seg_prefix(req, c.base + " m1m2", it, k, -1));
-                apply_block(c.traj, c.blk[1]);
                 c.traj.propagate_steps(req.tw_gap_steps[k]);
                 if (c.log_on) c.traj.log_stats();
             }
@@ -510,7 +373,7 @@ bool run_tau_fanout(ReuseCtx& c, const DeviceHierarchySnapshot& tau_snap,
                     return true;
             // Back to the clean μ1-state at T[k]: the next k advances the T chain
             // from here (each detect_leaf left the device on a t-propagated
-            // state). Restore before the next waiting-time step.
+            // state).
             c.traj.restore_device(tw_snap);
         }
     }
@@ -518,8 +381,8 @@ bool run_tau_fanout(ReuseCtx& c, const DeviceHierarchySnapshot& tau_snap,
 }
 
 // The full 3→9→21 walk for one (signal,pathway). Two snapshots live at once
-// (tau_snap across the m2 fanout, tw_snap across leaves) — same footprint as the
-// flat tree. Emits one coarse heartbeat per m1 group (3 lines / (s,p)).
+// (tau_snap across the m2 fanout, tw_snap across leaves): 2·M·N² on top of the
+// B=1 trajectory. Emits one coarse heartbeat per m1 group (3 lines / (s,p)).
 void run_pathway_reuse(ReuseCtx& c, const std::vector<ReuseM1Branch>& m1s,
                        std::vector<std::vector<Cd>>& leaf_grid) {
     const TwoDESRequest& req = c.req;
@@ -528,15 +391,14 @@ void run_pathway_reuse(ReuseCtx& c, const std::vector<ReuseM1Branch>& m1s,
     static const char ax[] = "xyz";
     for (const auto& b1 : m1s) {
         const auto t0 = std::chrono::steady_clock::now();
-        c.traj.set_initial(ground_projector(c.N));
-        c.traj.apply_dipole_full_hierarchy(
-            rsel(c, b1.m1, c.spec.pulses[0].raise), c.spec.pulses[0].side);
+        c.traj.set_initial({ground_projector(c.N)}, c.gg);
+        c.traj.apply_dipole({rsel(c, b1.m1, c.spec.pulses[0].raise)},
+                            c.spec.pulses[0].side, c.blk[0]);
         bool diverged = false;
         for (int it = 0; it < req.n_tau && !diverged; ++it) {
             if (it > 0) {
                 if (c.log_on)
                     c.traj.set_log_prefix(seg_prefix(req, c.base + " m1", it, -1, -1));
-                apply_block(c.traj, c.blk[0]);
                 c.traj.propagate_steps(req.steps_per_tau);
                 if (c.log_on) c.traj.log_stats();
             }
@@ -571,16 +433,15 @@ bool tscan_batched(ReuseCtx& c, const DeviceHierarchySnapshot& tw_snap,
     std::vector<Eigen::MatrixXcd> mu2(plan.B_t);
     for (int b = 0; b < plan.B_t; ++b)
         mu2[b] = rsel(c, plan.leaves[b].m[2], c.spec.pulses[2].raise);
-    c.traj.apply_dipole_per_slot(mu2, c.spec.pulses[2].side);
-    const int base = (it * req.n_tw + k) * req.n_t;
+    c.traj.apply_dipole(mu2, c.spec.pulses[2].side, c.blk[2]);
+    const size_t base = static_cast<size_t>(it * req.n_tw + k) * req.n_t;
     int t_since_print = 0;                                // mirror detect_leaf
     for (int j = 0; j < req.n_t; ++j) {
         if (j > 0) {
-            apply_block(c.traj, c.blk[2]);
             c.traj.propagate_steps(req.steps_per_t, /*check_div=*/false);
             t_since_print += req.steps_per_t;
         }
-        c.traj.detect_sample_batch(base + j);            // writes 21 traces at once
+        c.det.sample(base + j);                          // writes 21 traces at once
         // t-segment stats (active=21): union |A|/|E| and per-slot |A_b|.
         if (c.log_on && c.print_interval > 0 && t_since_print >= c.print_interval) {
             c.traj.set_log_prefix(seg_prefix(req, c.base + " t", it, k, j));
@@ -594,7 +455,7 @@ bool tscan_batched(ReuseCtx& c, const DeviceHierarchySnapshot& tw_snap,
 
 // The full batched 3→9→21 walk for one (signal,pathway). Only τ-snap(B=3) +
 // tw-snap(B=9) live at once (t layer has no snapshot) — same footprint rule as
-// the reuse and flat walks.
+// the reuse walk.
 void run_pathway_batched(ReuseCtx& c, const BranchPlan& plan,
                          std::vector<std::vector<Cd>>& leaf_grid) {
     const TwoDESRequest& req = c.req;
@@ -602,23 +463,21 @@ void run_pathway_batched(ReuseCtx& c, const BranchPlan& plan,
     c.traj.set_cadence_logging(false);
     const auto t0 = std::chrono::steady_clock::now();
 
-    // τ: 3 slots = ground + μ0(m1). set_active_batch(3) first so set_initial_batch
-    // expects exactly 3 initial matrices.
-    c.traj.set_active_batch(plan.B_tau);
+    // τ: 3 slots = ground + μ0(m1); set_initial sets the width from the count.
     std::vector<Eigen::MatrixXcd> grounds(plan.B_tau, ground_projector(N));
-    c.traj.set_initial_batch(grounds);
+    c.traj.set_initial(grounds, c.gg);
     std::vector<Eigen::MatrixXcd> mu0(plan.B_tau);
     for (int b = 0; b < plan.B_tau; ++b)
         mu0[b] = rsel(c, plan.m1_axis[b], c.spec.pulses[0].raise);
-    c.traj.apply_dipole_per_slot(mu0, c.spec.pulses[0].side);
+    c.traj.apply_dipole(mu0, c.spec.pulses[0].side, c.blk[0]);
 
     // Detection: 21 leaf μ_det(m4)=(μ⁺)†, opened once for the whole tree; one
     // flat [21·(n_tau·n_tw·n_t)] device grid, one D2H at the end.
     std::vector<Eigen::MatrixXcd> mu_det(plan.B_t);
     for (int b = 0; b < plan.B_t; ++b)
         mu_det[b] = c.Rax[plan.leaves[b].m[3]]->adjoint();
-    const int n_samples = req.n_tau * req.n_tw * req.n_t;
-    c.traj.detect_begin_batch(mu_det, n_samples);
+    const size_t grid_sz = static_cast<size_t>(req.n_tau) * req.n_tw * req.n_t;
+    c.det.begin(mu_det, grid_sz);
 
     DeviceHierarchySnapshot tau_snap, tw_snap;
     bool diverged = false;
@@ -626,7 +485,6 @@ void run_pathway_batched(ReuseCtx& c, const BranchPlan& plan,
         if (it > 0) {                                            // τ advance, active=3
             if (c.log_on)
                 c.traj.set_log_prefix(seg_prefix(req, c.base + " m1", it, -1, -1));
-            apply_block(c.traj, c.blk[0]);
             c.traj.propagate_steps(req.steps_per_tau);
             if (c.log_on) c.traj.log_stats();
         }
@@ -637,13 +495,12 @@ void run_pathway_batched(ReuseCtx& c, const BranchPlan& plan,
         std::vector<Eigen::MatrixXcd> mu1(plan.B_T);
         for (int b = 0; b < plan.B_T; ++b)
             mu1[b] = rsel(c, plan.m2_axis[b], c.spec.pulses[1].raise);
-        c.traj.apply_dipole_per_slot(mu1, c.spec.pulses[1].side);
+        c.traj.apply_dipole(mu1, c.spec.pulses[1].side, c.blk[1]);
 
         for (int k = 0; k < req.n_tw; ++k) {
             if (req.tw_gap_steps[k] > 0) {                        // T advance, active=9
                 if (c.log_on)
                     c.traj.set_log_prefix(seg_prefix(req, c.base + " m1m2", it, k, -1));
-                apply_block(c.traj, c.blk[1]);
                 c.traj.propagate_steps(req.tw_gap_steps[k]);
                 if (c.log_on) c.traj.log_stats();
             }
@@ -656,9 +513,8 @@ void run_pathway_batched(ReuseCtx& c, const BranchPlan& plan,
 
     // One D2H of the whole [21][tree]; scatter into per-component leaf grids so
     // the driver's accumulation matches the reuse layout exactly.
-    const size_t grid_sz = static_cast<size_t>(req.n_tau) * req.n_tw * req.n_t;
     std::vector<Cd> flat(static_cast<size_t>(plan.B_t) * grid_sz);
-    c.traj.detect_flush_batch(flat.data(), static_cast<int>(grid_sz));
+    c.det.flush(flat.data());
     for (int b = 0; b < plan.B_t; ++b) {
         const int ci = plan.leaves[b].comp_idx;      // == b (canonical), explicit
         std::copy(flat.begin() + static_cast<size_t>(b) * grid_sz,
@@ -668,13 +524,178 @@ void run_pathway_batched(ReuseCtx& c, const BranchPlan& plan,
 
     const double s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
-    std::cout << "  [batch B=21] " << c.base << " N=" << N
+    std::cout << "  [batch B=" << plan.B_t << " m1=" << plan.m1_axis[0]
+              << (plan.B_tau > 1 ? "..": "") << "] " << c.base << " N=" << N
               << (diverged ? "  DIVERGED" : "")
               << "  (" << heom::console::format_computation_time(s) << ")\n"
               << std::flush;
 }
 
+// One (signal, pathway) cell of the output, resolved before any propagation.
+struct PathwayJob {
+    int s, p;                            // index into req.signals / req.pathways
+    const PathSpec& spec;
+    const SystemContext& ctx;
+    ManifoldLayout lay;
+    std::array<ManifoldBlock, 3> blk;    // [τ, T, t] — pathway_segment_blocks()
+};
+
+// Budget guard for the walk the config asked for. The alloc plan only covers
+// trajectory-owned buffers; the driver-owned extras it cannot see are folded
+// INTO the budget (not out of gfree) so the printed shortfall report stays
+// honest:
+//   batched (B=21): tau_snap (B=3) + tw_snap (B=9), each a full ρ copy
+//     ⇒ 12·M·Nb, plus the [21·tree] device detection grid;
+//   reuse (B=1): tau_snap + tw_snap at B=1 ⇒ 2·M·Nb. SystemContext's check
+//     never saw them: S0 D=42 printed "87.8% of free" and then the snapshot
+//     cudaMalloc threw.
+//   The mixed build snapshots the Kahan carry alongside ρ, doubling both.
+// Nb = ctx.rho_capacity(): the largest block this run stores per ADO, the same
+// number the trajectory buffers are sized by.
+// Exceeding the budget is an ERROR, not a reason to pick a different walk: a
+// run that silently drops from B=21 to B=1 is a run whose wall-clock the user
+// did not sign up for. Say what does not fit and what to
+// change.
+// Slot widths come from the plan, not literals: the batched walk holds a
+// τ-snapshot of B_tau slots and a T-snapshot of B_T slots and detects B_t
+// leaves at once; the reuse walk holds the same two snapshots at B=1.
+// Width 7 runs the same walk per m1 subtree (B_tau=1, B_T=3, B_t=7): 4 snapshot
+// slots and a [7·tree] detection grid, one subtree at a time.
+heom::MemoryBudget walk_budget(const SystemContext& ctx, const BranchPlan& bplan,
+                               int width, size_t grid_sz) {
+    const size_t MNb = static_cast<size_t>(ctx.M()) * ctx.rho_capacity();
+    auto budget = heom::estimate_budget(ctx.config(), static_cast<size_t>(ctx.M()), width,
+                                        heom::Resident::SystemTables);
+    size_t snap_slots = 2;                                     // reuse: tau_snap + tw_snap
+    if (width > 1) {
+        const BranchPlan p = walk_plans(bplan, width).front();
+        snap_slots = static_cast<size_t>(p.B_tau + p.B_T);
+    }
+    const size_t per_slot = heom::kMixedPrecision ? 2 : 1;
+    size_t extra = snap_slots * per_slot * MNb * sizeof(heom::complex_t);
+    if (width > 1)
+        extra += static_cast<size_t>(width) * grid_sz * sizeof(heom::complex_t);
+    budget.driver    += extra;
+    budget.gpu_total += extra;
+    return budget;
+}
+
+void check_walk_budget(const SystemContext& ctx, const TwoDESRequest& req,
+                       const BranchPlan& bplan, size_t grid_sz) {
+    auto budget = walk_budget(ctx, bplan, req.batch, grid_sz);
+    size_t gfree = 0, gtot = 0;
+    heom::query_gpu_memory(gfree, gtot);
+    std::string budget_err;
+    if (heom::check_budget(budget, ctx.config(), gfree, budget_err)
+            != heom::BudgetCheck::Exceeds)
+        return;
+    heom::print_budget(budget, gfree, gtot);
+    // Say what every width would need, so the user can pick one that fits.
+    std::string widths;
+    for (int w : {21, 7, 1}) {
+        const double mib = walk_budget(ctx, bplan, w, grid_sz).gpu_total / 1048576.0;
+        widths += (widths.empty() ? "" : ", ") + std::to_string(w) + ": " +
+                  std::to_string(static_cast<long long>(mib + 0.5)) + " MiB";
+    }
+    throw std::runtime_error(
+        "compute_2des: 2des.batch: " + std::to_string(req.batch) +
+        " walk exceeds GPU budget (estimated need per width — " + widths + "; " +
+        std::to_string(gfree / 1048576) + " MiB free): " + budget_err);
+}
+
+// Everything that can reject a (signal, pathway) without computing it: the
+// names, the manifold ladder, the basis/context pairing and the GPU budget.
+// All cells are checked before the first one runs — a check inside the loop
+// threw away every pathway already finished (SE and GSB done, ESA over
+// budget ⇒ hours of GPU time, nothing written).
+std::vector<PathwayJob> plan_pathways(const SystemContext& sys_single,
+                                      const SystemContext& sys_double,
+                                      const TwoDESRequest& req,
+                                      const BranchPlan& bplan, size_t grid_sz) {
+    auto unique = [](const std::vector<std::string>& v, const char* what) {
+        for (size_t i = 0; i < v.size(); ++i)
+            if (std::count(v.begin(), v.end(), v[i]) > 1)
+                throw std::invalid_argument(std::string("compute_2des: ") + what +
+                                            " '" + v[i] + "' listed twice");
+    };
+    unique(req.signals, "signal");
+    unique(req.pathways, "pathway");
+
+    std::vector<PathwayJob> jobs;
+    for (int s = 0; s < static_cast<int>(req.signals.size()); ++s) {
+        const std::string& sig = req.signals[s];
+        if (sig != "rephasing" && sig != "nonrephasing")
+            throw std::invalid_argument(
+                "compute_2des: unknown signal '" + sig +
+                "' (want rephasing/nonrephasing)");
+        for (int p = 0; p < static_cast<int>(req.pathways.size()); ++p) {
+            const PathSpec& spec = find_path(sig == "rephasing", req.pathways[p]);
+            const bool dbl = (spec.basis == BasisType::DOUBLE_EXCITED);
+            const SystemContext& ctx = dbl ? sys_double : sys_single;
+            // The blocks are declarations the kernel takes literally, so they
+            // must be derived from the SAME basis the trajectory runs in. NOT
+            // assert(): shipped builds are Release, where assert() compiles to
+            // nothing.
+            if (spec.basis != ctx.config().physics.basis)
+                throw std::logic_error(
+                    "compute_2des: pathway basis / SystemContext mismatch");
+            const auto lay = ManifoldLayout::from(
+                spec.basis, ctx.config().physics.n_states, ctx.N());
+            jobs.push_back({s, p, spec, ctx, lay, pathway_segment_blocks(spec, lay)});
+        }
+    }
+    for (const auto& j : jobs) check_walk_budget(j.ctx, req, bplan, grid_sz);
+    return jobs;
+}
+
 }  // namespace
+
+// Try 21 → 7 → 1, first that fits under the same usable-free
+// rule as check_budget. Pure (no GPU query) so unit tests can mock free bytes.
+int pick_batch_width(const std::array<size_t, 3>& need_bytes,
+                     size_t gpu_free,
+                     std::string& reason,
+                     double safety_margin) {
+    if (!(safety_margin > 0.0 && safety_margin <= 1.0))
+        throw std::invalid_argument(
+            "pick_batch_width: safety_margin must be in (0, 1], got " +
+            std::to_string(safety_margin));
+    auto mib = [](size_t bytes) {
+        return static_cast<long long>(bytes / 1048576.0 + 0.5);
+    };
+    std::string needs_txt;
+    for (size_t i = 0; i < kBatchWidthCandidates.size(); ++i) {
+        if (i) needs_txt += ", ";
+        needs_txt += std::to_string(kBatchWidthCandidates[i]) + ": " +
+                     std::to_string(mib(need_bytes[i])) + " MiB";
+    }
+
+    if (gpu_free == 0) {
+        // Match check_walk_budget: Unknown capacity is not Exceeds.
+        reason = "auto selected B=21 (GPU free unknown; needs — " + needs_txt + ")";
+        return 21;
+    }
+    const size_t usable = static_cast<size_t>(gpu_free * safety_margin);
+    for (size_t i = 0; i < kBatchWidthCandidates.size(); ++i) {
+        if (need_bytes[i] <= usable) {
+            const int w = kBatchWidthCandidates[i];
+            reason = "auto selected B=" + std::to_string(w) + " (need " +
+                     std::to_string(mib(need_bytes[i])) + " MiB <= usable " +
+                     std::to_string(mib(usable)) + " MiB of " +
+                     std::to_string(mib(gpu_free)) + " MiB free; widths — " +
+                     needs_txt + ")";
+            return w;
+        }
+    }
+    throw std::runtime_error(
+        "compute_2des: 2des.batch: auto — no walk width fits GPU budget "
+        "(estimated need per width — " + needs_txt + "; " +
+        std::to_string(mib(gpu_free)) + " MiB free, usable " +
+        std::to_string(mib(usable)) + " MiB with " +
+        std::to_string(static_cast<int>(safety_margin * 100 + 0.5)) +
+        "% safety margin)");
+}
+
 
 TwoDESResult compute_2des(const SystemContext& sys_single,
                           const SystemContext& sys_double,
@@ -710,20 +731,18 @@ TwoDESResult compute_2des(const SystemContext& sys_single,
         &req.dipole_double->mu_x, &req.dipole_double->mu_y, &req.dipole_double->mu_z};
 
     const size_t grid_sz = static_cast<size_t>(req.n_tau) * req.n_tw * req.n_t;
-    std::vector<Cd> grid(grid_sz);
 
     // Two-level 2DES log (mirrors absorption's "[abs x] propagating" always-on
     // header + print_interval-gated per-step lines):
-    //   - COARSE: the header + one "[k/total]" line per component tree. Always
-    //     printed — it is the progress heartbeat (which pathway/component are we
-    //     on, how long did it take), cheap at `tree_total` lines.
+    //   - COARSE: the header + the walk's own heartbeat lines (one per m1 group
+    //     for reuse, one per (signal,pathway) for batched), printed AFTER each
+    //     finishes with its elapsed time so nothing the trajectory emits mid-run
+    //     interleaves into the label.
     //   - FINE: the per-step "... fs : ADOs |A|/|E|/M ..." lines inside each
-    //     tree, gated by print_interval (==0 ⇒ off) via `log_on`.
+    //     walk, gated by print_interval (==0 ⇒ off) via `log_on`.
     const int  print_interval = sys_single.config().time.print_interval;
     const bool log_on         = (print_interval > 0);
     const int  n_comp_trees   = static_cast<int>(isotropic_components().size());
-    const int  tree_total     = out.n_signal * out.n_pathway * n_comp_trees;
-    int        tree_idx       = 0;
 
     auto join = [](const std::vector<std::string>& v) {
         std::string s;
@@ -731,209 +750,120 @@ TwoDESResult compute_2des(const SystemContext& sys_single,
         return s;
     };
 
+    // Resolve batch: auto → 21/7/1; explicit widths unchanged.
+    // Local copy so plan_pathways / the walk see a concrete width; out records
+    // what was chosen for HDF5 (spec.batch may still be kBatchAuto).
+    TwoDESRequest resolved = req;
+    const BranchPlan bplan = build_branch_plan();
+    if (resolved.batch == kBatchAuto) {
+        size_t gfree = 0, gtot = 0;
+        heom::query_gpu_memory(gfree, gtot);
+        std::array<size_t, 3> needs{};
+        for (size_t i = 0; i < kBatchWidthCandidates.size(); ++i) {
+            const int w = kBatchWidthCandidates[i];
+            needs[i] = std::max(
+                walk_budget(sys_single, bplan, w, grid_sz).gpu_total,
+                walk_budget(sys_double, bplan, w, grid_sz).gpu_total);
+        }
+        std::string reason;
+        resolved.batch = pick_batch_width(needs, gfree, reason);
+        out.batch_auto_reason = reason;
+    } else if (resolved.batch != 1 && resolved.batch != 7 && resolved.batch != 21) {
+        throw std::invalid_argument(
+            "compute_2des: batch width " + std::to_string(resolved.batch) +
+            " (want 1, 7, 21 or auto)");
+    }
+    out.batch_width = resolved.batch;
+
     std::cout << "\n======== 2DES (carry-through) ========\n"
-              << "  signals    : " << join(req.signals)
+              << "  signals    : " << join(resolved.signals)
               << "  (" << out.n_signal << ")\n"
-              << "  pathways   : " << join(req.pathways)
+              << "  pathways   : " << join(resolved.pathways)
               << "  (" << out.n_pathway << ")\n";
     std::cout << "  orientation: isotropic -> I1,I2,I3 ("
               << n_comp_trees << " components)\n";
-    std::cout << "  grid       : tau " << req.n_tau << " x " << req.dtau_fs
+    std::cout << "  grid       : tau " << resolved.n_tau << " x " << resolved.dtau_fs
               << "fs | ";
-    if (req.n_tw == 1) std::cout << "T 1 (T=" << req.tw_fs[0] << "fs)";
-    else std::cout << "T " << req.n_tw << " pts ["
-                   << req.tw_fs.front() << ".." << req.tw_fs.back() << "]fs";
-    std::cout << " | t " << req.n_t << " x " << req.dt_detect_fs << "fs\n"
-              << "  trees      : " << tree_total
-              << "  (print_interval=" << print_interval << ")\n"
-              << "======================================\n" << std::flush;
+    if (resolved.n_tw == 1) std::cout << "T 1 (T=" << resolved.tw_fs[0] << "fs)";
+    else std::cout << "T " << resolved.n_tw << " pts ["
+                   << resolved.tw_fs.front() << ".." << resolved.tw_fs.back() << "]fs";
+    std::cout << " | t " << resolved.n_t << " x " << resolved.dt_detect_fs << "fs\n"
+              << "  walk       : " << (resolved.batch == 21 ? "batched 3->9->21 (B=21)"
+                                     : resolved.batch == 7   ? "batched per m1 subtree 1->3->7 (B=7, x3)"
+                                                            : "reuse 3->9->21 (B=1)")
+              << "  (print_interval=" << print_interval << ")\n";
+    if (!out.batch_auto_reason.empty())
+        std::cout << "  batch auto : " << out.batch_auto_reason << "\n";
+    std::cout << "======================================\n" << std::flush;
 
-    // Coarse per-tree heartbeat: one flushed line per component tree, printed
-    // AFTER it finishes, carrying its elapsed time. Printed after (not before)
-    // so nothing the trajectory emits mid-run — the one-time "[ulist] enabled"
-    // banner, a divergence warning, or (FINE mode) the per-step ADO lines that
-    // already carry the same "[k/total]" tag — interleaves into the label. The
-    // running k/total on every line is the "where are we" signal; the trailing
-    // (elapsed) tells which pathway/component is slow.
-    auto timed_tree = [&](const std::string& label, auto&& run) {
-        const auto t0 = std::chrono::steady_clock::now();
-        run();
-        const double s = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t0).count();
-        std::cout << label << "  (" << heom::console::format_computation_time(s)
-                  << ")\n" << std::flush;
-    };
-
-    for (int s = 0; s < out.n_signal; ++s) {
+    const int B = resolved.batch;
+    const std::vector<BranchPlan> wplans =
+        (B > 1) ? walk_plans(bplan, B) : std::vector<BranchPlan>{};
+    for (const PathwayJob& job :
+         plan_pathways(sys_single, sys_double, resolved, bplan, grid_sz)) {
+        const int s = job.s, p = job.p;
         const std::string& sig = req.signals[s];
         const bool rp = (sig == "rephasing");
-        if (!rp && sig != "nonrephasing")
-            throw std::invalid_argument(
-                "compute_2des: unknown signal '" + sig +
-                "' (want rephasing/nonrephasing)");
+        const PathSpec& spec = job.spec;
+        const SystemContext& ctx = job.ctx;
+        const auto& Rax = (spec.basis == BasisType::DOUBLE_EXCITED) ? Rdouble : Rsingle;
+        const int N = ctx.N();
 
-        for (int p = 0; p < out.n_pathway; ++p) {
-            const PathSpec& spec = find_path(rp, req.pathways[p]);
-            const bool dbl = (spec.basis == BasisType::DOUBLE_EXCITED);
-            const SystemContext& ctx = dbl ? sys_double : sys_single;
-            const auto& Rax = dbl ? Rdouble : Rsingle;
-            const int N = ctx.N();
+        // One trajectory per (signal,pathway), reused across the whole walk
+        // via set_initial (never `new` per tree → cudaMalloc thrash). Only
+        // one HEOMTrajectory is alive at any time.
+        HEOMTrajectory traj(ctx, B);
+        // Its detector lives just as long: grow-only buffers, so the
+        // per-tree begin() re-uploads μ_det but never re-allocates.
+        heom::Detector det(traj);
 
-            // The blocks below are declarations the kernel takes literally, so
-            // they must be derived from the SAME basis the trajectory runs in.
-            // NOT assert(): shipped builds are Release, where assert() compiles
-            // to nothing — a guard that vanishes in exactly the builds that run
-            // is worse than none, because the plan says it is there.
-            if (spec.basis != ctx.config().physics.basis)
-                throw std::logic_error(
-                    "compute_2des: pathway basis / SystemContext mismatch");
-            const auto lay = ManifoldLayout::from(
-                spec.basis, ctx.config().physics.n_states, N);
-            const auto blk = pathway_segment_blocks(spec, lay);  // [τ, T, t]
-
-            // Batched path decision + budget guard. B=21 needs 21× the two
-            // mutable O(M·N²) buffers, PLUS the driver-owned extras the alloc
-            // plan cannot see (it only covers trajectory-owned buffers):
-            //   - tau_snap (B=3) + tw_snap (B=9) gathered blocks, worst case
-            //     n_active = M ⇒ 12·M·N² elements;
-            //   - the [21·tree] device detection grid.
-            // Fold them INTO the budget (not out of gfree) so the printed
-            // shortfall report stays honest. If it doesn't fit, fall back to
-            // reuse/flat with a clear message instead of a raw ctor OOM throw
-            bool use_batch = req.batch;
-            if (use_batch) {
-                auto budget = heom::estimate_budget(
-                    ctx.config(), static_cast<size_t>(ctx.M()), /*batch=*/21);
-                const size_t MN2 = static_cast<size_t>(ctx.M()) * N * N;
-                const size_t snap_bytes =
-                    12 * MN2 * sizeof(heom::complex_t);
-                const size_t det_bytes = static_cast<size_t>(21) * req.n_tau
-                    * req.n_tw * req.n_t * sizeof(heom::complex_t);
-                budget.auxiliary  += snap_bytes + det_bytes;
-                budget.gpu_total  += snap_bytes + det_bytes;
-                size_t gfree = 0, gtot = 0;
-                heom::query_gpu_memory(gfree, gtot);
-                std::string budget_err;
-                if (heom::check_budget(budget, ctx.config(), gfree, budget_err)
-                        == heom::BudgetCheck::Exceeds) {
-                    std::cout << "  [2des.batch] B=21 exceeds GPU budget; falling "
-                                 "back to " << (req.orient_reuse ? "reuse" : "flat")
-                              << "\n" << std::flush;
-                    use_batch = false;
+        // Both walks fill the same per-component leaf grids
+        // (leaf_grid[ci] = isotropic_components()[ci]'s tree) and then run
+        // the one accumulation below, so their float-add order into
+        // out.resp is byte-identical — the bit-exact parity gate depends on
+        // this.
+        //
+        // The five-deep nest (ci→ip→it→k→j) is THE SHAPE THE GATE LOCKS, not
+        // a loop nobody got around to tidying. Floating-point addition is not
+        // associative, so collapsing, fusing, reordering, or parallelising
+        // these loops changes the sum and breaks reuse/batched parity — which
+        // is the only evidence we have that the two walks compute the same
+        // physics — and moves the committed golden baseline. Want it faster?
+        // Prove the new order is bit-identical first. Otherwise leave it
+        // exactly as it is.
+        const auto& comps = isotropic_components();
+        std::vector<std::vector<Cd>> leaf_grid(comps.size(),
+                                               std::vector<Cd>(grid_sz));
+        auto accumulate = [&]() {
+            for (int ci = 0; ci < static_cast<int>(comps.size()); ++ci) {
+                const auto& c = comps[ci];
+                for (int ip = 0; ip < 3; ++ip) {
+                    if (!c.bucket[ip]) continue;
+                    for (int it = 0; it < req.n_tau; ++it)
+                    for (int k = 0; k < req.n_tw; ++k)
+                    for (int j = 0; j < req.n_t; ++j)
+                        out.resp[out.idx(ip, s, p, it, k, j)] +=
+                            spec.sign *
+                            leaf_grid[ci][static_cast<size_t>(it * req.n_tw + k)
+                                          * req.n_t + j];
                 }
             }
+        };
 
-            // One trajectory per (signal,pathway), reused across all components
-            // via set_initial (never `new` per tree → cudaMalloc thrash). Only
-            // one HEOMTrajectory is alive at any time. Batched path opens it at
-            // B=21 (max fanout); every other path at B=1.
-            HEOMTrajectory traj(ctx, /*enable_hdf5=*/false, use_batch ? 21 : 1);
+        ReuseCtx rc{traj, det, spec, Rax, req, N, ground_block(job.lay), job.blk,
+                    std::string(rp ? "rp " : "nr ") + spec.name,
+                    log_on, print_interval};
+        if (B > 1)
+            for (const BranchPlan& wp : wplans)                       // 1 plan (21) or 3 subtrees (7)
+                run_pathway_batched(rc, wp, leaf_grid);               // batched lockstep
+        else
+            run_pathway_reuse(rc, group_isotropic(), leaf_grid);      // reuse, prefix-shared
+        accumulate();
 
-            auto sel = [&](int axis, bool raise) {
-                return raise ? Eigen::MatrixXcd(*Rax[axis])
-                             : Eigen::MatrixXcd(Rax[axis]->adjoint());
-            };
-
-            // Canonical-order accumulation into out.resp, shared by the reuse and
-            // batched paths so their float-add order is byte-identical (the
-            // bit-exact parity gate depends on this).
-            //
-            // The five-deep nest (ci→ip→it→k→j) is THE SHAPE THE GATE LOCKS, not
-            // a loop nobody got around to tidying. Floating-point addition is not
-            // associative, so collapsing, fusing, reordering, or parallelising
-            // these loops changes the sum and breaks flat/reuse/batched parity —
-            // which is the only evidence we have that the three walks compute the
-            // same physics. Want it faster? Prove the new order is bit-identical
-            // first. Otherwise leave it exactly as it is.
-            auto accumulate = [&](const std::vector<std::vector<Cd>>& leaf_grid) {
-                const auto& comps = isotropic_components();
-                for (int ci = 0; ci < static_cast<int>(comps.size()); ++ci) {
-                    const auto& c = comps[ci];
-                    for (int ip = 0; ip < 3; ++ip) {
-                        if (!c.bucket[ip]) continue;
-                        for (int it = 0; it < req.n_tau; ++it)
-                        for (int k = 0; k < req.n_tw; ++k)
-                        for (int j = 0; j < req.n_t; ++j)
-                            out.resp[out.idx(ip, s, p, it, k, j)] +=
-                                spec.sign *
-                                leaf_grid[ci][static_cast<size_t>(it * req.n_tw + k)
-                                              * req.n_t + j];
-                    }
-                }
-            };
-
-            if (use_batch) {
-                // Lockstep 3→9→21 batched walk. Same leaf_grid layout as
-                // reuse ⇒ identical accumulation.
-                const auto& comps = isotropic_components();
-                std::vector<std::vector<Cd>> leaf_grid(comps.size(),
-                                                       std::vector<Cd>(grid_sz));
-                ReuseCtx rc{traj, spec, Rax, req, N, blk,
-                            std::string(rp ? "rp " : "nr ") + spec.name,
-                            log_on, print_interval};
-                run_pathway_batched(rc, build_branch_plan(), leaf_grid);
-                tree_idx += static_cast<int>(comps.size());
-                accumulate(leaf_grid);
-            } else if (req.orient_reuse) {
-                // 3→9→21 prefix-share walk. Runs the whole (s,p) fanout into
-                // per-component leaf grids, then accumulates in canonical
-                // isotropic_components() order (float-add order == flat ⇒
-                // bit-exact when filtering is off).
-                const auto& comps = isotropic_components();
-                std::vector<std::vector<Cd>> leaf_grid(comps.size(),
-                                                       std::vector<Cd>(grid_sz));
-                ReuseCtx rc{traj, spec, Rax, req, N, blk,
-                            std::string(rp ? "rp " : "nr ") + spec.name,
-                            log_on, print_interval};
-                run_pathway_reuse(rc, group_isotropic(), leaf_grid);
-                tree_idx += static_cast<int>(comps.size());  // heartbeat accounting
-                accumulate(leaf_grid);
-            } else {
-                for (const auto& c : isotropic_components()) {
-                    const std::string tag = "[" + std::to_string(++tree_idx)
-                                          + "/" + std::to_string(tree_total) + "]";
-                    const std::string label = tag + " " + (rp ? "rp" : "nr") + " "
-                                            + spec.name + " " + component_label(c)
-                                            + "  N=" + std::to_string(N);
-                    const Eigen::MatrixXcd mu0 = sel(c.m[0], spec.pulses[0].raise);
-                    const Eigen::MatrixXcd mu1 = sel(c.m[1], spec.pulses[1].raise);
-                    const Eigen::MatrixXcd mu2 = sel(c.m[2], spec.pulses[2].raise);
-                    const Eigen::MatrixXcd mu_det = Rax[c.m[3]]->adjoint();  // μ⁻
-                    timed_tree(label, [&] {
-                        run_pathway_tree(traj, spec, mu0, mu1, mu2, mu_det, req, N,
-                                         blk, grid, tag, log_on, print_interval);
-                    });
-                    for (int ip = 0; ip < 3; ++ip) {
-                        if (!c.bucket[ip]) continue;
-                        for (int it = 0; it < req.n_tau; ++it)
-                        for (int k = 0; k < req.n_tw; ++k)
-                        for (int j = 0; j < req.n_t; ++j)
-                            out.resp[out.idx(ip, s, p, it, k, j)] +=
-                                spec.sign *
-                                grid[static_cast<size_t>(it * req.n_tw + k) * req.n_t + j];
-                    }
-                }
-            }
-
-            if (traj.diverged())
-                throw std::runtime_error(
-                    std::string("compute_2des: trajectory diverged (") +
-                    sig + " " + spec.name + ")");
-
-            // Every propagation in a 2DES walk sits in a τ, T or t segment, and
-            // all three have a declared block. A nonzero count means a launch
-            // site was added without one — correct, slower, and invisible to
-            // the bitwise A/B gate, which is exactly why it is checked here and
-            // not left as a silent slowdown. The
-            // trajectory is fresh per (signal,pathway), so this reads as a
-            // per-walk total.
-            if (traj.propagations_without_block() != 0)
-                throw std::logic_error(
-                    "compute_2des: " + std::to_string(
-                        traj.propagations_without_block()) +
-                    " propagation segment(s) ran without a declared manifold "
-                    "block (" + sig + " " + spec.name + ")");
-        }
+        if (traj.diverged())
+            throw std::runtime_error(
+                std::string("compute_2des: trajectory diverged (") +
+                sig + " " + spec.name + ")");
     }
     return out;
 }

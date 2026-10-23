@@ -24,7 +24,7 @@ def _yaml_template(tw_line: str) -> str:
 system:
   n_states: 7
   temperature: 77.0
-spectroscopy:
+2des:
   tau_max: 600.0
   dtau: 8.0
   {tw_line}
@@ -84,7 +84,7 @@ def test_update_config_yaml_tw():
     text = _yaml_template('tw: ["0:1000:1000"]')
     out = update_config_yaml_tw(text, [0.0, 104.0, 504.0, 1000.0])
     doc = __import__("yaml").safe_load(out)
-    assert doc["spectroscopy"]["tw"] == ["0", "104", "504", "1000"]
+    assert doc["2des"]["tw"] == ["0", "104", "504", "1000"]
 
 
 def test_merge_combines_tw(tmp_path):
@@ -107,7 +107,7 @@ def test_merge_combines_tw(tmp_path):
         assert resp[0, 0, 0, 0, 1, 0] == pytest.approx(502.0 + 0j)
         yaml = f["/parameters/config_yaml"][()].decode()
         import yaml as yaml_mod
-        assert yaml_mod.safe_load(yaml)["spectroscopy"]["tw"] == ["0", "500"]
+        assert yaml_mod.safe_load(yaml)["2des"]["tw"] == ["0", "500"]
         sources = json.loads(f["/parameters"].attrs["merge_sources"])
         assert len(sources) == 2
 

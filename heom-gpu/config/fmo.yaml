@@ -47,8 +47,19 @@ bath:
   eta: 70.0                   # Drude J(ω) coupling η (cm^-1); λ_reorg = η/2 = 35 cm^-1
   gamma_inverse: 100.0        # Bath relaxation time 1/γ (fs)
   expansion_method: pade      # REQUIRED: pade | matsubara
-  n_extra_poles: 1            # non-Drude bath poles (K)
+  n_extra_poles: 1           # non-Drude bath poles per site (K_n default)
   L_cutoff: 3                 # occupation cutoff: Σ_{n,k} α_{n,k} ≤ L_cutoff
+  # Optional per-pigment overrides (1-based). Absent keys inherit the defaults
+  # above; a `vibrational_modes` list here REPLACES the bath-level list (which
+  # is empty in this file). See config/fmo_vib.yaml for a full example.
+  #   sites:
+  #     3:
+  #       vibrational_modes:      # underdamped Brownian oscillator(s), +2 ladders each
+  #         - {omega_cm: 340.0, huang_rhys: 0.02, gamma_inverse: 354.0}   # C(t) decays in 1/γ=354 fs ⇔ γ=15 cm⁻¹, FWHM 2γ=30 cm⁻¹
+  #     9:
+  #       eta: 120.0              # this pigment's Drude η
+  #       gamma_inverse: 60.0     # this pigment's 1/γ (fs)
+  #       n_extra_poles: 2        # this pigment's Padé count K_9 (slower γ ⇒ needs more poles)
 
 filter:
   # ADO filtering. `enabled` is the single on/off switch — when false, all the
@@ -56,20 +67,18 @@ filter:
   #
   # Leave filtering off unless the active closure actually shrinks.
   # Judge that by |E|/M in the stats line, not by |A|/M.
-  enabled: false
+  enabled: true
   tolerance: 1e-6             # ADO max-norm threshold
-  start_step: 10             # warmup (relaxed-threshold) window; first pass pinned
-  warmup_factor: 1e-1        # warmup threshold = tolerance * warmup_factor
   # U-list whole-step launch — single knob. 0 = off; a value in (0,1] turns it
   # on AND is the adaptive gate τ (|E|/M > τ ⇒ full-grid fallback, byte-equal;
   # else the compact whole-step over U = A ∪ neighbors(A) runs). Needs filtering
-  # on. env HEOM_ULIST_TAU overrides τ for sweeps.
+  # on. This key is the only place τ comes from (it is part of config_hash).
   ulist: 0.9
 
 # -----------------------------------------------------------------------------
 # MC static disorder (optional). Points at a disorder node file (generate with
 # mc-disorder-gen). No on/off switch: it is consulted ONLY on the MC path
-# (`mc-disorder-run <task> fmo.yaml --workers K`, or the low-level
+# (`mc-disorder-run <task> fmo.yaml [--gpus 0,1]`, or the low-level
 # `heom_solver <task> fmo.yaml --rank N`). A bare filename resolves next to
 # this config; a plain `heom_solver <task> fmo.yaml` ignores it (single-shot).
 # -----------------------------------------------------------------------------
@@ -80,7 +89,7 @@ static_disorder:
 # sink + initial state + output.
 # -----------------------------------------------------------------------------
 dynamics:
-  integrator: rk4             # REQUIRED (no default): rk4 | if-rk4. rk4 = plain
+  integrator: if-rk4             # REQUIRED (no default): rk4 | if-rk4. rk4 = plain
                               # historical path; dt < 2 fs is a rk4 STABILITY
                               # limit (Term-2 hierarchy decay). if-rk4 integrates
                               # Term 2 exactly → larger dt at an accuracy cost
@@ -118,7 +127,7 @@ absorption:
   output_interval: 1
   print_interval: 10
   output:
-    save_path: "data/fmo_las_128rqmc/"
+    save_path: "data/fmo_test/las"
 
 # -----------------------------------------------------------------------------
 # 2DES task (carry-through, single+double). Time grid is derived from the τ/t
@@ -143,4 +152,4 @@ absorption:
   pathways: ["SE", "GSB", "ESA"]
   signals: ["rephasing", "nonrephasing"]
   output:
-    save_path: "data/fmo_2des/"
+    save_path: "data/fmo_test/2des"

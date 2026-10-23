@@ -155,6 +155,7 @@ def extract_hdf5_params(f: h5py.File) -> tuple[Optional[np.ndarray], float, dict
 
 def parse_hdf5_dual_basis(filename: str, verbose: bool = False) -> PopulationData:
     with h5py.File(filename, "r") as f:
+        heom_h5.require_complete(f)
         if verbose:
             print_hdf5_parameters(f, filename)
 

@@ -3,7 +3,7 @@
 # benchmark_3sites_2des.yaml cannot serve that gate: filtering is on (it zeroes
 # ADOs, so it can HIDE out-of-block residue and never create it), tw is a single
 # point (tw_gap_steps is all zero, so the T segment never propagates and its
-# block is never exercised), and it sets no batch key (only the flat walk runs).
+# block is never exercised), and it sets no batch key (only the B=1 reuse walk runs).
 # This file differs from it in exactly those three respects plus a grid small
 # enough that somebody will run it twice.
 #
@@ -38,8 +38,6 @@ bath:
 filter:
   enabled: false               # (1) filtering can only MASK out-of-block residue
   tolerance: 1.0e-6
-  start_step: 8
-  warmup_factor: 1.0e-1
   ulist: 0.9
 
 2des:
@@ -63,6 +61,16 @@ filter:
   batch: true                  # (3) the batched walk — the only one the MP build
                                # gets any direct evidence for (test_2des_reuse is
                                # FP64-only).
+                               # Why small systems win so much: N=3 leaves the
+                               # card idle one component at a time, so packing
+                               # the 21 isotropic components into one launch is
+                               # ~4.6x here (49.7s→10.8s, RTX 5060); FMO only
+                               # ~1.14x. Caveat: NOT bit-identical to the serial
+                               # walk when the ADO filter is on — batched slots
+                               # share one union active set, so a component keeps
+                               # ADOs its solo run would drop (~2e-7 rel, 200x
+                               # below the filter's own error). Filter off (as
+                               # here): the two walks agree bit-for-bit.
   output:
     save_path: "tests/benchmark_data"
     filename: "benchmark_3sites_2des_blocking"

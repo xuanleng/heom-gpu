@@ -2,11 +2,13 @@
 the SAME 1-based inclusive interval (--r-begin/--r-end), plus a unique 1-based
 rank; on success it renames each worker's temp log to match its data shard
 (<stem>.log). Uses a fake solver script (no real heom_solver / GPU)."""
+import glob
 import os
 
 import numpy as np
 import pytest
 
+from heom_tools.common import mc_naming
 from heom_tools.mc_disorder import run
 
 # Fake solver: logs its argv, then (if it got an interval) writes a shard named
@@ -26,6 +28,7 @@ _FAKE_SOLVER = (
     "os.makedirs(save, exist_ok=True)\n"
     "name = f'fmo_absorption_0123456789abcdef_{ts}_r{b}-{e}_rank{rank}.h5'\n"
     "open(os.path.join(save, name), 'w').close()\n"
+    "open(os.path.join(save, f'mc.{ts}_r{b}-{e}.queue'), 'wb').close()\n"
 )
 
 
@@ -89,7 +92,7 @@ def test_launch_pins_each_worker_to_its_gpu(tmp_path, monkeypatch):
 
     gpu_of_rank = run.plan_gpu_assignment([0, 1])
     run.launch(str(solver), "absorption", "cfg.yaml",
-               save_path=save, queue_path=str(tmp_path / "mc.queue"),
+               save_path=save,
                run_id="20260710_0000", r_begin=1, r_end=8,
                gpu_of_rank=gpu_of_rank)
 
@@ -104,7 +107,7 @@ def test_launch_without_gpus_leaves_env_untouched(tmp_path, monkeypatch):
     monkeypatch.setenv("ARGV_LOG", str(argv_log))
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     run.launch(str(solver), "absorption", "cfg.yaml",
-               save_path=save, queue_path=str(tmp_path / "mc.queue"),
+               save_path=save,
                run_id="20260710_0000", r_begin=1, r_end=8,
                gpu_of_rank=[None])
     seen = dict(ln.split() for ln in argv_log.read_text().splitlines())
@@ -120,7 +123,7 @@ def test_launch_shares_run_id_interval_and_renames_logs(tmp_path, monkeypatch):
 
     ts = "20260706_1122"
     failed = run.launch(str(solver), "absorption", "cfg.yaml",
-                        save_path=save, queue_path=str(tmp_path / "mc.queue"),
+                        save_path=save,
                         run_id=ts, r_begin=201, r_end=300,
                         gpu_of_rank=["0", "1", "2"])
     assert failed == []
@@ -144,6 +147,11 @@ def test_launch_shares_run_id_interval_and_renames_logs(tmp_path, monkeypatch):
         assert os.path.isfile(os.path.join(save, stem + ".log"))
         assert not os.path.exists(os.path.join(save, f"worker_rank{n}.log"))
 
+    # The batch's queue (same name as the solver's queue_file_name) is removed
+    # once every worker has exited.
+    assert mc_naming.queue_file_name(ts, 201, 300) == "mc.20260706_1122_r201-300.queue"
+    assert not glob.glob(os.path.join(save, "mc.*.queue"))
+
 
 def test_launch_default_interval_is_one_based(tmp_path, monkeypatch):
     """--range omitted upstream ⇒ launcher passes [1, n]; verify 1-based start."""
@@ -154,7 +162,7 @@ def test_launch_default_interval_is_one_based(tmp_path, monkeypatch):
     monkeypatch.setenv("SAVE", save)
 
     run.launch(str(solver), "absorption", "cfg.yaml",
-               save_path=save, queue_path=str(tmp_path / "mc.queue"),
+               save_path=save,
                run_id="20260706_0000", r_begin=1, r_end=50,
                gpu_of_rank=[None])
     toks = argv_log.read_text().split()
@@ -359,7 +367,7 @@ def test_launch_failure_keeps_worker_log(tmp_path, monkeypatch):
     monkeypatch.setenv("SAVE", save)
 
     failed = run.launch(str(solver), "absorption", "cfg.yaml",
-                        save_path=save, queue_path=str(tmp_path / "mc.queue"),
+                        save_path=save,
                         run_id="20260706_0000", r_begin=1, r_end=10,
                         gpu_of_rank=["0", "1"])
     assert sorted(r for r, _, _ in failed) == [1, 2]

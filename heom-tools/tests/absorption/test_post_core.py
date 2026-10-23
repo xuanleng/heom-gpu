@@ -104,6 +104,15 @@ def test_fft_to_spectrum_rejects_bad_grid() -> None:
         fft_to_spectrum(np.ones(4, dtype=np.complex128), dt_fs=1.0, dw_cm=0.0)
 
 
+def test_fft_to_spectrum_half_weights_t0() -> None:
+    # Trapezoid: C(t_0) at half weight, so a lone t=0 sample is a flat 0.5/nfft.
+    ct = np.zeros(8, dtype=np.complex128)
+    ct[0] = 1.0
+    _, spec = fft_to_spectrum(ct, dt_fs=2.0)
+    np.testing.assert_allclose(spec, 0.5 / spec.size, rtol=0, atol=1e-15)
+    assert ct[0] == 1.0      # the caller's C(t) is not touched
+
+
 def test_sticks_table_dominant_site_index() -> None:
     st_tab = _sticks_table([
         StickEntry(1.0, 0.5, 1, 0.75),

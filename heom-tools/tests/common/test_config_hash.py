@@ -30,8 +30,6 @@ bath:
 filter:
   enabled: true
   tolerance: 1.0e-7
-  start_step: 10
-  warmup_factor: 0.001
 absorption:
   integrator: rk4
   dt: 1.0
@@ -42,12 +40,31 @@ absorption:
     save_path: "/tmp/"
     filename: "auto"
     use_timestamp: false
+fluorescence:
+  integrator: rk4
+  dt: 1.0
+  n_steps: 200
+  output_interval: 1
+  batch: true
+  output:
+    save_path: "/tmp/"
+  equilibration:
+    t_max: 5000.0
+    check_interval: 50.0
+    tolerance: 1.0e-6
 static_disorder:
   draws_file: "nodes.h5"
 """
 
 # Must equal kPhysicsHashVectorExpected in test_core.cpp.
-_GOLDEN = "7e9a4ebcf3c349b7"
+# Task-scoped (absorption) — the value the solver writes into an absorption file.
+_GOLDEN = "bef65eb0a9c0f82b"
+# Task-less core (system+bath+filter) — what load_yaml holds before resolve.
+_GOLDEN_CORE = "93fab135bac4ec03"
+# Must equal kPhysicsHashVectorExpectedFl: pins the nested `equilibration` map.
+# Fluorescence rejects the ADO filter, so its vector has the filter off.
+_GOLDEN_FL = "b36d1b90e6bca5c1"
+_VECTOR_FL = _VECTOR.replace("  enabled: true\n  tolerance: 1.0e-7\n", "  enabled: false\n")
 
 
 def test_fnv1a64_hex_known_vectors():
@@ -56,27 +73,67 @@ def test_fnv1a64_hex_known_vectors():
 
 
 def test_physics_hash_matches_cpp_golden():
-    assert physics_hash(_VECTOR) == _GOLDEN
+    assert physics_hash(_VECTOR, "absorption") == _GOLDEN
+    assert physics_hash(_VECTOR) == _GOLDEN_CORE
+    assert physics_hash(_VECTOR_FL, "fluorescence") == _GOLDEN_FL
+    assert _VECTOR_FL != _VECTOR
+    assert _GOLDEN != _GOLDEN_CORE
+
+
+def test_fluorescence_hash_tracks_equilibration_not_batch():
+    ref = physics_hash(_VECTOR_FL, "fluorescence")
+    assert physics_hash(_VECTOR_FL.replace("batch: true", "batch: false"), "fluorescence") == ref
+    assert physics_hash(_VECTOR_FL.replace("tolerance: 1.0e-6", "tolerance: 1.0e-8"),
+                        "fluorescence") != ref
+    assert physics_hash(_VECTOR_FL.replace("t_max: 5000.0", "t_max: 9000.0"),
+                        "fluorescence") != ref
 
 
 def test_physics_hash_ignores_comments_whitespace_and_dropped_blocks():
-    ref = physics_hash(_VECTOR)
+    ref = physics_hash(_VECTOR, "absorption")
     # Leading/trailing comments + blank line: no change.
     commented = "# header\n" + _VECTOR + "\n# trailing r-range note\n"
-    assert physics_hash(commented) == ref
+    assert physics_hash(commented, "absorption") == ref
     # Editing the non-physical output block: no change.
-    assert physics_hash(_VECTOR.replace("/tmp/", "/other/dir/")) == ref
+    assert physics_hash(_VECTOR.replace("/tmp/", "/other/dir/"), "absorption") == ref
     # Editing static_disorder (disorder identity is tracked separately): no change.
-    assert physics_hash(_VECTOR.replace("nodes.h5", "other_nodes.h5")) == ref
+    assert physics_hash(_VECTOR.replace("nodes.h5", "other_nodes.h5"), "absorption") == ref
+    # Print / batch knobs move bytes, not physics: no change.
+    assert physics_hash(_VECTOR.replace("print_interval: 200", "print_interval: 7"),
+                        "absorption") == ref
+    assert physics_hash(_VECTOR.replace("integrator: rk4", "integrator: rk4\n  batch: true"),
+                        "absorption") == ref
+    assert physics_hash(_VECTOR.replace("tolerance: 1.0e-7",
+                                        "tolerance: 1.0e-7\n  log_per_slot: true"),
+                        "absorption") == ref
+
+
+def test_physics_hash_scoped_to_own_task_block():
+    ref = physics_hash(_VECTOR, "absorption")
+    # Another task's block appearing / changing must not fork this task's group.
+    with_dyn = _VECTOR + "dynamics:\n  dt: 0.5\n  n_steps: 10\n"
+    assert physics_hash(with_dyn, "absorption") == ref
+    assert physics_hash(with_dyn.replace("dt: 0.5", "dt: 0.25"), "absorption") == ref
+    # But the block IS the identity of its own task.
+    assert physics_hash(with_dyn, "dynamics") != physics_hash(
+        with_dyn.replace("dt: 0.5", "dt: 0.25"), "dynamics")
+    # And a task whose block is absent hashes to the core.
+    assert physics_hash(_VECTOR, "2des") == _GOLDEN_CORE
 
 
 def test_physics_hash_changes_on_real_physics_edit():
-    ref = physics_hash(_VECTOR)
+    ref = physics_hash(_VECTOR, "absorption")
     assert physics_hash(_VECTOR.replace("temperature: 77.0",
-                                        "temperature: 100.0")) != ref
+                                        "temperature: 100.0"), "absorption") != ref
     # Waiting-time / spectroscopy IS physics.
     assert physics_hash(_VECTOR.replace("strengths: [4.5, 4.5]",
-                                        "strengths: [4.5, 5.0]")) != ref
+                                        "strengths: [4.5, 5.0]"), "absorption") != ref
+    # Time grid of the task being run IS physics.
+    assert physics_hash(_VECTOR.replace("n_steps: 200", "n_steps: 400"),
+                        "absorption") != ref
+    # Filter tolerance changes the numbers: physics.
+    assert physics_hash(_VECTOR.replace("tolerance: 1.0e-7", "tolerance: 1.0e-5"),
+                        "absorption") != ref
 
 
 def test_physics_hash_stable_under_key_reorder():
@@ -87,4 +144,4 @@ def test_physics_hash_stable_under_key_reorder():
     reordered = ("".join(lines[bath_start:bath_end])
                  + "".join(lines[:bath_start])
                  + "".join(lines[bath_end:]))
-    assert physics_hash(reordered) == physics_hash(_VECTOR)
+    assert physics_hash(reordered, "absorption") == physics_hash(_VECTOR, "absorption")

@@ -2,6 +2,7 @@
 #include "system_context.hpp"
 #include "output/hdf5_metadata.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -63,9 +64,27 @@ HDF5Writer::HDF5Writer(bool use_timestamp)
 }
 
 HDF5Writer::~HDF5Writer() {
-    if (file_ >= 0) {
-        try { close(0.0); } catch (...) {}
+    if (file_ < 0) return;
+    // Reaching the destructor with the file still open means the run never got
+    // to close(): an exception is unwinding through run_dynamics. The file on
+    // disk has a valid layout but only `current_step_` of `n_records_` records,
+    // so it says status="aborted". A destructor cannot throw; say what happened
+    // on stderr instead.
+    std::cerr << "HDF5Writer: closing " << output_path_ << " ABORTED ("
+              << current_step_ << "/" << n_records_ << " records written)\n";
+    try {
+        heom::hdf5::write_scalar_attr(file_, "n_records_written", current_step_);
+        heom::hdf5::write_run_status(file_, heom::hdf5::RunStatus::Aborted);
+    } catch (const std::exception& e) {
+        std::cerr << "HDF5Writer: could not mark file aborted: " << e.what() << "\n";
     }
+    auto close_quietly = [](hid_t& id, herr_t (*close_fn)(hid_t)) {
+        if (id >= 0) { close_fn(id); id = -1; }
+    };
+    close_quietly(density_matrix_dataset_, H5Dclose);
+    close_quietly(time_dataset_,           H5Dclose);
+    close_quietly(complex_type_,           H5Tclose);
+    close_quietly(file_,                   H5Fclose);
 }
 
 void HDF5Writer::open(const SystemContext& sys,
@@ -78,8 +97,8 @@ void HDF5Writer::open(const SystemContext& sys,
     const auto& time    = cfg.time;
 
     // cfg.initial is std::optional<InitialState>. The
-    // dynamics writer path always reaches here after set_initial_from_config()
-    // (which requires has_value). The check below catches a future caller
+    // dynamics writer path (heom::run_dynamics) always reaches here after
+    // building ρ0 from cfg.initial (which requires has_value). The check below catches a future caller
     // that wires the dynamics writer onto an absorption-style cfg by mistake.
     if (!cfg.initial.has_value()) {
         throw std::runtime_error(
@@ -93,16 +112,14 @@ void HDF5Writer::open(const SystemContext& sys,
                                                    cfg.output.filename,
                                                    use_timestamp_);
 
-    file_ = H5Fcreate(output_path_.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-    if (file_ < 0) {
-        throw std::runtime_error("Cannot create HDF5 file: " + output_path_);
-    }
+    file_ = heom::hdf5::create_output_file(output_path_, use_timestamp_);
 
     // ------------------------------------------------------------------
     // Group layout: /  /parameters  /derived  /results  /provenance
     // See src/output/hdf5_metadata.hpp for the contract each group obeys.
     // ------------------------------------------------------------------
     heom::hdf5::write_root_identity(file_, cfg, "dynamics");
+    heom::hdf5::write_run_status(file_, heom::hdf5::RunStatus::Running);
 
     hid_t params = heom::hdf5::write_parameters_group(file_, sys,
                                                      use_filtering,
@@ -120,8 +137,7 @@ void HDF5Writer::open(const SystemContext& sys,
             break;
         case InitialState::Type::EXCITON_EXCITATION:
             heom::hdf5::write_scalar_attr(params, "selected_exciton_index",
-                single_exciton_user_index_1based(init_state.exciton_index,
-                                                 phys.basis));
+                hilbert_to_pigment(init_state.exciton_index, phys.basis));
             break;
         case InitialState::Type::COHERENT:
         case InitialState::Type::CUSTOM_MATRIX:
@@ -168,12 +184,12 @@ void HDF5Writer::open(const SystemContext& sys,
     tmp_rho_.resize(static_cast<size_t>(N_) * N_);
     current_step_ = 0;
 
-    H5Fflush(file_, H5F_SCOPE_GLOBAL);
+    HDF5_CHECK_ERR(H5Fflush(file_, H5F_SCOPE_GLOBAL));
 
     std::cout << "HDF5 file created: " << output_path_ << "\n";
 }
 
-void HDF5Writer::write_timestep(double time_fs, const cuDoubleComplex* rho, int N) {
+void HDF5Writer::write_timestep(double time_fs, const std::complex<double>* rho, int N) {
     heom::hdf5::validate_timestep_bounds(N, N_, current_step_, n_records_);
 
     // ---- write time[current_step_] ----
@@ -188,12 +204,7 @@ void HDF5Writer::write_timestep(double time_fs, const cuDoubleComplex* rho, int 
                             H5P_DEFAULT, &time_fs));
 
     // ---- write density_matrix[current_step_] (complex compound) ----
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < N; ++j) {
-            cuDoubleComplex val = rho[i * N + j];
-            tmp_rho_[i * N + j] = std::complex<double>(cuCreal(val), cuCimag(val));
-        }
-    }
+    std::copy(rho, rho + static_cast<size_t>(N) * N, tmp_rho_.begin());
 
     hsize_t start_rho[3] = {(hsize_t)current_step_, 0, 0};
     hsize_t count_rho[3] = {1, (hsize_t)N, (hsize_t)N};
@@ -209,23 +220,26 @@ void HDF5Writer::write_timestep(double time_fs, const cuDoubleComplex* rho, int 
     current_step_++;
 }
 
-void HDF5Writer::close(double simulation_time,
+void HDF5Writer::close(double simulation_time, heom::hdf5::RunStatus status,
                        const std::vector<FilteringRecord>* filtering_history) {
     if (file_ < 0) return;
 
     heom::hdf5::write_scalar_attr(file_, "simulation_time_seconds", simulation_time);
+    heom::hdf5::write_scalar_attr(file_, "n_records_written", current_step_);
 
     if (filtering_history && !filtering_history->empty()) {
         // M11: written into /derived because final_active_ados is a runtime
         // outcome of the ADO filter, not a user-facing knob. We re-open the
         // group instead of carrying its hid_t through the writer's lifetime.
-        hid_t derived = H5Gopen2(file_, "/derived", H5P_DEFAULT);
-        if (derived >= 0) {
-            heom::hdf5::write_scalar_attr(derived, "final_active_ados",
-                                          filtering_history->back().active_ados);
-            HDF5_CHECK_ERR(H5Gclose(derived));
-        }
+        // open() created /derived; failing to reopen it is a broken file, not
+        // an optional extra — a missing final_active_ados must not be silent.
+        hid_t derived;
+        HDF5_CHECK_HID(derived, H5Gopen2(file_, "/derived", H5P_DEFAULT));
+        heom::hdf5::write_scalar_attr(derived, "final_active_ados",
+                                      filtering_history->back().active_ados);
+        HDF5_CHECK_ERR(H5Gclose(derived));
     }
+    heom::hdf5::write_run_status(file_, status);
 
     auto close_if_open = [](hid_t& id, herr_t (*close_fn)(hid_t), const char* name) {
         if (id < 0) return;
