@@ -61,7 +61,8 @@ inline void validate_timestep_bounds(
  *                      + config_yaml
  *   /derived/          eigenspectrum + bath-correlation coefficients + M_total
  *                      + final_active_ados (after close)
- *   /results/          time[T], density_matrix[T,N,N] (complex compound)
+ *   /results/          time[T], density_matrix[T,N,N] (complex compound),
+ *                      system_bath_energy[T, n_bath] (complex compound)
  *   /provenance/       hardware / OS / config_path strings
  *
  * write_timestep() incrementally fills /results.
@@ -91,9 +92,12 @@ public:
               bool use_filtering,
               double filter_threshold);
 
-    /// rho: row-major N×N, one record. Host type only — the writer knows
-    /// nothing about how the trajectory stores its state.
-    void write_timestep(double time_fs, const std::complex<double>* rho, int N);
+    /// rho: row-major N×N. esb: [n_bath] first-tier system-bath energy for
+    /// the same record (required; nullptr throws). Breaking vs 2.2.0, which
+    /// had no esb argument. Host type only — the writer knows nothing about
+    /// how the trajectory stores its state.
+    void write_timestep(double time_fs, const std::complex<double>* rho, int N,
+                        const std::complex<double>* esb, int n_bath);
 
     /// status: Complete, or Diverged when the run stopped at a divergence
     /// check (fewer than the allocated records written). Destroying an open
@@ -109,15 +113,18 @@ private:
 
     hid_t file_;
     hid_t density_matrix_dataset_;  // /results/density_matrix (compound complex)
+    hid_t esb_dataset_;              // /results/system_bath_energy
     hid_t time_dataset_;             // /results/time
     hid_t complex_type_;             // owned compound complex type
     int current_step_;
     int N_;
+    int n_bath_;
     int n_records_;
 
     // Per-timestep staging buffer (N×N complex doubles, layout-compatible
     // with the compound complex HDF5 dtype).
     std::vector<std::complex<double>> tmp_rho_;
+    std::vector<std::complex<double>> tmp_esb_;
 };
 
 #endif // HDF5_WRITER_HPP

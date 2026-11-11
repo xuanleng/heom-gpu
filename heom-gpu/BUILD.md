@@ -1,4 +1,4 @@
-# heom-gpu 2.2.0
+# heom-gpu 2.2.1
 
 GPU solver for hierarchical equations of motion (HEOM) with a Drude–Lorentz
 bath. Released under the **MIT License** (`LICENSE`).

@@ -430,6 +430,59 @@ void HEOMTrajectory::read_alpha0(std::vector<std::complex<double>>& out) {
         out[i] = std::complex<double>(heom::c_re(h_rho0_[i]), heom::c_im(h_rho0_[i]));
 }
 
+void HEOMTrajectory::read_system_bath_energy(std::vector<std::complex<double>>& out) {
+    if (!initial_set_) {
+        throw std::runtime_error(
+            "HEOMTrajectory::read_system_bath_energy() called before set_initial()");
+    }
+
+    const int n_bath = sys_.n_bath();
+    const int N      = sys_.N();
+    const int M      = sys_.M();
+    const int B      = active_batch_;
+    const size_t Nb  = static_cast<size_t>(support_.elems());
+    const size_t slot = static_cast<size_t>(M) * Nb;
+    const auto& ft = sys_.first_tier();
+    // Site occupation n̂_n = L_n from build_d_coupling (cached on SystemContext):
+    // 1-ex projector on EXCITED_ONLY / WITH_GROUND; on DOUBLE_EXCITED also the
+    // f-states that contain pigment n (the bath kernel's number operator).
+    const std::vector<int8_t>& dcoup = sys_.d_coupling_host();
+
+    out.assign(static_cast<size_t>(B) * n_bath, {0.0, 0.0});
+    if (ft.empty() || Nb == 0) return;
+
+    std::vector<heom::complex_t> packed(Nb);
+    std::vector<heom::complex_t> full(static_cast<size_t>(N) * N);
+
+    for (int b = 0; b < B; ++b) {
+        const heom::complex_t* slot_ptr =
+            d_rho_.get() + static_cast<size_t>(b) * slot;
+        for (const auto& e : ft) {
+            if (e.alpha < 0 || e.alpha >= M)
+                throw std::logic_error("first_tier alpha out of range");
+            if (e.site < 0 || e.site >= n_bath)
+                throw std::logic_error("first_tier site out of range");
+            CUDA_CHECK(cudaMemcpy(
+                packed.data(),
+                slot_ptr + static_cast<size_t>(e.alpha) * Nb,
+                Nb * sizeof(heom::complex_t),
+                cudaMemcpyDeviceToHost));
+            expand_block_(packed.data(), full.data());
+            // Formula uses √s_k; FirstTierAdo::scale stores s_k = √(|c||c̄|).
+            const double sqrt_s = std::sqrt(e.scale);
+            std::complex<double> tr(0.0, 0.0);
+            const int8_t* drow = dcoup.data() + static_cast<size_t>(e.site) * N;
+            for (int i = 0; i < N; ++i) {
+                if (drow[i] == 0) continue;
+                const heom::complex_t z = full[static_cast<size_t>(i) * N + i];
+                tr += static_cast<double>(drow[i])
+                    * std::complex<double>(heom::c_re(z), heom::c_im(z));
+            }
+            out[static_cast<size_t>(b) * n_bath + e.site] += sqrt_s * tr;
+        }
+    }
+}
+
 void HEOMTrajectory::apply_dipole(
     const std::vector<Eigen::MatrixXcd>& mus, heom::spectra::DipoleSide side,
     const heom::ManifoldBlock& support_after) {

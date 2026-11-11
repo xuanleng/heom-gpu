@@ -1,11 +1,25 @@
 # Changelog
 
-Public releases are git tags on this repository (`v1.0.0`, `v2.2.0`); the other
-versions below were internal. The version
+Public releases are git tags on this repository (`v1.0.0`, `v2.2.0`, `v2.2.1`); the
+other versions below were internal. The version
 string lives in three places that must agree: `VERSION`,
 `include/heom_version.hpp`, and `project(... VERSION ...)` in `CMakeLists.txt`.
 Every HDF5 file records the string it was written by in
 `/provenance/software_version`.
+
+## 2.2.1 — 2026-11-11
+
+Based on 2.2.0. The only change is the output below; density matrices are
+bit-identical to 2.2.0.
+
+Dynamics HDF5 now writes the first-tier system-bath interaction energy
+`/results/system_bath_energy[T, n_bath]`:
+\(E_n=\sum_k\sqrt{s_k}\,\mathrm{Tr}[\hat n_n\tilde\rho^{(1)}_{nk}]\),
+\(s_k=\sqrt{|c_k||\bar c_k|}\), units Eh. \(\hat n_n\) is the site
+occupation from `build_d_coupling` (1-ex projector on excited_only /
+with_ground; includes f-states on double_excited). Existing datasets are
+unchanged. Absorption and 2DES are unchanged: their ρ lives in an (e,g)
+block, so this trace is structurally ~0 and is not a physical energy.
 
 ## 2.2.0 — 2026-10-23
 

@@ -156,9 +156,12 @@ bool run_dynamics(const SystemContext& sys) {
 
     HDF5Writer writer(cfg.output.use_timestamp);
     writer.open(sys, rho0, cfg.filter.enabled, cfg.filter.tolerance);
+    std::vector<std::complex<double>> esb;
+    const int n_bath = sys.n_bath();
     const double seconds = run_output_loop(
         traj, [&](int, double t_fs, const std::complex<double>* rho, int, int) {
-            writer.write_timestep(t_fs, rho, N);
+            traj.read_system_bath_energy(esb);
+            writer.write_timestep(t_fs, rho, N, esb.data(), n_bath);
         });
     writer.close(seconds,
                  traj.diverged() ? heom::hdf5::RunStatus::Diverged

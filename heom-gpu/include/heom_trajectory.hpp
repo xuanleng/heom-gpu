@@ -135,6 +135,21 @@ public:
     /// receives; throws before set_initial.
     void read_alpha0(std::vector<std::complex<double>>& out);
 
+    /// System-bath interaction energy from the first-tier ADOs, one complex
+    /// per (slot, bath):
+    ///   E_n = Σ_k √s_k Tr[n̂_n ρ̃^{(1)}_{nk}],  s_k = √(|c_k||c̄_k|)
+    /// n̂_n is the site occupation from build_d_coupling (1-ex projector on
+    /// EXCITED_ONLY / WITH_GROUND; on DOUBLE_EXCITED also f-states that
+    /// contain pigment n). FirstTierAdo::scale stores s_k; the √ is taken here.
+    /// Sums every first-tier ADO still resident in device memory.
+    /// With filtering off this is the physical ⟨H_SB⟩. With filtering on,
+    /// inactive ADOs are frozen (not cleared), so the sum is the *stored*
+    /// tier-1 correlation including inactive leftovers — not ⟨H_SB⟩ on the
+    /// active set alone. Prefer filter-off when comparing to analytic
+    /// interaction energies. out is resized to active_batch()·n_bath(),
+    /// slot-major. Throws before set_initial.
+    void read_system_bath_energy(std::vector<std::complex<double>>& out);
+
     /// Per-filter-step records accumulated so far (empty with filtering off).
     /// The dynamics writer stores them; nothing in the core reads them back.
     const std::vector<FilteringRecord>& filtering_history() const {

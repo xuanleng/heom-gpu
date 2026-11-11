@@ -254,6 +254,25 @@ void SystemContext::upload_gpu_readonly(const HostHierarchy& hh) {
             }
         }
         h_total_decay[alpha] = make_cuDoubleComplex(decay.real(), decay.imag());
+
+        // First-tier list: exactly one occupation on one ladder. Built here
+        // so the rest of the host hierarchy can still be discarded.
+        int tier = 0, last = -1;
+        for (int s = 0; s < D_; ++s) {
+            const int8_t a = idx[s];
+            if (a > 0) {
+                tier += a;
+                last = s;
+            }
+        }
+        if (tier == 1) {
+            FirstTierAdo e;
+            e.alpha = alpha;
+            e.site  = ml.site_of(last);  // bath index (pigment or shared)
+            e.k     = ml.pole_of(last);
+            e.scale = h_scale[static_cast<size_t>(last)];
+            first_tier_.push_back(e);
+        }
     }
 
     // The derivative kernel stages H as REAL (sH is real_t: half the smem, so
@@ -277,7 +296,7 @@ void SystemContext::upload_gpu_readonly(const HostHierarchy& hh) {
         }
     }
 
-    std::vector<int8_t> h_d_coupling = build_d_coupling(cfg_.physics);
+    h_d_coupling_ = build_d_coupling(cfg_.physics);
 
     d_hamiltonian_.copy_from_host(h_hamiltonian.data(), h_hamiltonian.size());
     d_c_bath_.copy_from_host(h_c_bath.data(), h_c_bath.size());
@@ -289,6 +308,6 @@ void SystemContext::upload_gpu_readonly(const HostHierarchy& hh) {
     d_coeff_plus_.copy_from_host(h_coeff_plus.data(), h_coeff_plus.size());
     d_coeff_minus_.copy_from_host(h_coeff_minus.data(), h_coeff_minus.size());
     d_total_decay_.copy_from_host(h_total_decay.data(), h_total_decay.size());
-    d_d_coupling_.copy_from_host(h_d_coupling.data(), h_d_coupling.size());
+    d_d_coupling_.copy_from_host(h_d_coupling_.data(), h_d_coupling_.size());
     d_mode_off_.copy_from_host(cfg_.physics.mode_off.data(), cfg_.physics.mode_off.size());
 }

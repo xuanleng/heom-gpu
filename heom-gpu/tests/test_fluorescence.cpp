@@ -352,6 +352,13 @@ void test_dress_monomer_closed_form() {
     ASSERT_NEAR(tier1.real() / (-2.0 * lam), 1.0, kAdoTol);
     ASSERT_NEAR(tier1.imag() / lam, 0.0, kAdoTol);
 
+    ASSERT_EQ(static_cast<int>(sys.first_tier().size()), D);
+    std::vector<cplx> esb;
+    traj.read_system_bath_energy(esb);
+    ASSERT_EQ(esb.size(), 1u);
+    ASSERT_NEAR(esb[0].real() / (-2.0 * lam), 1.0, kAdoTol);
+    ASSERT_NEAR(esb[0].imag() / lam, 0.0, kAdoTol);
+
     traj.propagate_steps(100);           // ~ τ_c of the Drude ladder (1/γ = 100 fs)
     ASSERT_TRUE(!traj.diverged());
     ASSERT_NEAR(traj.relative_distance(snap), 0.0, kFixedTol);

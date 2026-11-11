@@ -25,7 +25,8 @@
  *
  * Host-side hierarchy data (indices, plus/minus maps) is only needed during
  * construction to populate the GPU buffers and is freed before the
- * constructor returns; the device copies are the single source of truth
+ * constructor returns, except the O(D) first-tier table used for the
+ * system-bath energy. The device copies are the single source of truth
  * during evolution.
  */
 class SystemContext {
@@ -48,6 +49,22 @@ public:
     // here so the budget check, the alloc plan and HEOMTrajectory::capacity_
     // are the same number.
     int rho_capacity() const { return rho_capacity_; }
+
+    // One first-tier ADO: Σ_{n,k} α_{nk} = 1. Kept on the host after the
+    // rest of the hierarchy tables are freed — O(D) ints, not O(M). The
+    // system-bath energy sums √s_k Tr[n̂_n ρ̃_α] over α that belong to
+    // bath n (see HEOMTrajectory::read_system_bath_energy).
+    struct FirstTierAdo {
+        int    alpha = 0;   // hierarchy index
+        int    site  = 0;   // bath index 0…n_bath-1 (pigment or shared)
+        int    k     = 0;   // pole within that bath
+        double scale = 0.0; // s_k = √(|c_k||c̄_k|)
+    };
+    const std::vector<FirstTierAdo>& first_tier() const { return first_tier_; }
+
+    // Host copy of build_d_coupling (n_bath × N); same layout as d_d_coupling_.
+    // Cached so read_system_bath_energy does not rebuild every output step.
+    const std::vector<int8_t>& d_coupling_host() const { return h_d_coupling_; }
 
     // Eigen decomposition of H, computed unconditionally at construction
     // (cheap even for LHC-II): consumed by HDF5 metadata and by the
@@ -110,6 +127,11 @@ private:
     GPUMemory<cuDoubleComplex> d_total_decay_;  // [M] Σ α_{nk}ν_{nk}, complex
     GPUMemory<int8_t>          d_d_coupling_;
     GPUMemory<int>             d_mode_off_;     // [n_bath+1] ladder prefix sums
+
+    // Host table of first-tier ADOs (see first_tier()). Built in
+    // upload_gpu_readonly from the hierarchy that is then discarded.
+    std::vector<FirstTierAdo> first_tier_;
+    std::vector<int8_t>       h_d_coupling_;  // host twin of d_d_coupling_
 
     // Aggregate of host-side hierarchy data; lives only inside the constructor
     // body so it is destroyed once GPU upload completes.

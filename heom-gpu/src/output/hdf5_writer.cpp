@@ -55,10 +55,12 @@ HDF5Writer::HDF5Writer(bool use_timestamp)
     : use_timestamp_(use_timestamp)
     , file_(-1)
     , density_matrix_dataset_(-1)
+    , esb_dataset_(-1)
     , time_dataset_(-1)
     , complex_type_(-1)
     , current_step_(0)
     , N_(0)
+    , n_bath_(0)
     , n_records_(0)
 {
 }
@@ -82,6 +84,7 @@ HDF5Writer::~HDF5Writer() {
         if (id >= 0) { close_fn(id); id = -1; }
     };
     close_quietly(density_matrix_dataset_, H5Dclose);
+    close_quietly(esb_dataset_,            H5Dclose);
     close_quietly(time_dataset_,           H5Dclose);
     close_quietly(complex_type_,           H5Tclose);
     close_quietly(file_,                   H5Fclose);
@@ -108,6 +111,7 @@ void HDF5Writer::open(const SystemContext& sys,
     const InitialState& init_state = *cfg.initial;
 
     N_ = phys.n_sites;
+    n_bath_ = sys.n_bath();
     output_path_ = heom::hdf5::resolve_output_path(cfg.output.save_path,
                                                    cfg.output.filename,
                                                    use_timestamp_);
@@ -157,7 +161,7 @@ void HDF5Writer::open(const SystemContext& sys,
     heom::hdf5::write_provenance_group(file_, sys);
 
     // ------------------------------------------------------------------
-    // /results: time + density_matrix(complex compound). Both are written
+    // /results: time + density_matrix + system_bath_energy. Written
     // incrementally by write_timestep().
     // ------------------------------------------------------------------
     hid_t results = heom::hdf5::create_group(file_, "/results");
@@ -168,9 +172,11 @@ void HDF5Writer::open(const SystemContext& sys,
 
     hsize_t dims_time[1] = {(hsize_t)n_records_};
     hsize_t dims_rho[3]  = {(hsize_t)n_records_, (hsize_t)N_, (hsize_t)N_};
+    hsize_t dims_esb[2]  = {(hsize_t)n_records_, (hsize_t)n_bath_};
 
     H5Handle space_time(H5Screate_simple(1, dims_time, NULL), H5Sclose);
     H5Handle space_rho (H5Screate_simple(3, dims_rho,  NULL), H5Sclose);
+    H5Handle space_esb (H5Screate_simple(2, dims_esb,  NULL), H5Sclose);
 
     HDF5_CHECK_HID(time_dataset_,
                    H5Dcreate2(results, "time", H5T_NATIVE_DOUBLE, space_time.get(),
@@ -178,10 +184,31 @@ void HDF5Writer::open(const SystemContext& sys,
     HDF5_CHECK_HID(density_matrix_dataset_,
                    H5Dcreate2(results, "density_matrix", complex_type_, space_rho.get(),
                               H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    HDF5_CHECK_HID(esb_dataset_,
+                   H5Dcreate2(results, "system_bath_energy", complex_type_, space_esb.get(),
+                              H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    heom::hdf5::write_string_attr(esb_dataset_, "units", "Eh");
+    heom::hdf5::write_string_attr(
+        esb_dataset_, "formula",
+        "sum_k sqrt(s_k) Tr[n_n rho_tilde^(1)_nk]; s_k=sqrt(|c_k||cbar_k|)");
+    heom::hdf5::write_string_attr(esb_dataset_, "physical_part", "real");
+    heom::hdf5::write_string_attr(esb_dataset_, "axis1", "bath_index");
+    // Filter freezes inactive ADOs without clearing them. With filtering on,
+    // the written column is the stored tier-1 correlation (incl. leftovers),
+    // not ⟨H_SB⟩ on the active set alone.
+    heom::hdf5::write_string_attr(
+        esb_dataset_, "includes_inactive_ados",
+        use_filtering ? "true" : "false");
+    heom::hdf5::write_string_attr(
+        esb_dataset_, "filter_semantics",
+        use_filtering
+            ? "stored_tier1_correlation_including_inactive"
+            : "physical_system_bath_interaction_energy");
 
     HDF5_CHECK_ERR(H5Gclose(results));
 
     tmp_rho_.resize(static_cast<size_t>(N_) * N_);
+    tmp_esb_.resize(static_cast<size_t>(n_bath_));
     current_step_ = 0;
 
     HDF5_CHECK_ERR(H5Fflush(file_, H5F_SCOPE_GLOBAL));
@@ -189,8 +216,15 @@ void HDF5Writer::open(const SystemContext& sys,
     std::cout << "HDF5 file created: " << output_path_ << "\n";
 }
 
-void HDF5Writer::write_timestep(double time_fs, const std::complex<double>* rho, int N) {
+void HDF5Writer::write_timestep(double time_fs, const std::complex<double>* rho, int N,
+                                const std::complex<double>* esb, int n_bath) {
     heom::hdf5::validate_timestep_bounds(N, N_, current_step_, n_records_);
+    if (n_bath != n_bath_) {
+        throw std::invalid_argument("HDF5Writer::write_timestep: n_bath mismatch");
+    }
+    if (!esb) {
+        throw std::invalid_argument("HDF5Writer::write_timestep: esb is null");
+    }
 
     // ---- write time[current_step_] ----
     hsize_t start_time[1] = {(hsize_t)current_step_};
@@ -216,6 +250,18 @@ void HDF5Writer::write_timestep(double time_fs, const std::complex<double>* rho,
     HDF5_CHECK_ERR(H5Dwrite(density_matrix_dataset_, complex_type_,
                             rho_memspace.get(), rho_space.get(),
                             H5P_DEFAULT, tmp_rho_.data()));
+
+    std::copy(esb, esb + static_cast<size_t>(n_bath), tmp_esb_.begin());
+    hsize_t start_esb[2] = {(hsize_t)current_step_, 0};
+    hsize_t count_esb[2] = {1, (hsize_t)n_bath};
+    H5Handle esb_space(H5Dget_space(esb_dataset_), H5Sclose);
+    HDF5_CHECK_ERR(H5Sselect_hyperslab(esb_space.get(), H5S_SELECT_SET,
+                                       start_esb, NULL, count_esb, NULL));
+    hsize_t mem_dims_esb[1] = {(hsize_t)n_bath};
+    H5Handle esb_memspace(H5Screate_simple(1, mem_dims_esb, NULL), H5Sclose);
+    HDF5_CHECK_ERR(H5Dwrite(esb_dataset_, complex_type_,
+                            esb_memspace.get(), esb_space.get(),
+                            H5P_DEFAULT, tmp_esb_.data()));
 
     current_step_++;
 }
@@ -250,10 +296,12 @@ void HDF5Writer::close(double simulation_time, heom::hdf5::RunStatus status,
     };
 
     close_if_open(density_matrix_dataset_, H5Dclose, "density_matrix");
+    close_if_open(esb_dataset_,            H5Dclose, "system_bath_energy");
     close_if_open(time_dataset_,           H5Dclose, "time");
     close_if_open(complex_type_,           H5Tclose, "complex_type");
     close_if_open(file_,                   H5Fclose, "file");
 
     N_ = 0;
+    n_bath_ = 0;
     n_records_ = 0;
 }

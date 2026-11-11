@@ -27,7 +27,8 @@ class SystemContext;   // forward decl: include from .cpp
  *   /derived/        cheap-to-recompute artefacts shipped for convenience
  *                    (eigenspectrum, bath-correlation coefficients, M_total).
  *   /results/        the actual bulk simulation output (time + density
- *                    matrix or ρ_xyz).
+ *                    matrix or ρ_xyz; dynamics also writes
+ *                    system_bath_energy[T, n_bath]).
  *   /provenance/     hardware / OS / config-path strings used only for
  *                    debugging, never for science.
  *

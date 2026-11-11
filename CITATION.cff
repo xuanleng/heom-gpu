@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite the article below."
 type: software
 title: heom-gpu
-version: 2.2.0
-date-released: 2026-10-23
+version: 2.2.1
+date-released: 2026-11-11
 license: MIT
 authors:
   - family-names: Ren

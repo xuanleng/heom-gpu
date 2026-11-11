@@ -312,10 +312,12 @@ bool test_hdf5_writer_status() {
     cfg.output.use_timestamp = false;
     SystemContext sys(cfg);
     const int N = sys.N();
+    const int n_bath = sys.n_bath();
     Eigen::MatrixXcd rho0 = Eigen::MatrixXcd::Zero(N, N);
     rho0(0, 0) = 1.0;
     std::vector<std::complex<double>> flat(static_cast<size_t>(N) * N, 0.0);
     flat[0] = 1.0;
+    const std::vector<std::complex<double>> zeros(static_cast<size_t>(n_bath), 0.0);
     const std::string path = heom_test::tmp_dir() + "/test_heom_status.h5";
 
     auto read_str = [](hid_t file, const char* name) -> std::string {
@@ -366,7 +368,7 @@ bool test_hdf5_writer_status() {
     if (pid == 0) {   // killed mid-run: nothing after write_timestep runs
         HDF5Writer w(false);
         w.open(sys, rho0, false, 0.0);
-        w.write_timestep(0.0, flat.data(), N);
+        w.write_timestep(0.0, flat.data(), N, zeros.data(), n_bath);
         _exit(0);
     }
     int wstatus = 0;
@@ -380,7 +382,7 @@ bool test_hdf5_writer_status() {
     {   // destroyed without close(): what an unwinding exception does
         HDF5Writer w(false);
         w.open(sys, rho0, false, 0.0);
-        w.write_timestep(0.0, flat.data(), N);
+        w.write_timestep(0.0, flat.data(), N, zeros.data(), n_bath);
     }
     if (!check("unwound", "aborted", false, 1)) return false;
 
@@ -388,7 +390,7 @@ bool test_hdf5_writer_status() {
                                   std::pair{RunStatus::Complete, "complete"}}) {
         HDF5Writer w(false);
         w.open(sys, rho0, false, 0.0);
-        w.write_timestep(0.0, flat.data(), N);
+        w.write_timestep(0.0, flat.data(), N, zeros.data(), n_bath);
         w.close(2.5, st);
         if (!check(name, name, true, 1)) return false;
     }
@@ -2982,6 +2984,226 @@ bool test_if_rk4_matches_plain_small_dt() {
     return true;
 }
 
+
+// 2.2.1: HDF5 system_bath_energy round-trip + attrs (filter off).
+bool test_esb_hdf5_readback() {
+    using heom::hdf5::RunStatus;
+    auto cfg = HEOMConfig::Config::load_yaml(write_tiny_trajectory_yaml());
+    HEOMConfig::resolve_dynamics_config(cfg);
+    // Need L>=1 so first-tier exists; rewrite L via a dedicated yaml.
+    const std::string path_yaml = heom_test::tmp_dir() + "/test_esb_hdf5.yaml";
+    {
+        std::ofstream f(path_yaml);
+        f << "system:\n"
+          << "  n_states: 1\n"
+          << "  basis: \"excited_only\"\n"
+          << "  temperature: 77.0\n"
+          << "  hamiltonian:\n"
+          << "    - [12100.0]\n"
+          << "  w0: 12000.0\n"
+          << "bath:\n"
+          << "  spectral_density: \"Drude-Lorentz\"\n"
+          << "  eta: 35.0\n"
+          << "  gamma_inverse: 100.0\n"
+          << "  expansion_method: matsubara\n"
+          << "  n_extra_poles: 0\n"
+          << "  L_cutoff: 2\n"
+          << "filter:\n"
+          << "  enabled: false\n"
+          << "dynamics:\n"
+          << "  integrator: rk4\n"
+          << "  dt: 1.0\n"
+          << "  n_steps: 1\n"
+          << "  output_interval: 1\n"
+          << "  print_interval: 0\n"
+          << "  initial_state:\n"
+          << "    type: \"site_excitation\"\n"
+          << "    excited_site: 1\n"
+          << "  output:\n"
+          << "    save_path: \"" << heom_test::tmp_dir() << "/\"\n"
+          << "    filename: \"test_esb_hdf5\"\n"
+          << "    use_timestamp: false\n";
+    }
+    cfg = HEOMConfig::Config::load_yaml(path_yaml);
+    HEOMConfig::resolve_dynamics_config(cfg);
+    SystemContext sys(cfg);
+    const int N = sys.N();
+    const int n_bath = sys.n_bath();
+    Eigen::MatrixXcd rho0 = build_initial_state(sys, *cfg.initial);
+    HEOMTrajectory traj(sys);
+    traj.set_initial({rho0}, heom::ManifoldBlock::full(N));
+    traj.propagate_steps(1);
+    std::vector<std::complex<double>> rho_flat(static_cast<size_t>(N) * N);
+    traj.read_alpha0(rho_flat);
+    std::vector<std::complex<double>> esb;
+    traj.read_system_bath_energy(esb);
+    if (static_cast<int>(esb.size()) != n_bath) {
+        std::cerr << "FAIL(esb_hdf5): esb size " << esb.size() << " != n_bath " << n_bath << "\n";
+        return false;
+    }
+
+    const std::string h5path = heom_test::tmp_dir() + "/test_esb_hdf5.h5";
+    std::remove(h5path.c_str());
+    {
+        HDF5Writer w(false);
+        w.open(sys, rho0, /*use_filtering=*/false, 0.0);
+        w.write_timestep(0.0, rho_flat.data(), N, esb.data(), n_bath);
+        w.close(0.1, RunStatus::Complete);
+    }
+
+    hid_t file = H5Fopen(h5path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file < 0) {
+        std::cerr << "FAIL(esb_hdf5): cannot open " << h5path << "\n";
+        return false;
+    }
+    hid_t dset = H5Dopen2(file, "/results/system_bath_energy", H5P_DEFAULT);
+    if (dset < 0) {
+        std::cerr << "FAIL(esb_hdf5): missing /results/system_bath_energy\n";
+        H5Fclose(file);
+        return false;
+    }
+    auto read_str_attr = [](hid_t loc, const char* name) -> std::string {
+        if (H5Aexists(loc, name) <= 0) return "<absent>";
+        hid_t a = H5Aopen(loc, name, H5P_DEFAULT);
+        hid_t ty = H5Aget_type(a);
+        char* v = nullptr;
+        H5Aread(a, ty, &v);
+        std::string out = v ? v : "";
+        H5free_memory(v);
+        H5Tclose(ty);
+        H5Aclose(a);
+        return out;
+    };
+    const std::string units = read_str_attr(dset, "units");
+    const std::string phys  = read_str_attr(dset, "physical_part");
+    const std::string axis1 = read_str_attr(dset, "axis1");
+    const std::string inac  = read_str_attr(dset, "includes_inactive_ados");
+    const std::string sem   = read_str_attr(dset, "filter_semantics");
+    if (units != "Eh" || phys != "real" || axis1 != "bath_index"
+        || inac != "false"
+        || sem != "physical_system_bath_interaction_energy") {
+        std::cerr << "FAIL(esb_hdf5): attrs units=" << units << " physical_part=" << phys
+                  << " axis1=" << axis1 << " includes_inactive_ados=" << inac
+                  << " filter_semantics=" << sem << "\n";
+        H5Dclose(dset);
+        H5Fclose(file);
+        return false;
+    }
+
+    hid_t space = H5Dget_space(dset);
+    if (space < 0) {
+        std::cerr << "FAIL(esb_hdf5): H5Dget_space failed\n";
+        H5Dclose(dset);
+        H5Fclose(file);
+        return false;
+    }
+    const int ndims = H5Sget_simple_extent_ndims(space);
+    hsize_t dims[2] = {0, 0};
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+    if (ndims != 2 || dims[0] < 1 || static_cast<int>(dims[1]) != n_bath) {
+        std::cerr << "FAIL(esb_hdf5): unexpected shape ndims=" << ndims
+                  << " dims=[" << dims[0] << "," << dims[1] << "]\n";
+        H5Dclose(dset);
+        H5Fclose(file);
+        return false;
+    }
+    hid_t ctype = heom::hdf5::make_complex_compound_type();
+    std::vector<std::complex<double>> got(static_cast<size_t>(dims[0]) * dims[1]);
+    if (H5Dread(dset, ctype, H5S_ALL, H5S_ALL, H5P_DEFAULT, got.data()) < 0) {
+        std::cerr << "FAIL(esb_hdf5): H5Dread failed\n";
+        H5Tclose(ctype);
+        H5Dclose(dset);
+        H5Fclose(file);
+        return false;
+    }
+    H5Tclose(ctype);
+    H5Dclose(dset);
+    H5Fclose(file);
+
+    // Compare the first written record (we only wrote one timestep).
+    for (int i = 0; i < n_bath; ++i) {
+        if (std::abs(got[static_cast<size_t>(i)] - esb[i]) > 1e-14) {
+            std::cerr << "FAIL(esb_hdf5): bath " << i << " wrote " << esb[i]
+                      << " read " << got[i] << "\n";
+            return false;
+        }
+        if (!std::isfinite(got[i].real()) || !std::isfinite(got[i].imag())) {
+            std::cerr << "FAIL(esb_hdf5): non-finite at bath " << i << "\n";
+            return false;
+        }
+    }
+    std::remove(h5path.c_str());
+    std::cout << "esb HDF5 readback + attrs (filter off): PASS\n";
+    return true;
+}
+
+// 2.2.1: DOUBLE_EXCITED must not throw; ESB finite and matches host rebuild.
+bool test_esb_double_excited_finite() {
+    auto cfg = HEOMConfig::Config::load_yaml(write_double_excited_dimer_yaml());
+    HEOMConfig::resolve_dynamics_config(cfg);
+    SystemContext sys(cfg);
+    const int N = sys.N();
+    const int n_bath = sys.n_bath();
+    if (N != 4 || n_bath != 2) {
+        std::cerr << "FAIL(esb_dex): unexpected N=" << N << " n_bath=" << n_bath << "\n";
+        return false;
+    }
+    if (sys.first_tier().empty()) {
+        std::cerr << "FAIL(esb_dex): empty first_tier\n";
+        return false;
+    }
+    Eigen::MatrixXcd rho0 = build_initial_state(sys, *cfg.initial);
+    HEOMTrajectory traj(sys);
+    traj.set_initial({rho0}, heom::ManifoldBlock::full(N));
+    traj.propagate_steps(5);
+
+    std::vector<std::complex<double>> esb;
+    try {
+        traj.read_system_bath_energy(esb);
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL(esb_dex): read_system_bath_energy threw: " << e.what() << "\n";
+        return false;
+    }
+    if (static_cast<int>(esb.size()) != n_bath) {
+        std::cerr << "FAIL(esb_dex): size " << esb.size() << "\n";
+        return false;
+    }
+    for (int n = 0; n < n_bath; ++n) {
+        if (!std::isfinite(esb[n].real()) || !std::isfinite(esb[n].imag())) {
+            std::cerr << "FAIL(esb_dex): non-finite E[" << n << "]=" << esb[n] << "\n";
+            return false;
+        }
+    }
+    // Second readout must match bitwise (no hidden scratch corruption).
+    std::vector<std::complex<double>> esb2;
+    traj.read_system_bath_energy(esb2);
+    for (int n = 0; n < n_bath; ++n) {
+        if (esb2[n] != esb[n]) {
+            std::cerr << "FAIL(esb_dex): non-deterministic readout at bath " << n << "\n";
+            return false;
+        }
+    }
+    // Spot-check: d_coupling rows include f-state occupations on DOUBLE_EXCITED
+    // (e-site projector + at least one double-excited state with that pigment).
+    const auto& dcoup = sys.d_coupling_host();
+    bool saw_f = false;
+    for (int bath = 0; bath < n_bath; ++bath) {
+        int nonzero = 0;
+        for (int i = 0; i < N; ++i) {
+            if (dcoup[static_cast<size_t>(bath) * N + i] != 0) ++nonzero;
+        }
+        if (nonzero >= 2) saw_f = true;
+    }
+    if (!saw_f) {
+        std::cerr << "FAIL(esb_dex): expected f-state occupations in d_coupling\n";
+        return false;
+    }
+    std::cout << "esb DOUBLE_EXCITED finite + d_coupling f-states: PASS\n";
+    return true;
+}
+
+
 }  // namespace
 
 int main() {
@@ -3109,6 +3331,8 @@ int main() {
         RUN_BOOL(test_trajectory_solve_without_initial_throws);
         RUN_BOOL(test_exciton_index_is_basis_independent);
         RUN_BOOL(test_hdf5_writer_status);
+        RUN_BOOL(test_esb_hdf5_readback);
+        RUN_BOOL(test_esb_double_excited_finite);
         RUN_BOOL(test_single_side_mu);
         RUN_BOOL(test_batch_single_side_mu);
         RUN_BOOL(test_batch_trace_BR);

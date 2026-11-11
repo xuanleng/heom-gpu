@@ -22,7 +22,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
                    "(pass -DCMAKE_CUDA_ARCHITECTURES=120 for Blackwell, or use ./build.sh)")
 endif()
 
-project(HEOM_GPU_Solver VERSION 2.2.0 LANGUAGES C CXX CUDA)
+project(HEOM_GPU_Solver VERSION 2.2.1 LANGUAGES C CXX CUDA)
 
 # C++ and CUDA standards
 set(CMAKE_CXX_STANDARD 17)
